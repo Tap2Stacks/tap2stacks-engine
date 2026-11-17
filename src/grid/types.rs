@@ -247,6 +247,13 @@ impl Default for GridSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TouchMode {
+    #[default]
+    Continuous,
+    Discrete,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SimulationConfig {
     pub mu: f64,
@@ -262,6 +269,7 @@ pub struct SimulationConfig {
     pub se_rel: f64,
     pub p_floor: f64,
     pub adaptive_mc: bool,
+    pub touch_mode: TouchMode,
 }
 
 impl Default for SimulationConfig {
@@ -280,6 +288,7 @@ impl Default for SimulationConfig {
             se_rel: 0.10,
             p_floor: 0.01,
             adaptive_mc: false,
+            touch_mode: TouchMode::Continuous,
         }
     }
 }

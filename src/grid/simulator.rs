@@ -4,8 +4,8 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
-use super::touch::window_hit_probability_steps;
-use super::types::{GridConfig, PriceBand, RuntimeState};
+use super::touch::{window_hit_discrete_steps, window_hit_probability_steps};
+use super::types::{GridConfig, PriceBand, RuntimeState, TouchMode};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulationSummary {
@@ -378,6 +378,7 @@ fn simulate_hit_batch_chunk(
                 sigma,
                 config.volatility.variance_floor,
                 config.simulation.bridge_epsilon,
+                config.simulation.touch_mode,
                 &mut sum,
                 &mut squared_sum,
                 &mut scenario_payouts,
@@ -393,6 +394,7 @@ fn simulate_hit_batch_chunk(
                     sigma,
                     config.volatility.variance_floor,
                     config.simulation.bridge_epsilon,
+                    config.simulation.touch_mode,
                     &mut sum,
                     &mut squared_sum,
                     &mut scenario_payouts,
@@ -421,6 +423,7 @@ fn simulate_hit_batch_chunk(
                 sigma,
                 config.volatility.variance_floor,
                 config.simulation.bridge_epsilon,
+                config.simulation.touch_mode,
                 &mut sum,
                 &mut squared_sum,
                 &mut scenario_payouts,
@@ -440,6 +443,7 @@ fn accumulate_path_stats(
     sigma: f64,
     variance_floor: f64,
     bridge_epsilon: f64,
+    touch_mode: TouchMode,
     sum: &mut [f64],
     squared_sum: &mut [f64],
     scenario_payouts: &mut Vec<f64>,
@@ -451,15 +455,24 @@ fn accumulate_path_stats(
 
     for cell in cells {
         let window = windows[cell.window_index];
-        let p = window_hit_probability_steps(
-            path,
-            cell.lower,
-            cell.upper,
-            window.start,
-            window.end,
-            sigma_sq,
-            bridge_epsilon,
-        );
+        let p = match touch_mode {
+            TouchMode::Continuous => window_hit_probability_steps(
+                path,
+                cell.lower,
+                cell.upper,
+                window.start,
+                window.end,
+                sigma_sq,
+                bridge_epsilon,
+            ),
+            TouchMode::Discrete => window_hit_discrete_steps(
+                path,
+                cell.lower,
+                cell.upper,
+                window.start,
+                window.end,
+            ),
+        };
         sum[cell.cell_index] += p;
         squared_sum[cell.cell_index] += p * p;
         if let Some(liabilities) = liabilities {

@@ -1,5 +1,48 @@
 use super::types::{PriceBand, TimeWindow};
 
+/// Returns `1.0` if any step in the half-open window `[start, end)` has
+/// `round(price * 100)` within `[round(lower * 100), round(upper * 100)]` inclusive, else `0.0`.
+pub fn window_hit_discrete(
+    path: &[f64],
+    band: &PriceBand,
+    window: &TimeWindow,
+    lock_offset: u32,
+) -> f64 {
+    let len = path.len();
+    let start = (window.start_secs.saturating_add(lock_offset) as usize).min(len);
+    let end = (window.end_secs.saturating_add(lock_offset) as usize).min(len);
+    window_hit_discrete_steps(path, band.lower, band.upper, start, end)
+}
+
+pub(crate) fn window_hit_discrete_steps(
+    path: &[f64],
+    lower: f64,
+    upper: f64,
+    start: usize,
+    end: usize,
+) -> f64 {
+    if path.is_empty() || start >= end || !lower.is_finite() || !upper.is_finite() {
+        return 0.0;
+    }
+    // Half-open [start, end): matches settlement, which counts samples with
+    // windowStartMs <= tsMs < windowEndMs.
+    let end = end.min(path.len());
+    if start >= end {
+        return 0.0;
+    }
+    let lower_cents = (lower * 100.0).round() as i64;
+    let upper_cents = (upper * 100.0).round() as i64;
+    for &price in &path[start..end] {
+        if price.is_finite() {
+            let cents = (price * 100.0).round() as i64;
+            if cents >= lower_cents && cents <= upper_cents {
+                return 1.0;
+            }
+        }
+    }
+    0.0
+}
+
 pub fn window_hit_probability(
     path: &[f64],
     band: PriceBand,
@@ -151,5 +194,77 @@ mod tests {
 
         assert!(probability > 0.0);
         assert!(probability < 1.0);
+    }
+
+    #[test]
+    fn discrete_sample_at_window_end_does_not_count() {
+        // Window [1, 3): indexes 1 and 2 count, index 3 does not.
+        let path = [157.00, 157.00, 157.00, 157.55];
+        let band = PriceBand {
+            row_index: 0,
+            lower: 157.52,
+            upper: 157.55,
+        };
+        let window = TimeWindow {
+            start_secs: 1,
+            end_secs: 3,
+        };
+        assert_eq!(window_hit_discrete(&path, &band, &window, 0), 0.0);
+    }
+
+    #[test]
+    fn discrete_hit_when_a_step_lands_in_band() {
+        let path = [157.50, 157.52, 157.55];
+        let band = PriceBand {
+            row_index: 0,
+            lower: 157.52,
+            upper: 157.55,
+        };
+        let window = TimeWindow {
+            start_secs: 1,
+            end_secs: 3,
+        };
+
+        assert_eq!(window_hit_discrete(&path, &band, &window, 0), 1.0);
+    }
+
+    #[test]
+    fn discrete_miss_when_path_jumps_over_band() {
+        let path = [157.40, 157.70];
+        let band = PriceBand {
+            row_index: 0,
+            lower: 157.52,
+            upper: 157.55,
+        };
+        let window = TimeWindow {
+            start_secs: 0,
+            end_secs: 1,
+        };
+
+        assert_eq!(window_hit_discrete(&path, &band, &window, 0), 0.0);
+        assert!(window_hit_probability(&path, band, window, 0.01, 0, 1e-6) > 0.0);
+    }
+
+    #[test]
+    fn band_edge_counts_for_both_adjacent_cells() {
+        let path = [157.40, 157.53];
+        let lower_band = PriceBand {
+            row_index: 0,
+            lower: 157.50,
+            upper: 157.53,
+        };
+        let upper_band = PriceBand {
+            row_index: 1,
+            lower: 157.53,
+            upper: 157.56,
+        };
+        // Index 1 (157.53, the shared edge) is inside the half-open window [1, 2).
+        let window = TimeWindow {
+            start_secs: 1,
+            end_secs: 2,
+        };
+
+        assert_eq!(window_hit_discrete(&path, &lower_band, &window, 0), 1.0);
+        assert_eq!(window_hit_discrete(&path, &upper_band, &window, 0), 1.0);
     }
 }

@@ -1,6 +1,7 @@
 mod pricing;
 mod simulator;
 mod state;
+mod stock;
 mod touch;
 mod types;
 
@@ -16,11 +17,15 @@ pub use simulator::{
     debug_simulate_paths, simulate_summary, DebugPathTrace, SimulationSummary,
 };
 pub use state::{estimate_runtime_state, estimate_volatility, update_runtime_state};
-pub use touch::{interval_hit_probabilities, interval_hit_probability, window_hit_probability};
+pub use stock::stock_grid_config;
+pub use touch::{
+    interval_hit_probabilities, interval_hit_probability, window_hit_discrete,
+    window_hit_probability,
+};
 pub use types::{
     CalibrationConfig, CalibrationKey, CellQuote, GridConfig, GridError, GridSnapshot, GridSpec,
     JumpConfig, LiabilityBook, OhlcBar, PriceBand, PricingConfig, RuntimeState, SimulationConfig,
-    TimeWindow, VolatilityConfig, VolatilitySnapshot,
+    TimeWindow, TouchMode, VolatilityConfig, VolatilitySnapshot,
 };
 
 #[derive(Debug, Clone)]
@@ -731,5 +736,78 @@ mod tests {
         let error = quote_grid(50_000.0, &history, &config).unwrap_err();
 
         assert!(matches!(error, GridError::InvalidHistory(_)));
+    }
+
+    #[test]
+    fn discrete_probability_not_above_continuous() {
+        let windows = vec![
+            TimeWindow {
+                start_secs: 5,
+                end_secs: 10,
+            },
+            TimeWindow {
+                start_secs: 10,
+                end_secs: 15,
+            },
+            TimeWindow {
+                start_secs: 15,
+                end_secs: 20,
+            },
+        ];
+        let mut discrete_cfg = stock_grid_config(3, windows.clone());
+        discrete_cfg.simulation.seed = Some(42);
+        discrete_cfg.simulation.mc_n_min = 2_000;
+        discrete_cfg.simulation.mc_n_max = 2_000;
+
+        let mut continuous_cfg = discrete_cfg.clone();
+        continuous_cfg.simulation.touch_mode = TouchMode::Continuous;
+
+        let history = vec![
+            OhlcBar {
+                open: 157.40,
+                high: 157.40,
+                low: 157.40,
+                close: 157.40,
+            },
+            OhlcBar {
+                open: 157.45,
+                high: 157.45,
+                low: 157.45,
+                close: 157.45,
+            },
+            OhlcBar {
+                open: 157.53,
+                high: 157.53,
+                low: 157.53,
+                close: 157.53,
+            },
+        ];
+
+        let spot = 157.53;
+        let anchor = aligned_anchor(spot, discrete_cfg.spec.band_width);
+        let bands = build_bands(
+            anchor,
+            discrete_cfg.spec.rows,
+            discrete_cfg.spec.center_row,
+            discrete_cfg.spec.band_width,
+        );
+        let runtime_state = estimate_runtime_state(spot, &history, &discrete_cfg).unwrap();
+        let max_horizon = 20;
+
+        let discrete_sim = simulate_summary(spot, &bands, &discrete_cfg, &runtime_state, max_horizon, None);
+        let continuous_sim = simulate_summary(spot, &bands, &continuous_cfg, &runtime_state, max_horizon, None);
+
+        for (row_d, row_c) in discrete_sim
+            .mean_probabilities
+            .iter()
+            .zip(continuous_sim.mean_probabilities.iter())
+        {
+            for (&p_d, &p_c) in row_d.iter().zip(row_c.iter()) {
+                assert!(
+                    p_d <= p_c + 1e-9,
+                    "expected discrete probability {p_d} <= continuous {p_c}"
+                );
+            }
+        }
     }
 }
