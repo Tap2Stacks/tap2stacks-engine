@@ -17,6 +17,7 @@ pub enum EngineOut {
         server_ts_ms: u64,
         last_sample_age_ms: Option<u64>,
         stale: bool,
+        prev_day_px: Option<f64>,
     },
 }
 

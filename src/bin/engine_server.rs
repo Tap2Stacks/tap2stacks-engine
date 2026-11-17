@@ -3,7 +3,7 @@ use std::env;
 use std::error::Error;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -278,14 +278,15 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         tick_receivers.insert(spec.coin.clone(), tick_rx);
     }
 
-    let health_rx = if let Some(ref replay_path) = replay_file {
+    let (health_rx, prev_day_px) = if let Some(ref replay_path) = replay_file {
         info!(replay_path = %replay_path, "starting engine_server in replay mode");
-        spawn_replay_stream(
+        let health_rx = spawn_replay_stream(
             Path::new(replay_path),
             &tickers,
             tick_senders,
             Arc::clone(&clock),
-        )?
+        )?;
+        (health_rx, Arc::new(RwLock::new(HashMap::new())))
     } else {
         let mut hl_config = HyperliquidConfig {
             coins: tickers.iter().map(|t| t.coin.clone()).collect(),
@@ -298,7 +299,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         info!(ws_url = %hl_config.ws_url, "starting engine_server with Hyperliquid stream");
         let handle = spawn_hyperliquid_stream(hl_config, tick_senders);
-        handle.health_rx
+        (handle.health_rx, handle.prev_day_px)
     };
 
     for spec in tickers {
@@ -311,11 +312,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let hub_clone = Arc::clone(&hub);
         let clock_clone = Arc::clone(&clock);
         let health_rx_clone = health_rx.clone();
+        let prev_day_px_clone = Arc::clone(&prev_day_px);
         tokio::spawn(run_ticker_task(
             spec,
             tick_rx,
             exposure_rx,
             health_rx_clone,
+            prev_day_px_clone,
             hub_clone,
             clock_clone,
         ));
@@ -346,6 +349,7 @@ async fn run_ticker_task(
     mut raw_tick_rx: mpsc::Receiver<PriceTick>,
     mut exposure_rx: mpsc::Receiver<Vec<(CellKey, f64)>>,
     mut health_rx: watch::Receiver<HashMap<String, FeedHealth>>,
+    prev_day_px: Arc<RwLock<HashMap<String, f64>>>,
     hub: Arc<ClientHub>,
     clock: Arc<MonotonicWallClock>,
 ) {
@@ -444,11 +448,17 @@ async fn run_ticker_task(
                 let server_ts_ms = clock.now_ms().max(last_sample_ms.unwrap_or(0));
                 let stale = is_ticker_stale(feed_health, last_sample_ms, server_ts_ms, stale_after_ms);
                 let last_sample_age_ms = last_sample_ms.map(|ts| server_ts_ms.saturating_sub(ts));
+                let latest_prev_day_px = prev_day_px
+                    .read()
+                    .expect("prev_day_px rwlock poisoned")
+                    .get(&spec.coin)
+                    .copied();
                 hub.publish(&EngineOut::Health {
                     ticker: spec.ticker.clone(),
                     server_ts_ms,
                     last_sample_age_ms,
                     stale,
+                    prev_day_px: latest_prev_day_px,
                 });
             }
         }

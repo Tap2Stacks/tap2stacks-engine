@@ -11,8 +11,8 @@ pub use binance::{
 };
 pub use cache::PriceCache;
 pub use hyperliquid::{
-    FeedHealth, HealthTracker, HyperliquidConfig, HyperliquidStreamHandle, parse_mark_price,
-    reconnect_delay, spawn_hyperliquid_stream,
+    AssetCtx, FeedHealth, HealthTracker, HyperliquidConfig, HyperliquidStreamHandle,
+    parse_asset_ctx, parse_mark_price, reconnect_delay, spawn_hyperliquid_stream,
 };
 pub use replay::read_hl_jsonl;
 pub use runtime::{PriceRuntime, PriceWorker, spawn_price_pipeline};

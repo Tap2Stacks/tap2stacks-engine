@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -48,6 +49,7 @@ pub struct FeedHealth {
 #[derive(Debug)]
 pub struct HyperliquidStreamHandle {
     pub health_rx: watch::Receiver<HashMap<String, FeedHealth>>,
+    pub prev_day_px: Arc<RwLock<HashMap<String, f64>>>,
     pub join_handle: JoinHandle<()>,
 }
 
@@ -115,6 +117,13 @@ struct WsEnvelope {
     data: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetCtx {
+    pub coin: String,
+    pub mark_px: f64,
+    pub prev_day_px: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ActiveAssetCtxData {
     coin: String,
@@ -125,25 +134,52 @@ struct ActiveAssetCtxData {
 struct ActiveAssetCtx {
     #[serde(rename = "markPx")]
     mark_px: String,
+    #[serde(rename = "prevDayPx")]
+    prev_day_px: Option<String>,
+}
+
+fn parse_positive_finite_price(raw: &str) -> Option<f64> {
+    let price = raw.parse::<f64>().ok()?;
+    if price.is_finite() && price > 0.0 {
+        Some(price)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn parse_active_asset_ctx_full(data: serde_json::Value) -> Option<AssetCtx> {
+    let payload: ActiveAssetCtxData = serde_json::from_value(data).ok()?;
+    let mark_px = parse_positive_finite_price(&payload.ctx.mark_px)?;
+    let prev_day_px = payload
+        .ctx
+        .prev_day_px
+        .as_deref()
+        .and_then(parse_positive_finite_price);
+    Some(AssetCtx {
+        coin: payload.coin,
+        mark_px,
+        prev_day_px,
+    })
 }
 
 pub(crate) fn parse_active_asset_ctx_value(data: serde_json::Value) -> Option<(String, f64)> {
-    let payload: ActiveAssetCtxData = serde_json::from_value(data).ok()?;
-    let price = payload.ctx.mark_px.parse::<f64>().ok()?;
-    if !price.is_finite() || price <= 0.0 {
+    parse_active_asset_ctx_full(data).map(|ctx| (ctx.coin, ctx.mark_px))
+}
+
+/// Parses a live Hyperliquid WebSocket JSON frame and returns `AssetCtx`
+/// when `channel == "activeAssetCtx"`.
+pub fn parse_asset_ctx(text: &str) -> Option<AssetCtx> {
+    let envelope: WsEnvelope = serde_json::from_str(text).ok()?;
+    if envelope.channel != "activeAssetCtx" {
         return None;
     }
-    Some((payload.coin, price))
+    parse_active_asset_ctx_full(envelope.data)
 }
 
 /// Parses a live Hyperliquid WebSocket JSON frame and returns `(coin, mark_px)`
 /// when `channel == "activeAssetCtx"`.
 pub fn parse_mark_price(text: &str) -> Option<(String, f64)> {
-    let envelope: WsEnvelope = serde_json::from_str(text).ok()?;
-    if envelope.channel != "activeAssetCtx" {
-        return None;
-    }
-    parse_active_asset_ctx_value(envelope.data)
+    parse_asset_ctx(text).map(|ctx| (ctx.coin, ctx.mark_px))
 }
 
 pub fn reconnect_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
@@ -179,6 +215,7 @@ struct HyperliquidStream {
     config: HyperliquidConfig,
     senders: HashMap<String, mpsc::Sender<PriceTick>>,
     health_tx: watch::Sender<HashMap<String, FeedHealth>>,
+    prev_day_px: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 impl HyperliquidStream {
@@ -338,9 +375,20 @@ impl HyperliquidStream {
         now_ms: u64,
         tracker: &mut HealthTracker,
     ) -> bool {
-        let Some((coin, price)) = parse_mark_price(text) else {
+        let Some(ctx) = parse_asset_ctx(text) else {
             return true;
         };
+
+        if let Some(prev_day_px) = ctx.prev_day_px {
+            let mut guard = self
+                .prev_day_px
+                .write()
+                .expect("prev_day_px rwlock poisoned");
+            guard.insert(ctx.coin.clone(), prev_day_px);
+        }
+
+        let coin = ctx.coin;
+        let price = ctx.mark_px;
 
         tracker.on_sample(&coin, now_ms);
         publish_health(&self.health_tx, tracker.snapshot());
@@ -383,15 +431,18 @@ pub fn spawn_hyperliquid_stream(
 ) -> HyperliquidStreamHandle {
     let initial_health = HealthTracker::new(config.coins.iter().cloned(), config.stale_after).snapshot();
     let (health_tx, health_rx) = watch::channel(initial_health);
+    let prev_day_px = Arc::new(RwLock::new(HashMap::new()));
     let stream = HyperliquidStream {
         config,
         senders,
         health_tx,
+        prev_day_px: Arc::clone(&prev_day_px),
     };
     let join_handle = tokio::spawn(stream.run());
 
     HyperliquidStreamHandle {
         health_rx,
+        prev_day_px,
         join_handle,
     }
 }
@@ -406,6 +457,20 @@ mod tests {
     fn parses_active_asset_ctx_mark_price() {
         let line = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"157.53","oraclePx":"157.44"}}}"#;
         assert_eq!(parse_mark_price(line), Some(("xyz:NVDA".into(), 157.53)));
+    }
+
+    #[test]
+    fn parse_asset_ctx_reads_prev_day_px() {
+        let with_prev = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"154.68","prevDayPx":"154.03","oraclePx":"154.70"}}}"#;
+        let parsed = parse_asset_ctx(with_prev).expect("expected valid AssetCtx");
+        assert_eq!(parsed.coin, "xyz:NVDA");
+        assert_eq!(parsed.mark_px, 154.68);
+        assert_eq!(parsed.prev_day_px, Some(154.03));
+
+        let without_prev = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"154.68","oraclePx":"154.70"}}}"#;
+        let parsed_no_prev = parse_asset_ctx(without_prev).expect("expected valid AssetCtx");
+        assert_eq!(parsed_no_prev.mark_px, 154.68);
+        assert_eq!(parsed_no_prev.prev_day_px, None);
     }
 
     #[test]

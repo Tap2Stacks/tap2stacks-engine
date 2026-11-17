@@ -13,7 +13,7 @@ pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfi
             windows,
         },
         simulation: SimulationConfig {
-            touch_mode: TouchMode::Discrete,
+            touch_mode: TouchMode::Continuous,
             lock_offset: 0,
             ..default.simulation
         },
@@ -31,7 +31,53 @@ pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfi
 mod tests {
     use super::*;
     use crate::grid::state::estimate_volatility;
-    use crate::grid::types::OhlcBar;
+    use crate::grid::touch::{window_hit_discrete, window_hit_probability};
+    use crate::grid::types::{OhlcBar, PriceBand};
+
+    #[test]
+    fn stock_config_uses_bridge_touch() {
+        let windows = vec![
+            TimeWindow {
+                start_secs: 5,
+                end_secs: 10,
+            },
+            TimeWindow {
+                start_secs: 10,
+                end_secs: 15,
+            },
+        ];
+        let c = stock_grid_config(3, windows);
+        assert_eq!(c.simulation.touch_mode, TouchMode::Continuous);
+    }
+
+    #[test]
+    fn stock_config_prices_straddle_as_certain_hit() {
+        let window = TimeWindow {
+            start_secs: 0,
+            end_secs: 1,
+        };
+        let c = stock_grid_config(3, vec![window]);
+        let path = [157.40, 157.70];
+        let band = PriceBand {
+            row_index: 0,
+            lower: 157.52,
+            upper: 157.55,
+        };
+        let p = match c.simulation.touch_mode {
+            TouchMode::Continuous => window_hit_probability(
+                &path,
+                band,
+                window,
+                0.01,
+                c.simulation.lock_offset,
+                c.simulation.bridge_epsilon,
+            ),
+            TouchMode::Discrete => {
+                window_hit_discrete(&path, &band, &window, c.simulation.lock_offset)
+            }
+        };
+        assert_eq!(p, 1.0);
+    }
 
     #[test]
     fn stock_config_neutralises_btc_adjustments() {
@@ -53,7 +99,7 @@ mod tests {
         assert_eq!(c.spec.rows, 20);
         assert_eq!(c.spec.center_row, 9);
         assert_eq!(c.simulation.lock_offset, 0);
-        assert_eq!(c.simulation.touch_mode, TouchMode::Discrete);
+        assert_eq!(c.simulation.touch_mode, TouchMode::Continuous);
 
         // Verify 1s flat bars do not suffer Parkinson dilution or BTC price adjustment.
         let bars = vec![

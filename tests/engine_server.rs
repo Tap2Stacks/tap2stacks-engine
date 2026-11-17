@@ -140,6 +140,7 @@ fn quote_serialises_with_exact_wire_names() {
         server_ts_ms: 1_795_000_001_000,
         last_sample_age_ms: Some(127),
         stale: false,
+        prev_day_px: None,
     };
     let hv = serde_json::to_value(health).unwrap();
     assert_eq!(
@@ -149,9 +150,23 @@ fn quote_serialises_with_exact_wire_names() {
             "ticker": "NVDA",
             "serverTsMs": 1_795_000_001_000u64,
             "lastSampleAgeMs": 127,
-            "stale": false
+            "stale": false,
+            "prevDayPx": null
         })
     );
+}
+
+#[test]
+fn health_frame_serializes_prev_day_px() {
+    let health = EngineOut::Health {
+        ticker: "NVDA".into(),
+        server_ts_ms: 1_795_000_001_000,
+        last_sample_age_ms: Some(127),
+        stale: false,
+        prev_day_px: Some(154.03),
+    };
+    let hv = serde_json::to_value(health).unwrap();
+    assert_eq!(hv["prevDayPx"], 154.03);
 }
 
 #[test]
@@ -479,5 +494,63 @@ async fn stale_ticker_sends_empty_cells_and_stale_health() {
 
     assert!(saw_stale_health);
     assert!(saw_empty_quote_while_stale);
+    hl_server.abort();
+}
+
+#[tokio::test]
+async fn health_frame_reports_prev_day_px_from_hyperliquid() {
+    let hl_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hl_addr = hl_listener.local_addr().unwrap();
+
+    let hl_server = tokio::spawn(async move {
+        let (stream, _) = hl_listener.accept().await.unwrap();
+        let ws = accept_async(stream).await.unwrap();
+        let (mut write, mut read) = ws.split();
+
+        let _sub = read.next().await;
+
+        write
+            .send(Message::Text(
+                r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"154.68","prevDayPx":"154.03","oraclePx":"154.70"}}}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    });
+
+    let addr = free_addr();
+    let token = "prev-day-px-token";
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engine_server"));
+    cmd.env("ENGINE_BIND_ADDR", &addr)
+        .env("ENGINE_TOKEN", token)
+        .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3")
+        .env("HL_WS_URL", format!("ws://{hl_addr}"));
+    let _guard = ChildGuard::spawn(cmd);
+
+    let mut ws = wait_and_connect(&addr, token).await;
+
+    let observed_prev_day_px = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(msg) = ws.next().await {
+            if let Message::Text(text) = msg.unwrap() {
+                if let Ok(EngineOut::Health {
+                    ticker,
+                    prev_day_px: Some(px),
+                    ..
+                }) = serde_json::from_str::<EngineOut>(&text)
+                {
+                    if ticker == "NVDA" {
+                        return px;
+                    }
+                }
+            }
+        }
+        panic!("ws stream ended before health frame with prevDayPx");
+    })
+    .await
+    .expect("expected NVDA health frame with prevDayPx");
+
+    assert_eq!(observed_prev_day_px, 154.03);
     hl_server.abort();
 }
