@@ -18,6 +18,7 @@ const MIN_LEAD_MS: u64 = 5_000;
 
 /// Quote snapshot for a single ticker produced from cached probabilities and live exposure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StockQuote {
     pub ticker: String,
     pub server_ts_ms: u64,
@@ -28,6 +29,7 @@ pub struct StockQuote {
 
 /// Single quoted cell within a `StockQuote`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StockCell {
     pub window_start_ms: u64,
     pub window_end_ms: u64,

@@ -7,7 +7,7 @@ COPY src ./src
 COPY tests ./tests
 COPY fixtures ./fixtures
 
-RUN cargo build --release --bin ws_market_server
+RUN cargo build --release --bin engine_server
 
 FROM debian:bookworm-slim
 
@@ -17,10 +17,10 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/ws_market_server /usr/local/bin/ws_market_server
+COPY --from=builder /app/target/release/engine_server /usr/local/bin/engine_server
 
 ENV RUST_LOG=info
-ENV WS_BIND_ADDR=0.0.0.0:8080
-EXPOSE 8080
+ENV ENGINE_BIND_ADDR=0.0.0.0:8090
+EXPOSE 8090
 
-CMD ["ws_market_server"]
+CMD ["engine_server"]

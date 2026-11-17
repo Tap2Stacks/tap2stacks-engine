@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a quoted price-band and time-window cell.
 #[derive(Debug, Hash, Eq, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CellKey {
     pub window_start_ms: u64,
     pub lower_cents: i64,
