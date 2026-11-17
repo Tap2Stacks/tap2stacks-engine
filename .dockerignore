@@ -1,0 +1,11 @@
+.git
+.github
+target
+tap2stacks-model
+APP_LAYER_LOG.md
+BENCHMARK_GRID.md
+MATH_MODEL.md
+PARITY_DEBUG_LOG.md
+PORT_FROM_PYTHON.md
+binance-price.example.ts
+scripts

@@ -1,0 +1,22 @@
+{
+  "spot": 50000.0,
+  "history": [
+    { "open": 50000.0, "high": 50020.0, "low": 49980.0, "close": 50010.0 },
+    { "open": 50010.0, "high": 50045.0, "low": 49995.0, "close": 50030.0 },
+    { "open": 50030.0, "high": 50060.0, "low": 50010.0, "close": 50040.0 }
+  ],
+  "config": {
+    "simulation": {
+      "seed": 12345,
+      "use_parallel": false,
+      "parallel_workers": 1,
+      "mc_n_min": 5000,
+      "mc_n_max": 5000,
+      "adaptive_mc": false,
+      "use_antithetic": true
+    },
+    "volatility": {
+      "jump": { "enabled": false }
+    }
+  }
+}
