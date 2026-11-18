@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use st_engine::calibrate::{
     CalibrateOptions, CalibrationSample, brier_score, implied_house_edge, reliability_table,
-    run_calibration,
+    run_calibration, tail_reliability_table,
 };
 use st_engine::grid::{GridConfig, stock_grid_config_for_ticker};
 use st_engine::price::{PriceTick, read_hl_jsonl};
@@ -25,6 +25,7 @@ struct CliArgs {
     a_sigma: Option<f64>,
     jump_enabled: Option<bool>,
     bridge_epsilon: Option<f64>,
+    variance_floor: Option<f64>,
     mc_n: Option<usize>,
     seed: Option<u64>,
 }
@@ -48,6 +49,7 @@ impl Default for CliArgs {
             a_sigma: None,
             jump_enabled: None,
             bridge_epsilon: None,
+            variance_floor: None,
             mc_n: None,
             seed: Some(42),
         }
@@ -72,6 +74,7 @@ fn apply_arg(out: &mut CliArgs, key: &str, val: &str) -> Result<(), String> {
         "--a-sigma" => out.a_sigma = Some(val.parse().map_err(|_| "bad --a-sigma")?),
         "--jump-enabled" => out.jump_enabled = Some(val.parse().map_err(|_| "bad --jump-enabled")?),
         "--bridge-epsilon" => out.bridge_epsilon = Some(val.parse().map_err(|_| "bad --bridge-epsilon")?),
+        "--variance-floor" => out.variance_floor = Some(val.parse().map_err(|_| "bad --variance-floor")?),
         "--mc-n" => out.mc_n = Some(val.parse().map_err(|_| "bad --mc-n")?),
         "--seed" => out.seed = Some(val.parse().map_err(|_| "bad --seed")?),
         _ => return Err(format!("unknown arg: {key}")),
@@ -109,6 +112,7 @@ fn apply_overrides(cfg: &mut GridConfig, cli: &CliArgs) {
     if let Some(v) = cli.a_sigma { cfg.pricing.a_sigma = v; }
     if let Some(v) = cli.jump_enabled { cfg.volatility.jump.enabled = v; }
     if let Some(v) = cli.bridge_epsilon { cfg.simulation.bridge_epsilon = v; }
+    if let Some(v) = cli.variance_floor { cfg.volatility.variance_floor = v; }
     if let Some(v) = cli.mc_n {
         cfg.simulation.mc_n_min = v;
         cfg.simulation.mc_n_max = v;
@@ -129,7 +133,7 @@ fn load_ticks(cli: &CliArgs) -> Vec<PriceTick> {
     ticks
 }
 
-fn print_section(label: &str, subset: &[&CalibrationSample]) {
+fn print_section(label: &str, subset: &[&CalibrationSample], max_multiplier: f64) {
     if subset.is_empty() {
         println!("\n=== {label} (n=0) ===");
         return;
@@ -137,9 +141,15 @@ fn print_section(label: &str, subset: &[&CalibrationSample]) {
     let pairs: Vec<(f64, bool)> = subset.iter().map(|s| (s.predicted, s.hit)).collect();
     let edge_tuples: Vec<(f64, bool, f64)> =
         subset.iter().map(|s| (s.predicted, s.hit, s.multiplier)).collect();
+    let unclamped: Vec<(f64, bool, f64)> = subset
+        .iter()
+        .filter(|s| s.multiplier < max_multiplier - 1e-6)
+        .map(|s| (s.predicted, s.hit, s.multiplier))
+        .collect();
     let table = reliability_table(&pairs, 10);
     let brier = brier_score(&pairs);
     let edge = implied_house_edge(&edge_tuples);
+    let unclamped_edge = implied_house_edge(&unclamped);
     let worst_gap = table
         .iter()
         .filter(|b| b.count >= 200)
@@ -147,9 +157,11 @@ fn print_section(label: &str, subset: &[&CalibrationSample]) {
         .fold(0.0_f64, f64::max);
 
     println!(
-        "\n=== {label} (samples={}, brier={brier:.6}, edge={:.2}%, worst_gap_200={:.2}pp) ===",
+        "\n=== {label} (samples={}, unclamped={}, brier={brier:.6}, edge={:.2}%, unclamped_edge={:.2}%, worst_gap_200={:.2}pp) ===",
         subset.len(),
+        unclamped.len(),
         edge * 100.0,
+        unclamped_edge * 100.0,
         worst_gap * 100.0
     );
     println!("bucket       |   count | mean_pred |  hit_rate |   diff_pp");
@@ -161,17 +173,27 @@ fn print_section(label: &str, subset: &[&CalibrationSample]) {
             b.count, b.mean_predicted, b.hit_rate, (b.mean_predicted - b.hit_rate) * 100.0
         );
     }
+
+    let tail = tail_reliability_table(&edge_tuples);
+    println!("tail p<0.1     |   count | mean_pred |  hit_rate | hit/pred |   edge_%");
+    for t in &tail {
+        if t.count == 0 { continue; }
+        println!(
+            "[{:.3}, {:.3}) | {:7} | {:9.5} | {:9.5} | {:8.3} | {:+7.2}%",
+            t.lo, t.hi, t.count, t.mean_predicted, t.hit_rate, t.hit_to_pred_ratio, t.implied_edge * 100.0
+        );
+    }
 }
 
 fn print_report(cli: &CliArgs, cfg: &GridConfig, ticker: &str, ticks: &[PriceTick]) {
     println!(
-        "coin={} ticker={} band_cents={} ticks={} sigma_scale={} sigma_ref={} ewma_hl={} p_raw_gamma={} p_time_boost={} cur_shift={} adj_shift={} zone_vol={} m_base={} m_risk_max={} a_sigma={} jump={}",
+        "coin={} ticker={} band_cents={} ticks={} sigma_scale={} sigma_ref={} ewma_hl={} p_raw_gamma={} p_time_boost={} cur_shift={} adj_shift={} zone_vol={} m_base={} m_risk_max={} a_sigma={} jump={} bridge_eps={:e} var_floor={:e}",
         cli.coin, ticker, cli.band_cents, ticks.len(), cfg.volatility.sigma_scale,
         cfg.volatility.sigma_ref, cfg.volatility.ewma_half_life_seconds, cfg.pricing.p_raw_gamma,
         cfg.pricing.p_time_boost, cfg.pricing.current_row_logit_shift,
         cfg.pricing.adjacent_row_logit_shift, cfg.pricing.zone_vol_shift_scale,
         cfg.pricing.m_base, cfg.pricing.m_risk_max, cfg.pricing.a_sigma,
-        cfg.volatility.jump.enabled,
+        cfg.volatility.jump.enabled, cfg.simulation.bridge_epsilon, cfg.volatility.variance_floor,
     );
     let report = run_calibration(
         ticks,
@@ -196,11 +218,12 @@ fn print_report(cli: &CliArgs, cfg: &GridConfig, ticker: &str, ticks: &[PriceTic
     let off_warmup: Vec<_> = report.samples.iter().filter(|s| !s.is_us_session && s.is_warmup).collect();
     let all_samples: Vec<_> = report.samples.iter().collect();
 
-    print_section("US REGULAR (13:30-20:00 UTC) STEADY (>5m)", &us_steady);
-    print_section("US REGULAR (13:30-20:00 UTC) WARMUP (0-5m)", &us_warmup);
-    print_section("OFF-HOURS STEADY (>5m)", &off_steady);
-    print_section("OFF-HOURS WARMUP (0-5m)", &off_warmup);
-    print_section("ALL COMBINED", &all_samples);
+    let max_m = cfg.pricing.max_multiplier;
+    print_section("US REGULAR (13:30-20:00 UTC) STEADY (>5m)", &us_steady, max_m);
+    print_section("US REGULAR (13:30-20:00 UTC) WARMUP (0-5m)", &us_warmup, max_m);
+    print_section("OFF-HOURS STEADY (>5m)", &off_steady, max_m);
+    print_section("OFF-HOURS WARMUP (0-5m)", &off_warmup, max_m);
+    print_section("ALL COMBINED", &all_samples, max_m);
 }
 
 fn main() {

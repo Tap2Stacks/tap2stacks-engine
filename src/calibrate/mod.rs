@@ -7,7 +7,8 @@ use crate::quote::QuoteEngine;
 
 use eval::{VOID_GAP_MS, collect_gaps_over_3s, window_hit_bands, window_is_void};
 pub use stats::{
-    Bucket, brier_score, implied_house_edge, is_us_regular_session_utc, reliability_table,
+    Bucket, TailBucket, brier_score, implied_house_edge, is_us_regular_session_utc,
+    reliability_table, tail_reliability_table,
 };
 
 const MAX_COMPLETED_BARS: usize = 600;

@@ -1,10 +1,42 @@
 use super::types::{
-    GridConfig, GridSpec, SimulationConfig, TimeWindow, TouchMode, VolatilityConfig,
+    CalibrationKey, GridConfig, GridSpec, PricingConfig, SimulationConfig, TimeWindow, TouchMode,
+    VolatilityConfig,
 };
+
+const CALIBRATION_WINDOWS: usize = 6;
+const CALIBRATION_SIGMA_BUCKETS: usize = 3;
+
+fn set_distance_factors(cfg: &mut GridConfig, dist_factors: &[(usize, f64)]) {
+    cfg.calibration.factors.clear();
+    for window_index in 0..CALIBRATION_WINDOWS {
+        for sigma_bucket in 0..CALIBRATION_SIGMA_BUCKETS {
+            for &(dist_bucket, factor) in dist_factors {
+                cfg.calibration.factors.insert(
+                    CalibrationKey {
+                        window_index,
+                        dist_bucket,
+                        sigma_bucket,
+                    },
+                    factor,
+                );
+            }
+        }
+    }
+}
 
 /// Builds a `GridConfig` configured for US equity 1 Hz discrete-sample quoting.
 pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfig {
     let default = GridConfig::default();
+    let mut volatility = VolatilityConfig {
+        parkinson_weight: 0.0,
+        price_adj_min: 1.0,
+        price_adj_max: 1.0,
+        variance_floor: 1e-10,
+        sigma_scale: 0.99,
+        ..default.volatility
+    };
+    volatility.jump.enabled = false;
+
     GridConfig {
         spec: GridSpec {
             rows: 20,
@@ -15,13 +47,18 @@ pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfi
         simulation: SimulationConfig {
             touch_mode: TouchMode::Continuous,
             lock_offset: 0,
+            bridge_epsilon: 1e-12,
             ..default.simulation
         },
-        volatility: VolatilityConfig {
-            parkinson_weight: 0.0,
-            price_adj_min: 1.0,
-            price_adj_max: 1.0,
-            ..default.volatility
+        volatility,
+        pricing: PricingConfig {
+            m_base: 0.012,
+            p_raw_gamma: 0.0,
+            p_time_boost: 0.0,
+            current_row_logit_shift: 0.32,
+            adjacent_row_logit_shift: 0.0,
+            zone_vol_shift_scale: 0.0,
+            ..default.pricing
         },
         ..default
     }
@@ -29,11 +66,25 @@ pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfi
 
 /// Builds a ticker-specific `GridConfig` for US equities (`NVDA`, `TSLA`).
 pub fn stock_grid_config_for_ticker(
-    _ticker: &str,
+    ticker: &str,
     band_cents: u32,
     windows: Vec<TimeWindow>,
 ) -> GridConfig {
-    stock_grid_config(band_cents, windows)
+    let mut cfg = stock_grid_config(band_cents, windows);
+    let symbol = ticker.split(':').next_back().unwrap_or(ticker);
+    if symbol.eq_ignore_ascii_case("TSLA") {
+        cfg.volatility.sigma_ref = 0.00011;
+        cfg.volatility.sigma_scale = 1.035;
+        cfg.pricing.m_base = 0.012;
+        cfg.pricing.current_row_logit_shift = 0.72;
+        set_distance_factors(&mut cfg, &[(1, 0.73), (2, 0.51), (3, 0.53), (4, 0.91)]);
+    } else if symbol.eq_ignore_ascii_case("NVDA") {
+        cfg.volatility.sigma_ref = 0.00023;
+        set_distance_factors(&mut cfg, &[(1, 0.72), (2, 0.555), (3, 0.51), (4, 0.96)]);
+    } else {
+        cfg.volatility.sigma_ref = 0.00020;
+    }
+    cfg
 }
 
 #[cfg(test)]
@@ -137,6 +188,49 @@ mod tests {
         assert!(stock_vol.sigma > btc_vol.sigma);
         assert!(
             (stock_vol.sigma - stock_vol.sigma_raw * c.volatility.sigma_scale).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn ticker_configs_set_calibrated_stock_defaults() {
+        let windows = vec![TimeWindow {
+            start_secs: 5,
+            end_secs: 10,
+        }];
+        let nvda = stock_grid_config_for_ticker("NVDA", 3, windows.clone());
+        let tsla = stock_grid_config_for_ticker("xyz:TSLA", 8, windows);
+        assert_eq!(nvda.volatility.sigma_ref, 0.00023);
+        assert_eq!(nvda.volatility.sigma_scale, 0.99);
+        assert_eq!(nvda.volatility.variance_floor, 1e-10);
+        assert!(!nvda.volatility.jump.enabled);
+        assert_eq!(nvda.simulation.bridge_epsilon, 1e-12);
+        assert_eq!(nvda.pricing.m_base, 0.012);
+        assert_eq!(nvda.pricing.p_raw_gamma, 0.0);
+        assert_eq!(nvda.pricing.current_row_logit_shift, 0.32);
+        assert_eq!(
+            nvda.calibration.factors.get(&CalibrationKey {
+                window_index: 0,
+                dist_bucket: 2,
+                sigma_bucket: 1,
+            }),
+            Some(&0.555)
+        );
+
+        assert_eq!(tsla.volatility.sigma_ref, 0.00011);
+        assert_eq!(tsla.volatility.sigma_scale, 1.035);
+        assert_eq!(tsla.volatility.variance_floor, 1e-10);
+        assert!(!tsla.volatility.jump.enabled);
+        assert_eq!(tsla.simulation.bridge_epsilon, 1e-12);
+        assert_eq!(tsla.pricing.m_base, 0.012);
+        assert_eq!(tsla.pricing.p_raw_gamma, 0.0);
+        assert_eq!(tsla.pricing.current_row_logit_shift, 0.72);
+        assert_eq!(
+            tsla.calibration.factors.get(&CalibrationKey {
+                window_index: 0,
+                dist_bucket: 2,
+                sigma_bucket: 1,
+            }),
+            Some(&0.51)
         );
     }
 }
