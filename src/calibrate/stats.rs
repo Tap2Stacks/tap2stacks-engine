@@ -76,16 +76,9 @@ pub fn implied_house_edge(samples: &[(f64, bool, f64)]) -> f64 {
     1.0 - payout_sum / samples.len() as f64
 }
 
-/// US regular session: weekdays (Mon..=Fri), 13:30..20:00 UTC.
+/// US regular session (`09:30-16:00 America/New_York`, weekdays, non-holiday).
 pub fn is_us_regular_session_utc(ts_ms: u64) -> bool {
-    let days_since_epoch = ts_ms / 86_400_000;
-    // 1970-01-01 was Thursday (weekday 4 in Mon=1..Sun=7).
-    let weekday = ((days_since_epoch + 3) % 7) + 1;
-    if weekday > 5 {
-        return false;
-    }
-    let secs_in_day = (ts_ms / 1_000) % 86_400;
-    secs_in_day >= 48_600 && secs_in_day < 72_000
+    crate::session::is_us_regular_session(ts_ms)
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -219,8 +219,8 @@ fn print_report(cli: &CliArgs, cfg: &GridConfig, ticker: &str, ticks: &[PriceTic
     let all_samples: Vec<_> = report.samples.iter().collect();
 
     let max_m = cfg.pricing.max_multiplier;
-    print_section("US REGULAR (13:30-20:00 UTC) STEADY (>5m)", &us_steady, max_m);
-    print_section("US REGULAR (13:30-20:00 UTC) WARMUP (0-5m)", &us_warmup, max_m);
+    print_section("US REGULAR (09:30-16:00 NY / 14:30-21:00 EST) STEADY (>5m)", &us_steady, max_m);
+    print_section("US REGULAR (09:30-16:00 NY / 14:30-21:00 EST) WARMUP (0-5m)", &us_warmup, max_m);
     print_section("OFF-HOURS STEADY (>5m)", &off_steady, max_m);
     print_section("OFF-HOURS WARMUP (0-5m)", &off_warmup, max_m);
     print_section("ALL COMBINED", &all_samples, max_m);

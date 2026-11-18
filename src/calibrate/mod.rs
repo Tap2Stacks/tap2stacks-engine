@@ -173,7 +173,7 @@ fn evaluate_window(
         .collect();
     let hits = window_hit_bands(ticks, tick_idx, window_start_ms, window_end_ms, &bands_cents);
     let is_warmup = window_start_ms.saturating_sub(state.feed_start_ms) < opts.warmup_ms;
-    let is_us_session = is_us_regular_session_utc(window_start_ms);
+    let is_us_session = crate::session::is_us_regular_session(window_start_ms);
 
     report.evaluated_windows += 1;
     for (cell, hit) in window_cells.into_iter().zip(hits) {
