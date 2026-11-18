@@ -1,4 +1,4 @@
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/engine_server /usr/local/bin/engine_server
 
 ENV RUST_LOG=info
-ENV ENGINE_BIND_ADDR=0.0.0.0:8090
+ENV ENGINE_BIND_ADDR=[::]:8090
 EXPOSE 8090
 
 CMD ["engine_server"]

@@ -1,0 +1,23 @@
+# Placeholder app name — the owner chooses the actual Fly app name on `fly launch --no-deploy --copy-config`
+app = "st-engine"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUST_LOG = "info,st_engine=info"
+  # Bind dual-stack IPv6/IPv4 so Fly's private 6PN DNS (<app>.internal:8090) and local TCP checks connect
+  ENGINE_BIND_ADDR = "[::]:8090"
+  ENGINE_TICKERS = "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8"
+
+[checks]
+  [checks.tcp]
+    port = 8090
+    type = "tcp"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
