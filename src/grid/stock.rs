@@ -74,14 +74,17 @@ pub fn stock_grid_config_for_ticker(
     let symbol = ticker.split(':').next_back().unwrap_or(ticker);
     if symbol.eq_ignore_ascii_case("TSLA") {
         cfg.volatility.sigma_ref = 0.00011;
-        cfg.volatility.sigma_scale = 1.07;
+        cfg.volatility.sigma_scale = 1.073;
+        cfg.volatility.variance_floor = 2.08e-9;
         cfg.pricing.m_base = 0.012;
-        cfg.pricing.off_hours_m_base = Some(0.025);
         cfg.pricing.current_row_logit_shift = 0.64;
         set_distance_factors(&mut cfg, &[(1, 0.71), (2, 0.49), (3, 0.51), (4, 0.94)]);
     } else if symbol.eq_ignore_ascii_case("NVDA") {
         cfg.volatility.sigma_ref = 0.00023;
-        cfg.pricing.off_hours_m_base = Some(0.090);
+        cfg.volatility.sigma_scale = 1.035;
+        cfg.volatility.variance_floor = 1.8e-9;
+        cfg.pricing.m_base = 0.015;
+        cfg.pricing.off_hours_m_base = Some(0.094);
         set_distance_factors(&mut cfg, &[(1, 0.72), (2, 0.545), (3, 0.505), (4, 0.96)]);
     } else {
         cfg.volatility.sigma_ref = 0.00020;
@@ -202,12 +205,12 @@ mod tests {
         let nvda = stock_grid_config_for_ticker("NVDA", 3, windows.clone());
         let tsla = stock_grid_config_for_ticker("xyz:TSLA", 8, windows);
         assert_eq!(nvda.volatility.sigma_ref, 0.00023);
-        assert_eq!(nvda.volatility.sigma_scale, 1.005);
-        assert_eq!(nvda.volatility.variance_floor, 1e-10);
+        assert_eq!(nvda.volatility.sigma_scale, 1.035);
+        assert_eq!(nvda.volatility.variance_floor, 1.8e-9);
         assert!(!nvda.volatility.jump.enabled);
         assert_eq!(nvda.simulation.bridge_epsilon, 1e-12);
-        assert_eq!(nvda.pricing.m_base, 0.020);
-        assert_eq!(nvda.pricing.off_hours_m_base, Some(0.090));
+        assert_eq!(nvda.pricing.m_base, 0.015);
+        assert_eq!(nvda.pricing.off_hours_m_base, Some(0.094));
         assert_eq!(nvda.pricing.p_raw_gamma, 0.0);
         assert_eq!(nvda.pricing.current_row_logit_shift, 0.32);
         assert_eq!(
@@ -220,12 +223,12 @@ mod tests {
         );
 
         assert_eq!(tsla.volatility.sigma_ref, 0.00011);
-        assert_eq!(tsla.volatility.sigma_scale, 1.07);
-        assert_eq!(tsla.volatility.variance_floor, 1e-10);
+        assert_eq!(tsla.volatility.sigma_scale, 1.073);
+        assert_eq!(tsla.volatility.variance_floor, 2.08e-9);
         assert!(!tsla.volatility.jump.enabled);
         assert_eq!(tsla.simulation.bridge_epsilon, 1e-12);
         assert_eq!(tsla.pricing.m_base, 0.012);
-        assert_eq!(tsla.pricing.off_hours_m_base, Some(0.025));
+        assert_eq!(tsla.pricing.off_hours_m_base, None);
         assert_eq!(tsla.pricing.p_raw_gamma, 0.0);
         assert_eq!(tsla.pricing.current_row_logit_shift, 0.64);
         assert_eq!(
