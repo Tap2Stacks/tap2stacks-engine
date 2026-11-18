@@ -19,5 +19,7 @@ primary_region = "sin"
     timeout = "5s"
     grace_period = "10s"
 
+# One machine: the backend connects to <engine-app>.internal; deploy with --ha=false.
 [[vm]]
   size = "shared-cpu-1x"
+  memory = "512mb"
