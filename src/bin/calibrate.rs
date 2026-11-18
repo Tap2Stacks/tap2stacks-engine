@@ -21,6 +21,7 @@ struct CliArgs {
     adjacent_shift: Option<f64>,
     zone_vol_scale: Option<f64>,
     m_base: Option<f64>,
+    off_hours_m_base: Option<f64>,
     m_risk_max: Option<f64>,
     a_sigma: Option<f64>,
     jump_enabled: Option<bool>,
@@ -45,6 +46,7 @@ impl Default for CliArgs {
             adjacent_shift: None,
             zone_vol_scale: None,
             m_base: None,
+            off_hours_m_base: None,
             m_risk_max: None,
             a_sigma: None,
             jump_enabled: None,
@@ -70,6 +72,7 @@ fn apply_arg(out: &mut CliArgs, key: &str, val: &str) -> Result<(), String> {
         "--adjacent-shift" => out.adjacent_shift = Some(val.parse().map_err(|_| "bad --adjacent-shift")?),
         "--zone-vol-scale" => out.zone_vol_scale = Some(val.parse().map_err(|_| "bad --zone-vol-scale")?),
         "--m-base" => out.m_base = Some(val.parse().map_err(|_| "bad --m-base")?),
+        "--off-hours-m-base" => out.off_hours_m_base = Some(val.parse().map_err(|_| "bad --off-hours-m-base")?),
         "--m-risk-max" => out.m_risk_max = Some(val.parse().map_err(|_| "bad --m-risk-max")?),
         "--a-sigma" => out.a_sigma = Some(val.parse().map_err(|_| "bad --a-sigma")?),
         "--jump-enabled" => out.jump_enabled = Some(val.parse().map_err(|_| "bad --jump-enabled")?),
@@ -108,6 +111,7 @@ fn apply_overrides(cfg: &mut GridConfig, cli: &CliArgs) {
     if let Some(v) = cli.adjacent_shift { cfg.pricing.adjacent_row_logit_shift = v; }
     if let Some(v) = cli.zone_vol_scale { cfg.pricing.zone_vol_shift_scale = v; }
     if let Some(v) = cli.m_base { cfg.pricing.m_base = v; }
+    if let Some(v) = cli.off_hours_m_base { cfg.pricing.off_hours_m_base = Some(v); }
     if let Some(v) = cli.m_risk_max { cfg.pricing.m_risk_max = v; }
     if let Some(v) = cli.a_sigma { cfg.pricing.a_sigma = v; }
     if let Some(v) = cli.jump_enabled { cfg.volatility.jump.enabled = v; }
@@ -155,14 +159,20 @@ fn print_section(label: &str, subset: &[&CalibrationSample], max_multiplier: f64
         .filter(|b| b.count >= 200)
         .map(|b| (b.mean_predicted - b.hit_rate).abs())
         .fold(0.0_f64, f64::max);
+    let worst_gap_100 = table
+        .iter()
+        .filter(|b| b.count >= 100)
+        .map(|b| (b.mean_predicted - b.hit_rate).abs())
+        .fold(0.0_f64, f64::max);
 
     println!(
-        "\n=== {label} (samples={}, unclamped={}, brier={brier:.6}, edge={:.2}%, unclamped_edge={:.2}%, worst_gap_200={:.2}pp) ===",
+        "\n=== {label} (samples={}, unclamped={}, brier={brier:.6}, edge={:.2}%, unclamped_edge={:.2}%, worst_gap_200={:.2}pp, worst_gap_100={:.2}pp) ===",
         subset.len(),
         unclamped.len(),
         edge * 100.0,
         unclamped_edge * 100.0,
-        worst_gap * 100.0
+        worst_gap * 100.0,
+        worst_gap_100 * 100.0
     );
     println!("bucket       |   count | mean_pred |  hit_rate |   diff_pp");
     for b in &table {
@@ -187,12 +197,12 @@ fn print_section(label: &str, subset: &[&CalibrationSample], max_multiplier: f64
 
 fn print_report(cli: &CliArgs, cfg: &GridConfig, ticker: &str, ticks: &[PriceTick]) {
     println!(
-        "coin={} ticker={} band_cents={} ticks={} sigma_scale={} sigma_ref={} ewma_hl={} p_raw_gamma={} p_time_boost={} cur_shift={} adj_shift={} zone_vol={} m_base={} m_risk_max={} a_sigma={} jump={} bridge_eps={:e} var_floor={:e}",
+        "coin={} ticker={} band_cents={} ticks={} sigma_scale={} sigma_ref={} ewma_hl={} p_raw_gamma={} p_time_boost={} cur_shift={} adj_shift={} zone_vol={} m_base={} off_m_base={:?} m_risk_max={} a_sigma={} jump={} bridge_eps={:e} var_floor={:e}",
         cli.coin, ticker, cli.band_cents, ticks.len(), cfg.volatility.sigma_scale,
         cfg.volatility.sigma_ref, cfg.volatility.ewma_half_life_seconds, cfg.pricing.p_raw_gamma,
         cfg.pricing.p_time_boost, cfg.pricing.current_row_logit_shift,
         cfg.pricing.adjacent_row_logit_shift, cfg.pricing.zone_vol_shift_scale,
-        cfg.pricing.m_base, cfg.pricing.m_risk_max, cfg.pricing.a_sigma,
+        cfg.pricing.m_base, cfg.pricing.off_hours_m_base, cfg.pricing.m_risk_max, cfg.pricing.a_sigma,
         cfg.volatility.jump.enabled, cfg.simulation.bridge_epsilon, cfg.volatility.variance_floor,
     );
     let report = run_calibration(

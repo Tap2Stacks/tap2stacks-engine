@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::grid::{
     GridConfig, OhlcBar, PriceBand, TimeWindow, VolatilitySnapshot, compute_k_safety,
-    compute_quote_probability, estimate_runtime_state, price_multiplier, simulate_summary,
-    stock_grid_config_for_ticker,
+    compute_quote_probability, effective_m_base, estimate_runtime_state,
+    price_multiplier_with_margin, simulate_summary, stock_grid_config_for_ticker,
 };
 use crate::price::PriceTick;
+use crate::session::is_us_regular_session;
 
 pub use book::{CellKey, ExposureBook};
 
@@ -287,11 +288,13 @@ impl QuoteEngine {
                 continue;
             }
             let liability = self.exposure.get(&cell.key);
-            let multiplier = price_multiplier(
+            let m_base = effective_m_base(&self.config, is_us_regular_session(cell.key.window_start_ms));
+            let multiplier = price_multiplier_with_margin(
                 cell.hit_probability,
                 volatility,
                 liability,
                 k_safety,
+                m_base,
                 &self.config,
             );
             cells.push(StockCell {
@@ -626,5 +629,61 @@ mod tests {
         let key_json = serde_json::to_string(&key).expect("CellKey should serialize");
         let key_rt: CellKey = serde_json::from_str(&key_json).expect("CellKey should deserialize");
         assert_eq!(key, key_rt);
+    }
+
+    #[test]
+    fn off_hours_cell_uses_higher_margin_than_us_regular() {
+        let us_ts = 1_794_931_200_000_u64; // 2026-11-17 16:00:00Z = 11:00 EST (US regular)
+        let off_ts = 1_794_916_800_000_u64; // 2026-11-17 12:00:00Z = 07:00 EST (off-hours)
+        assert!(is_us_regular_session(us_ts + 5_000));
+        assert!(!is_us_regular_session(off_ts + 5_000));
+
+        let spot = 157.53;
+        let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg.simulation.seed = Some(42);
+        let mut us_engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg.clone());
+        us_engine.on_sample(PriceTick { ts_ms: us_ts, price: spot }, &sample_history(spot));
+        let us_quote = us_engine.price(us_ts);
+
+        let mut off_engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
+        off_engine.on_sample(PriceTick { ts_ms: off_ts, price: spot }, &sample_history(spot));
+        let off_quote = off_engine.price(off_ts);
+
+        assert_eq!(us_quote.cells.len(), off_quote.cells.len());
+        let mut checked = 0usize;
+        for (us_cell, off_cell) in us_quote.cells.iter().zip(off_quote.cells.iter()) {
+            assert!((us_cell.hit_probability - off_cell.hit_probability).abs() < 1e-12);
+            if us_cell.multiplier < 25.0 && us_cell.multiplier > 1.05 {
+                assert!(
+                    off_cell.multiplier < us_cell.multiplier,
+                    "expected off-hours multiplier ({}) < US multiplier ({}) for p={}",
+                    off_cell.multiplier,
+                    us_cell.multiplier,
+                    us_cell.hit_probability,
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn us_regular_quote_ignores_off_hours_m_base() {
+        let us_ts = 1_794_931_200_000_u64; // 2026-11-17 16:00:00Z = 11:00 EST
+        let spot = 157.53;
+        let history = sample_history(spot);
+
+        let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg.simulation.seed = Some(42);
+        let mut with_off_hours = QuoteEngine::with_config("NVDA".to_string(), 3, cfg.clone());
+        with_off_hours.on_sample(PriceTick { ts_ms: us_ts, price: spot }, &history);
+        let q1 = with_off_hours.price(us_ts);
+
+        cfg.pricing.off_hours_m_base = None;
+        let mut baseline = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
+        baseline.on_sample(PriceTick { ts_ms: us_ts, price: spot }, &history);
+        let q2 = baseline.price(us_ts);
+
+        assert_eq!(q1.cells, q2.cells);
     }
 }

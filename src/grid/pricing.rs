@@ -1,6 +1,18 @@
 use super::types::{CalibrationKey, GridConfig, TimeWindow, VolatilitySnapshot};
 
-pub fn compute_m_eff(volatility: VolatilitySnapshot, config: &GridConfig) -> f64 {
+pub fn effective_m_base(config: &GridConfig, is_us_regular: bool) -> f64 {
+    if is_us_regular {
+        config.pricing.m_base
+    } else {
+        config.pricing.off_hours_m_base.unwrap_or(config.pricing.m_base)
+    }
+}
+
+pub fn compute_m_eff_with_base(
+    volatility: VolatilitySnapshot,
+    m_base: f64,
+    config: &GridConfig,
+) -> f64 {
     let epsilon = config.volatility.variance_floor;
     let sigma_term = (volatility.sigma / config.volatility.sigma_ref.max(epsilon) - 1.0).max(0.0);
     let lambda_term =
@@ -9,7 +21,11 @@ pub fn compute_m_eff(volatility: VolatilitySnapshot, config: &GridConfig) -> f64
         + config.pricing.a_lambda * lambda_term)
         .clamp(0.0, config.pricing.m_risk_max);
 
-    config.pricing.m_base + m_risk
+    m_base + m_risk
+}
+
+pub fn compute_m_eff(volatility: VolatilitySnapshot, config: &GridConfig) -> f64 {
+    compute_m_eff_with_base(volatility, config.pricing.m_base, config)
 }
 
 pub fn compute_quote_probability(
@@ -160,6 +176,21 @@ pub fn apply_quote_logit_shift(probability: f64, shift: f64, epsilon: f64) -> f6
     shifted.clamp(epsilon, 1.0 - epsilon)
 }
 
+pub fn price_multiplier_with_margin(
+    hit_probability: f64,
+    volatility: VolatilitySnapshot,
+    liability: f64,
+    k_safety: f64,
+    m_base: f64,
+    config: &GridConfig,
+) -> f64 {
+    let bounded_probability = hit_probability.clamp(config.volatility.variance_floor, 1.0);
+    let base = (1.0 - compute_m_eff_with_base(volatility, m_base, config)) / bounded_probability;
+    let k_skew = compute_k_skew(liability, config);
+    (base * k_skew * k_safety * config.pricing.skew_factor * config.pricing.safety_factor)
+        .clamp(config.pricing.min_multiplier, config.pricing.max_multiplier)
+}
+
 pub fn price_multiplier(
     hit_probability: f64,
     volatility: VolatilitySnapshot,
@@ -167,9 +198,12 @@ pub fn price_multiplier(
     k_safety: f64,
     config: &GridConfig,
 ) -> f64 {
-    let bounded_probability = hit_probability.clamp(config.volatility.variance_floor, 1.0);
-    let base = (1.0 - compute_m_eff(volatility, config)) / bounded_probability;
-    let k_skew = compute_k_skew(liability, config);
-    (base * k_skew * k_safety * config.pricing.skew_factor * config.pricing.safety_factor)
-        .clamp(config.pricing.min_multiplier, config.pricing.max_multiplier)
+    price_multiplier_with_margin(
+        hit_probability,
+        volatility,
+        liability,
+        k_safety,
+        config.pricing.m_base,
+        config,
+    )
 }

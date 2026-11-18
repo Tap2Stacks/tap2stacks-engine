@@ -327,6 +327,7 @@ impl Default for VolatilityConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PricingConfig {
     pub m_base: f64,
+    pub off_hours_m_base: Option<f64>,
     pub m_risk_max: f64,
     pub lambda_ref: f64,
     pub a_sigma: f64,
@@ -354,6 +355,7 @@ impl Default for PricingConfig {
     fn default() -> Self {
         Self {
             m_base: 0.02,
+            off_hours_m_base: None,
             m_risk_max: 0.025,
             lambda_ref: 0.1,
             a_sigma: 0.5,
@@ -448,6 +450,13 @@ impl GridConfig {
             return Err(GridError::InvalidConfig(
                 "pricing.liability_rho must be between 0 and 1",
             ));
+        }
+        if let Some(off_m_base) = self.pricing.off_hours_m_base {
+            if !off_m_base.is_finite() || !(0.0..1.0).contains(&off_m_base) {
+                return Err(GridError::InvalidConfig(
+                    "pricing.off_hours_m_base must be in [0, 1)",
+                ));
+            }
         }
         for window in &self.spec.windows {
             if window.start_secs >= window.end_secs {

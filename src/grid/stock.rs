@@ -76,10 +76,12 @@ pub fn stock_grid_config_for_ticker(
         cfg.volatility.sigma_ref = 0.00011;
         cfg.volatility.sigma_scale = 1.07;
         cfg.pricing.m_base = 0.012;
+        cfg.pricing.off_hours_m_base = Some(0.025);
         cfg.pricing.current_row_logit_shift = 0.64;
         set_distance_factors(&mut cfg, &[(1, 0.71), (2, 0.49), (3, 0.51), (4, 0.94)]);
     } else if symbol.eq_ignore_ascii_case("NVDA") {
         cfg.volatility.sigma_ref = 0.00023;
+        cfg.pricing.off_hours_m_base = Some(0.090);
         set_distance_factors(&mut cfg, &[(1, 0.72), (2, 0.545), (3, 0.505), (4, 0.96)]);
     } else {
         cfg.volatility.sigma_ref = 0.00020;
@@ -205,6 +207,7 @@ mod tests {
         assert!(!nvda.volatility.jump.enabled);
         assert_eq!(nvda.simulation.bridge_epsilon, 1e-12);
         assert_eq!(nvda.pricing.m_base, 0.020);
+        assert_eq!(nvda.pricing.off_hours_m_base, Some(0.090));
         assert_eq!(nvda.pricing.p_raw_gamma, 0.0);
         assert_eq!(nvda.pricing.current_row_logit_shift, 0.32);
         assert_eq!(
@@ -222,6 +225,7 @@ mod tests {
         assert!(!tsla.volatility.jump.enabled);
         assert_eq!(tsla.simulation.bridge_epsilon, 1e-12);
         assert_eq!(tsla.pricing.m_base, 0.012);
+        assert_eq!(tsla.pricing.off_hours_m_base, Some(0.025));
         assert_eq!(tsla.pricing.p_raw_gamma, 0.0);
         assert_eq!(tsla.pricing.current_row_logit_shift, 0.64);
         assert_eq!(

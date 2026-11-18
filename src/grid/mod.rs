@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use pricing::{
     apply_quote_logit_shift, compute_k_safety, compute_k_skew, compute_m_eff,
-    compute_quote_probability, price_multiplier, smooth_used_liability,
+    compute_m_eff_with_base, compute_quote_probability, effective_m_base, price_multiplier,
+    price_multiplier_with_margin, smooth_used_liability,
 };
 pub use simulator::{
     debug_reconstruct_paths_from_returns, debug_reconstruct_paths_from_shocks,
