@@ -1,27 +1,14 @@
 use super::types::{GridConfig, GridError, OhlcBar, RuntimeState, VolatilitySnapshot};
 
+/// Prior sample weight `k` when blending initial EWMA variance from restart history.
+const SEED_PRIOR_WEIGHT: f64 = 12.0;
+
 pub fn estimate_volatility(
     spot: f64,
     history: &[OhlcBar],
     config: &GridConfig,
 ) -> Result<VolatilitySnapshot, GridError> {
-    if spot <= 0.0 {
-        return Err(GridError::InvalidSpot);
-    }
-    if history.is_empty() {
-        return Err(GridError::InvalidHistory(
-            "at least one OHLC bar is required",
-        ));
-    }
-
-    let mut state = RuntimeState::default();
-
-    for bar in history {
-        validate_bar(*bar)?;
-        state = update_runtime_state(&state, bar.close, Some(bar), config)?;
-    }
-
-    Ok(reprice_sigma_for_spot(state.volatility, spot, config))
+    Ok(estimate_runtime_state(spot, history, config)?.volatility)
 }
 
 pub fn estimate_runtime_state(
@@ -38,14 +25,43 @@ pub fn estimate_runtime_state(
         ));
     }
 
-    let mut state = RuntimeState::default();
     for bar in history {
         validate_bar(*bar)?;
-        state = update_runtime_state(&state, bar.close, Some(bar), config)?;
     }
+
+    let mut state = if let Some(seed_variance) = seeded_initial_variance(history, config) {
+        let mut s = RuntimeState {
+            last_price: Some(history[0].close),
+            variance: Some(seed_variance),
+            ..RuntimeState::default()
+        };
+        for bar in &history[1..] {
+            s = update_runtime_state(&s, bar.close, Some(bar), config)?;
+        }
+        s
+    } else {
+        update_runtime_state(&RuntimeState::default(), history[0].close, Some(&history[0]), config)?
+    };
 
     state.volatility = reprice_sigma_for_spot(state.volatility, spot, config);
     Ok(state)
+}
+
+fn seeded_initial_variance(history: &[OhlcBar], config: &GridConfig) -> Option<f64> {
+    if history.len() < 2 {
+        return None;
+    }
+    let variance_floor = config.volatility.variance_floor;
+    let mut sum_sq = 0.0;
+    for pair in history.windows(2) {
+        let log_return = (pair[1].close / pair[0].close.max(variance_floor)).ln();
+        sum_sq += log_return * log_return;
+    }
+    let n = (history.len() - 1) as f64;
+    let realized = sum_sq / n;
+    let prior = config.volatility.sigma_ref.powi(2);
+    let blended = (n * realized + SEED_PRIOR_WEIGHT * prior) / (n + SEED_PRIOR_WEIGHT);
+    Some(blended.max(variance_floor))
 }
 
 pub fn update_runtime_state(
@@ -153,4 +169,81 @@ fn reprice_sigma_for_spot(
 
 fn clamp(value: f64, lower: f64, upper: f64) -> f64 {
     value.max(lower).min(upper)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::stock::stock_grid_config_for_ticker;
+
+    fn flat_bars(prices: &[f64]) -> Vec<OhlcBar> {
+        prices
+            .iter()
+            .map(|&p| OhlcBar {
+                open: p,
+                high: p,
+                low: p,
+                close: p,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn single_bar_falls_back_to_sigma_ref_prior() {
+        let cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        let decay = (-std::f64::consts::LN_2 / cfg.volatility.ewma_half_life_seconds).exp();
+        let vol = estimate_volatility(157.5, &flat_bars(&[157.5]), &cfg).unwrap();
+        let expected_raw = (decay * cfg.volatility.sigma_ref.powi(2))
+            .max(cfg.volatility.variance_floor)
+            .sqrt();
+        assert!((vol.sigma_raw - expected_raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn quiet_restart_history_seeds_below_sigma_ref() {
+        let cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        let bars = flat_bars(&vec![157.5; 25]);
+        let vol = estimate_volatility(157.5, &bars, &cfg).unwrap();
+        assert!(vol.sigma_raw < cfg.volatility.sigma_ref * 0.7);
+    }
+
+    #[test]
+    fn zero_variance_history_is_floored_at_variance_floor() {
+        let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg.volatility.variance_floor = 1e-8;
+        let bars = flat_bars(&vec![157.5; 250]);
+        let state = estimate_runtime_state(157.5, &bars, &cfg).unwrap();
+        assert!((state.variance.unwrap() - cfg.volatility.variance_floor).abs() < 1e-15);
+        assert!(
+            (state.volatility.sigma_raw - cfg.volatility.variance_floor.sqrt()).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn seed_blends_realized_with_prior_by_sample_count() {
+        let cfg = stock_grid_config_for_ticker("TSLA", 8, Vec::new());
+        let prices = [320.0, 320.1, 320.0, 320.15];
+        let bars = flat_bars(&prices);
+        let n = (bars.len() - 1) as f64;
+        let sum_sq: f64 = prices
+            .windows(2)
+            .map(|w| (w[1] / w[0]).ln().powi(2))
+            .sum();
+        let realized = sum_sq / n;
+        let seed_var = ((n * realized + SEED_PRIOR_WEIGHT * cfg.volatility.sigma_ref.powi(2))
+            / (n + SEED_PRIOR_WEIGHT))
+        .max(cfg.volatility.variance_floor);
+
+        let mut expected = RuntimeState {
+            last_price: Some(bars[0].close),
+            variance: Some(seed_var),
+            ..RuntimeState::default()
+        };
+        for bar in &bars[1..] {
+            expected = update_runtime_state(&expected, bar.close, Some(bar), &cfg).unwrap();
+        }
+        let actual = estimate_runtime_state(320.15, &bars, &cfg).unwrap();
+        assert!((actual.variance.unwrap() - expected.variance.unwrap()).abs() < 1e-15);
+        assert!((actual.volatility.sigma_raw - expected.volatility.sigma_raw).abs() < 1e-12);
+    }
 }
