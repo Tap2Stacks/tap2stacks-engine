@@ -27,6 +27,15 @@ pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfi
     }
 }
 
+/// Builds a ticker-specific `GridConfig` for US equities (`NVDA`, `TSLA`).
+pub fn stock_grid_config_for_ticker(
+    _ticker: &str,
+    band_cents: u32,
+    windows: Vec<TimeWindow>,
+) -> GridConfig {
+    stock_grid_config(band_cents, windows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,7 +17,7 @@ pub use simulator::{
     debug_simulate_paths, simulate_summary, DebugPathTrace, SimulationSummary,
 };
 pub use state::{estimate_runtime_state, estimate_volatility, update_runtime_state};
-pub use stock::stock_grid_config;
+pub use stock::{stock_grid_config, stock_grid_config_for_ticker};
 pub use touch::{
     interval_hit_probabilities, interval_hit_probability, window_hit_discrete,
     window_hit_probability,

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::grid::{
     GridConfig, OhlcBar, PriceBand, TimeWindow, VolatilitySnapshot, compute_k_safety,
     compute_quote_probability, estimate_runtime_state, price_multiplier, simulate_summary,
-    stock_grid_config,
+    stock_grid_config_for_ticker,
 };
 use crate::price::PriceTick;
 
@@ -80,6 +80,7 @@ pub struct QuoteEngine {
     ticker: String,
     band_cents: u32,
     spot: f64,
+    base_config: GridConfig,
     config: GridConfig,
     volatility: Option<VolatilitySnapshot>,
     cached_cells: Vec<CachedCell>,
@@ -91,11 +92,18 @@ pub struct QuoteEngine {
 impl QuoteEngine {
     /// Creates a new `QuoteEngine` for `ticker` with `band_cents`-wide price bands.
     pub fn new(ticker: String, band_cents: u32) -> Self {
+        let base_config = stock_grid_config_for_ticker(&ticker, band_cents, Vec::new());
+        Self::with_config(ticker, band_cents, base_config)
+    }
+
+    /// Creates a `QuoteEngine` using an explicit `GridConfig` template (for calibration/tuning).
+    pub fn with_config(ticker: String, band_cents: u32, base_config: GridConfig) -> Self {
         Self {
             ticker,
             band_cents,
             spot: 0.0,
-            config: stock_grid_config(band_cents, Vec::new()),
+            config: base_config.clone(),
+            base_config,
             volatility: None,
             cached_cells: Vec::new(),
             cached_scenario_payouts: Vec::new(),
@@ -123,7 +131,9 @@ impl QuoteEngine {
             })
             .collect();
 
-        let config = stock_grid_config(self.band_cents, relative_windows);
+        let mut config = self.base_config.clone();
+        config.spec.band_width = self.band_cents as f64 / 100.0;
+        config.spec.windows = relative_windows;
         if config.validate().is_err() {
             return;
         }
