@@ -35,6 +35,11 @@ impl Drop for ChildGuard {
     }
 }
 
+fn idle_engine_slot() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn free_addr() -> String {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().unwrap().to_string()
@@ -212,6 +217,7 @@ async fn rejects_connection_without_token() {
     cmd.env("ENGINE_BIND_ADDR", &addr)
         .env("ENGINE_TOKEN", token)
         .env("ENGINE_REPLAY_FILE", "tests/fixtures/hl_sample.jsonl");
+    let _slot = idle_engine_slot();
     let _guard = ChildGuard::spawn(cmd);
 
     wait_for_port_ready(&addr).await;
@@ -250,6 +256,7 @@ async fn replay_client_gets_quote_within_200ms_and_exposure_moves_it() {
         .env("ENGINE_TOKEN", token)
         .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8")
         .env("ENGINE_REPLAY_FILE", "tests/fixtures/hl_sample.jsonl");
+    let _slot = idle_engine_slot();
     let _guard = ChildGuard::spawn(cmd);
 
     let mut ws = wait_and_connect(&addr, token).await;
@@ -372,6 +379,7 @@ async fn slow_client_does_not_block_fast_client() {
         .env("ENGINE_TOKEN", token)
         .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3")
         .env("ENGINE_REPLAY_FILE", "tests/fixtures/hl_sample.jsonl");
+    let _slot = idle_engine_slot();
     let _guard = ChildGuard::spawn(cmd);
 
     // Connect a slow client and intentionally never read from it.
@@ -435,6 +443,7 @@ async fn stale_ticker_sends_empty_cells_and_stale_health() {
         .env("ENGINE_TOKEN", token)
         .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3")
         .env("HL_WS_URL", format!("ws://{hl_addr}"));
+    let _slot = idle_engine_slot();
     let _guard = ChildGuard::spawn(cmd);
 
     let mut ws = wait_and_connect(&addr, token).await;
@@ -527,6 +536,7 @@ async fn health_frame_reports_prev_day_px_from_hyperliquid() {
         .env("ENGINE_TOKEN", token)
         .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3")
         .env("HL_WS_URL", format!("ws://{hl_addr}"));
+    let _slot = idle_engine_slot();
     let _guard = ChildGuard::spawn(cmd);
 
     let mut ws = wait_and_connect(&addr, token).await;
