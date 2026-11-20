@@ -5,13 +5,14 @@ use st_engine::calibrate::{
     CalibrateOptions, CalibrationSample, brier_score, implied_house_edge, reliability_table,
     run_calibration, tail_reliability_table,
 };
-use st_engine::grid::{GridConfig, stock_grid_config_for_ticker};
+use st_engine::grid::{CalibrationKey, GridConfig, stock_grid_config_for_ticker};
 use st_engine::price::{PriceTick, read_hl_jsonl};
 
 struct CliArgs {
     files: Vec<PathBuf>,
     coin: String,
     band_cents: u32,
+    distance_factors: [Option<f64>; 6],
     sigma_scale: Option<f64>,
     sigma_ref: Option<f64>,
     ewma_half_life: Option<f64>,
@@ -37,6 +38,7 @@ impl Default for CliArgs {
             files: Vec::new(),
             coin: String::new(),
             band_cents: 0,
+            distance_factors: [None; 6],
             sigma_scale: None,
             sigma_ref: None,
             ewma_half_life: None,
@@ -63,6 +65,12 @@ fn apply_arg(out: &mut CliArgs, key: &str, val: &str) -> Result<(), String> {
         "--file" => out.files.push(PathBuf::from(val)),
         "--coin" => out.coin = val.to_string(),
         "--band-cents" => out.band_cents = val.parse().map_err(|_| "bad --band-cents")?,
+        "--distance-factor-1" | "--distance-factor-2" | "--distance-factor-3" | "--distance-factor-4" | "--distance-factor-5" | "--distance-factor-6" => {
+            let idx = key.as_bytes()[key.len() - 1] as usize - b'1' as usize;
+            let factor: f64 = val.parse().map_err(|_| "bad distance factor")?;
+            if !factor.is_finite() || factor <= 0.0 { return Err("distance factor must be finite and positive".into()); }
+            out.distance_factors[idx] = Some(factor);
+        }
         "--sigma-scale" => out.sigma_scale = Some(val.parse().map_err(|_| "bad --sigma-scale")?),
         "--sigma-ref" => out.sigma_ref = Some(val.parse().map_err(|_| "bad --sigma-ref")?),
         "--ewma-half-life" => out.ewma_half_life = Some(val.parse().map_err(|_| "bad --ewma-half-life")?),
@@ -102,6 +110,18 @@ fn parse_args() -> Result<CliArgs, String> {
 }
 
 fn apply_overrides(cfg: &mut GridConfig, cli: &CliArgs) {
+    for (index, factor) in cli.distance_factors.iter().enumerate() {
+        if let Some(value) = factor {
+            for window_index in 0..6 {
+                for sigma_bucket in 0..3 {
+                    cfg.calibration.factors.insert(
+                        CalibrationKey { window_index, dist_bucket: index + 1, sigma_bucket },
+                        *value,
+                    );
+                }
+            }
+        }
+    }
     if let Some(v) = cli.sigma_scale { cfg.volatility.sigma_scale = v; }
     if let Some(v) = cli.sigma_ref { cfg.volatility.sigma_ref = v; }
     if let Some(v) = cli.ewma_half_life { cfg.volatility.ewma_half_life_seconds = v; }
@@ -184,6 +204,9 @@ fn print_section(label: &str, subset: &[&CalibrationSample], max_multiplier: f64
         );
     }
 
+    print_distance_slice("dist 0.30-0.50", subset, |sample| (0.3..0.5).contains(&sample.predicted));
+    print_distance_slice("dist tail 0.05-0.10", subset, |sample| (0.05..0.10).contains(&sample.predicted));
+
     let tail = tail_reliability_table(&edge_tuples);
     println!("tail p<0.1     |   count | mean_pred |  hit_rate | hit/pred |   edge_%");
     for t in &tail {
@@ -195,7 +218,37 @@ fn print_section(label: &str, subset: &[&CalibrationSample], max_multiplier: f64
     }
 }
 
+
+fn print_distance_slice(label: &str, subset: &[&CalibrationSample], include: impl Fn(&CalibrationSample) -> bool) {
+    let mut counts = [0usize; 11];
+    let mut predicted = [0.0f64; 11];
+    let mut hits = [0.0f64; 11];
+    for sample in subset.iter().copied().filter(|sample| include(sample)) {
+        let dist = sample.center_distance.min(10);
+        counts[dist] += 1;
+        predicted[dist] += sample.predicted;
+        if sample.hit {
+            hits[dist] += 1.0;
+        }
+    }
+    println!("{label} | dist | count | mean_pred | hit_rate | diff_pp");
+    for dist in 0..=10 {
+        if counts[dist] < 50 {
+            continue;
+        }
+        let n = counts[dist] as f64;
+        let mean = predicted[dist] / n;
+        let hit = hits[dist] / n;
+        println!(
+            "{label} | {dist:4} | {count:7} | {mean:9.4} | {hit:8.4} | {diff:+7.2}",
+            count = counts[dist],
+            diff = (mean - hit) * 100.0,
+        );
+    }
+}
+
 fn print_report(cli: &CliArgs, cfg: &GridConfig, ticker: &str, ticks: &[PriceTick]) {
+    println!("distance_factor_overrides={:?}", cli.distance_factors);
     println!(
         "coin={} ticker={} band_cents={} ticks={} sigma_scale={} sigma_ref={} ewma_hl={} p_raw_gamma={} p_time_boost={} cur_shift={} adj_shift={} zone_vol={} m_base={} off_m_base={:?} m_risk_max={} a_sigma={} jump={} bridge_eps={:e} var_floor={:e}",
         cli.coin, ticker, cli.band_cents, ticks.len(), cfg.volatility.sigma_scale,
@@ -246,4 +299,31 @@ fn main() {
     let mut cfg = stock_grid_config_for_ticker(&ticker, cli.band_cents, Vec::new());
     apply_overrides(&mut cfg, &cli);
     print_report(&cli, &cfg, &ticker, &ticks);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distance_override_applies_to_all_windows_and_sigma_buckets() {
+        let mut cli = CliArgs::default();
+        apply_arg(&mut cli, "--distance-factor-6", "1.2").unwrap();
+        let mut cfg = stock_grid_config_for_ticker("NVDA", 1, Vec::new());
+        apply_overrides(&mut cfg, &cli);
+        for window_index in 0..6 {
+            for sigma_bucket in 0..3 {
+                let key = CalibrationKey { window_index, dist_bucket: 6, sigma_bucket };
+                assert_eq!(cfg.calibration.factors.get(&key), Some(&1.2));
+            }
+        }
+    }
+
+    #[test]
+    fn distance_override_rejects_nonpositive_and_nonfinite_factors() {
+        let mut cli = CliArgs::default();
+        for value in ["0", "-1", "NaN", "inf"] {
+            assert!(apply_arg(&mut cli, "--distance-factor-1", value).is_err());
+        }
+    }
 }

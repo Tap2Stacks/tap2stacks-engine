@@ -30,6 +30,8 @@ pub struct CalibrationSample {
     pub predicted: f64,
     pub hit: bool,
     pub multiplier: f64,
+    pub center_distance: usize,
+    pub signed_distance: i64,
     pub is_warmup: bool,
     pub is_us_session: bool,
 }
@@ -177,11 +179,19 @@ fn evaluate_window(
 
     report.evaluated_windows += 1;
     for (cell, hit) in window_cells.into_iter().zip(hits) {
+        let spot_cents = (quote.spot * 100.0).round() as i64;
+        let signed_distance = (cell.lower_cents - spot_cents).div_euclid(opts.band_cents as i64);
+        let center_distance = cell
+            .lower_cents
+            .abs_diff(spot_cents)
+            .div_ceil(opts.band_cents as u64) as usize;
         report.samples.push(CalibrationSample {
             window_start_ms,
             predicted: cell.hit_probability,
             hit,
             multiplier: cell.multiplier,
+            center_distance,
+            signed_distance,
             is_warmup,
             is_us_session,
         });
