@@ -120,6 +120,11 @@ impl QuoteEngine {
         self.seed_variance_prior = variance.filter(|value| (*value).is_finite() && *value > 0.0);
     }
 
+    /// Quoted volatility from the latest sample, if one has been taken.
+    pub fn volatility(&self) -> Option<VolatilitySnapshot> {
+        self.volatility
+    }
+
     /// Runs Monte Carlo for a new price sample and caches per-cell probabilities and scenario payouts.
     pub fn on_sample(&mut self, tick: PriceTick, history: &[OhlcBar]) {
         if !tick.price.is_finite() || tick.price <= 0.0 || self.band_cents == 0 {

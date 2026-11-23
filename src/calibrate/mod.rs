@@ -34,6 +34,9 @@ pub struct CalibrationSample {
     pub signed_distance: i64,
     pub is_warmup: bool,
     pub is_us_session: bool,
+    pub spot: f64,
+    pub sigma: f64,
+    pub sigma_raw: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,6 +45,8 @@ pub struct CalibrationReport {
     pub voided_windows: usize,
     pub evaluated_windows: usize,
     pub gaps_over_3s: Vec<(u64, u64)>,
+    pub voided_window_starts: Vec<u64>,
+    pub stale_quote_skips: usize,
 }
 
 pub fn run_calibration(ticks: &[PriceTick], opts: &CalibrateOptions) -> CalibrationReport {
@@ -142,12 +147,14 @@ fn evaluate_window(
         return;
     };
     if quote_ts_ms.saturating_sub(tick.ts_ms) > VOID_GAP_MS {
+        report.stale_quote_skips += 1;
         return;
     }
 
     let window_end_ms = window_start_ms + WINDOW_WIDTH_MS;
     if window_is_void(ticks, tick_idx, window_start_ms, window_end_ms) {
         report.voided_windows += 1;
+        report.voided_window_starts.push(window_start_ms);
         return;
     }
 
@@ -185,6 +192,7 @@ fn evaluate_window(
             .lower_cents
             .abs_diff(spot_cents)
             .div_ceil(opts.band_cents as u64) as usize;
+        let volatility = state.engine.volatility();
         report.samples.push(CalibrationSample {
             window_start_ms,
             predicted: cell.hit_probability,
@@ -194,6 +202,9 @@ fn evaluate_window(
             signed_distance,
             is_warmup,
             is_us_session,
+            spot: quote.spot,
+            sigma: volatility.map(|snap| snap.sigma).unwrap_or(0.0),
+            sigma_raw: volatility.map(|snap| snap.sigma_raw).unwrap_or(0.0),
         });
     }
 }
@@ -289,6 +300,7 @@ mod tests {
         assert!(!steady.is_empty());
         assert!(report.samples.iter().any(|s| s.is_warmup));
         assert!(report.samples.iter().all(|s| s.is_us_session));
+        assert!(report.samples.iter().any(|s| s.sigma.is_finite() && s.sigma > 0.0 && s.spot > 0.0));
 
         let buckets = reliability_table(&steady, 10);
         let large_buckets: Vec<&Bucket> = buckets.iter().filter(|b| b.count >= 200).collect();
@@ -306,5 +318,51 @@ mod tests {
                 diff
             );
         }
+    }
+
+    #[test]
+    fn calibration_records_sigma_and_void_windows() {
+        let mut ticks = Vec::new();
+        let mut price = 140.0_f64;
+        let base_ts = 1_795_392_000_000_u64;
+        for sec in 0..400_u64 {
+            ticks.push(PriceTick {
+                ts_ms: base_ts + sec * 1_000,
+                price,
+            });
+            price += 0.001;
+        }
+        let gap_start = ticks.last().unwrap().ts_ms;
+        ticks.push(PriceTick {
+            ts_ms: gap_start + 16_000,
+            price: 141.0,
+        });
+        for sec in 1..30_u64 {
+            ticks.push(PriceTick {
+                ts_ms: gap_start + 16_000 + sec * 1_000,
+                price: 141.0,
+            });
+        }
+        let mut cfg = stock_grid_config(3, Vec::new());
+        cfg.simulation.mc_n_min = 20;
+        cfg.simulation.mc_n_max = 20;
+        cfg.simulation.seed = Some(1);
+        let report = run_calibration(
+            &ticks,
+            &CalibrateOptions {
+                ticker: "NVDA".to_string(),
+                band_cents: 3,
+                base_config: cfg,
+                warmup_ms: 300_000,
+                restart_gap_ms: 30_000,
+            },
+        );
+        assert!(report.samples.iter().any(|sample| {
+            sample.sigma.is_finite() && sample.sigma > 0.0 && sample.sigma_raw > 0.0 && sample.spot > 0.0
+        }));
+        assert!(report.voided_windows > 0);
+        assert_eq!(report.voided_window_starts.len(), report.voided_windows);
+        assert!(report.gaps_over_3s.iter().any(|(start, end)| end.saturating_sub(*start) >= 16_000));
+        assert!(report.stale_quote_skips > 0);
     }
 }
