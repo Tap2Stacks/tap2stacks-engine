@@ -16,6 +16,8 @@ pub struct CandleWarmup {
 pub struct HlCandle {
     #[serde(rename = "t")]
     pub open_time_ms: u64,
+    #[serde(rename = "T")]
+    pub close_time_ms: u64,
     #[serde(rename = "c")]
     pub close: String,
 }
@@ -24,10 +26,11 @@ pub fn parse_candle_snapshot(body: &str) -> Result<Vec<HlCandle>, serde_json::Er
     serde_json::from_str(body)
 }
 
-/// Estimates per-second variance from 1m close-to-close log returns using population standard deviation.
-pub fn estimate_candle_warmup(candles: &[HlCandle]) -> Option<CandleWarmup> {
+/// Estimates per-second variance from completed 1m close-to-close log returns using population standard deviation.
+pub fn estimate_candle_warmup(candles: &[HlCandle], now_ms: u64) -> Option<CandleWarmup> {
     let mut closes: Vec<(u64, f64)> = candles
         .iter()
+        .filter(|candle| candle.close_time_ms <= now_ms)
         .filter_map(|candle| {
             let close = candle.close.parse::<f64>().ok()?;
             (close.is_finite() && close > 0.0).then_some((candle.open_time_ms, close))
@@ -126,7 +129,7 @@ pub async fn fetch_candle_warmup(
         .await
         .map_err(WarmupError::Http)?;
     let candles = parse_candle_snapshot(&body).map_err(WarmupError::Decode)?;
-    estimate_candle_warmup(&candles).ok_or(WarmupError::NoUsableData)
+    estimate_candle_warmup(&candles, end_time_ms).ok_or(WarmupError::NoUsableData)
 }
 
 #[cfg(test)]
@@ -139,6 +142,7 @@ mod tests {
     fn candle(open_time_ms: u64, close: &str) -> HlCandle {
         HlCandle {
             open_time_ms,
+            close_time_ms: open_time_ms + 59_999,
             close: close.to_string(),
         }
     }
@@ -154,7 +158,7 @@ mod tests {
     #[test]
     fn estimates_per_second_variance_from_real_rows() {
         let candles = parse_candle_snapshot(REAL_AAPL_CANDLES).unwrap();
-        let estimate = estimate_candle_warmup(&candles).unwrap();
+        let estimate = estimate_candle_warmup(&candles, 1_795_413_059_999).unwrap();
         assert_eq!(estimate.candle_count, 13);
         assert!((estimate.last_close - 347.89).abs() < 1e-12);
         assert!((estimate.variance_per_second - 2.83795315302e-9).abs() < 1e-15);
@@ -162,9 +166,31 @@ mod tests {
     }
 
     #[test]
+    fn ignores_trailing_candle_that_is_still_open() {
+        let candles = [
+            candle(0, "100.0"),
+            candle(60_000, "101.0"),
+            candle(120_000, "103.0"),
+            candle(180_000, "99.0"),
+        ];
+
+        let filtered = estimate_candle_warmup(&candles, 200_000).unwrap();
+        let without_open_candle = estimate_candle_warmup(&candles[..3], 200_000).unwrap();
+
+        assert_eq!(filtered, without_open_candle);
+        assert_eq!(filtered.candle_count, 3);
+        assert_eq!(filtered.last_close, 103.0);
+    }
+
+    #[test]
     fn rejects_empty_flat_or_unusable_closes() {
-        assert!(estimate_candle_warmup(&[]).is_none());
-        assert!(estimate_candle_warmup(&[candle(1, "100.0"), candle(2, "100.0")]).is_none());
-        assert!(estimate_candle_warmup(&[candle(1, "100.0"), candle(2, "bad")]).is_none());
+        assert!(estimate_candle_warmup(&[], 1).is_none());
+        assert!(
+            estimate_candle_warmup(&[candle(0, "100.0"), candle(60_000, "100.0")], 119_999)
+                .is_none()
+        );
+        assert!(
+            estimate_candle_warmup(&[candle(0, "100.0"), candle(60_000, "bad")], 119_999).is_none()
+        );
     }
 }
