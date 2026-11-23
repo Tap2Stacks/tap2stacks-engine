@@ -29,7 +29,12 @@ impl Default for HyperliquidConfig {
     fn default() -> Self {
         Self {
             ws_url: "wss://api.hyperliquid.xyz/ws".to_string(),
-            coins: vec!["xyz:NVDA".to_string(), "xyz:TSLA".to_string()],
+            coins: vec![
+                "xyz:NVDA".to_string(),
+                "xyz:TSLA".to_string(),
+                "xyz:AAPL".to_string(),
+                "xyz:SP500".to_string(),
+            ],
             stale_after: Duration::from_secs(3),
             health_interval: Duration::from_millis(500),
             ping_interval: Duration::from_secs(30),
@@ -452,6 +457,19 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn default_coins_cover_xyz_stock_perps() {
+        assert_eq!(
+            HyperliquidConfig::default().coins,
+            vec![
+                "xyz:NVDA".to_string(),
+                "xyz:TSLA".to_string(),
+                "xyz:AAPL".to_string(),
+                "xyz:SP500".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn parses_active_asset_ctx_mark_price() {

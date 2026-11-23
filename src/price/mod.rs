@@ -4,6 +4,7 @@ mod hyperliquid;
 mod replay;
 mod runtime;
 mod types;
+mod warmup;
 
 pub use binance::{
     BinanceAggTradeConfig, BinanceAggTradeStream, BinanceConnectionState, BinanceStreamHandle,
@@ -18,4 +19,8 @@ pub use replay::read_hl_jsonl;
 pub use runtime::{PriceRuntime, PriceWorker, spawn_price_pipeline};
 pub use types::{
     GridMarketSnapshot, PriceError, PriceSnapshot, PriceTick, StreamHealth,
+};
+pub use warmup::{
+    CandleWarmup, HlCandle, WarmupError, estimate_candle_warmup, fetch_candle_warmup,
+    parse_candle_snapshot,
 };

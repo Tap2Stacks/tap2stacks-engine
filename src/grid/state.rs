@@ -16,6 +16,17 @@ pub fn estimate_runtime_state(
     history: &[OhlcBar],
     config: &GridConfig,
 ) -> Result<RuntimeState, GridError> {
+    estimate_runtime_state_with_seed_prior(spot, history, config, None)
+}
+
+/// Like `estimate_runtime_state`, but substitutes a measured variance for the
+/// cold-start `sigma_ref` prior.
+pub fn estimate_runtime_state_with_seed_prior(
+    spot: f64,
+    history: &[OhlcBar],
+    config: &GridConfig,
+    seed_variance_prior: Option<f64>,
+) -> Result<RuntimeState, GridError> {
     if spot <= 0.0 {
         return Err(GridError::InvalidSpot);
     }
@@ -29,25 +40,49 @@ pub fn estimate_runtime_state(
         validate_bar(*bar)?;
     }
 
-    let mut state = if let Some(seed_variance) = seeded_initial_variance(history, config) {
+    let mut state = if let Some(seed_variance) =
+        seeded_initial_variance(history, config, seed_variance_prior)
+    {
         let mut s = RuntimeState {
             last_price: Some(history[0].close),
             variance: Some(seed_variance),
             ..RuntimeState::default()
         };
         for bar in &history[1..] {
-            s = update_runtime_state(&s, bar.close, Some(bar), config)?;
+            s = update_runtime_state_with_seed_prior(
+                &s,
+                bar.close,
+                Some(bar),
+                config,
+                seed_variance_prior,
+            )?;
         }
         s
     } else {
-        update_runtime_state(&RuntimeState::default(), history[0].close, Some(&history[0]), config)?
+        update_runtime_state_with_seed_prior(
+            &RuntimeState::default(),
+            history[0].close,
+            Some(&history[0]),
+            config,
+            seed_variance_prior,
+        )?
     };
 
     state.volatility = reprice_sigma_for_spot(state.volatility, spot, config);
     Ok(state)
 }
 
-fn seeded_initial_variance(history: &[OhlcBar], config: &GridConfig) -> Option<f64> {
+fn prior_variance(config: &GridConfig, seed_variance_prior: Option<f64>) -> f64 {
+    seed_variance_prior
+        .filter(|variance| (*variance).is_finite() && *variance > 0.0)
+        .unwrap_or_else(|| config.volatility.sigma_ref.powi(2))
+}
+
+fn seeded_initial_variance(
+    history: &[OhlcBar],
+    config: &GridConfig,
+    seed_variance_prior: Option<f64>,
+) -> Option<f64> {
     if history.len() < 2 {
         return None;
     }
@@ -59,7 +94,7 @@ fn seeded_initial_variance(history: &[OhlcBar], config: &GridConfig) -> Option<f
     }
     let n = (history.len() - 1) as f64;
     let realized = sum_sq / n;
-    let prior = config.volatility.sigma_ref.powi(2);
+    let prior = prior_variance(config, seed_variance_prior);
     let blended = (n * realized + SEED_PRIOR_WEIGHT * prior) / (n + SEED_PRIOR_WEIGHT);
     Some(blended.max(variance_floor))
 }
@@ -69,6 +104,16 @@ pub fn update_runtime_state(
     price: f64,
     bar: Option<&OhlcBar>,
     config: &GridConfig,
+) -> Result<RuntimeState, GridError> {
+    update_runtime_state_with_seed_prior(previous_state, price, bar, config, None)
+}
+
+fn update_runtime_state_with_seed_prior(
+    previous_state: &RuntimeState,
+    price: f64,
+    bar: Option<&OhlcBar>,
+    config: &GridConfig,
+    seed_variance_prior: Option<f64>,
 ) -> Result<RuntimeState, GridError> {
     if price <= 0.0 {
         return Err(GridError::InvalidSpot);
@@ -91,7 +136,7 @@ pub fn update_runtime_state(
 
     let previous_variance = previous_state
         .variance
-        .unwrap_or(config.volatility.sigma_ref.powi(2));
+        .unwrap_or_else(|| prior_variance(config, seed_variance_prior));
     let variance =
         ((1.0 - decay) * observed_variance + decay * previous_variance).max(variance_floor);
     let sigma_raw = variance.sqrt().max(variance_floor.sqrt());
@@ -197,6 +242,48 @@ mod tests {
             .max(cfg.volatility.variance_floor)
             .sqrt();
         assert!((vol.sigma_raw - expected_raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn seed_prior_override_replaces_sigma_ref_for_single_bar() {
+        let cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        let prior = 8e-8;
+        let decay = (-std::f64::consts::LN_2 / cfg.volatility.ewma_half_life_seconds).exp();
+        let state =
+            estimate_runtime_state_with_seed_prior(157.5, &flat_bars(&[157.5]), &cfg, Some(prior))
+                .unwrap();
+        let expected_raw = (decay * prior).max(cfg.volatility.variance_floor).sqrt();
+        assert!((state.volatility.sigma_raw - expected_raw).abs() < 1e-12);
+    }
+
+    #[test]
+    fn seed_prior_override_replaces_static_prior_in_blend() {
+        let cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        let prior = 7.2e-8;
+        let bars = flat_bars(&[157.5; 25]);
+        let n = (bars.len() - 1) as f64;
+        let seed_var = ((SEED_PRIOR_WEIGHT * prior) / (n + SEED_PRIOR_WEIGHT))
+            .max(cfg.volatility.variance_floor);
+
+        let mut expected = RuntimeState {
+            last_price: Some(bars[0].close),
+            variance: Some(seed_var),
+            ..RuntimeState::default()
+        };
+        for bar in &bars[1..] {
+            expected = update_runtime_state_with_seed_prior(
+                &expected,
+                bar.close,
+                Some(bar),
+                &cfg,
+                Some(prior),
+            )
+            .unwrap();
+        }
+        let actual =
+            estimate_runtime_state_with_seed_prior(157.5, &bars, &cfg, Some(prior)).unwrap();
+        assert!((actual.variance.unwrap() - expected.variance.unwrap()).abs() < 1e-15);
+        assert!((actual.volatility.sigma_raw - expected.volatility.sigma_raw).abs() < 1e-12);
     }
 
     #[test]
