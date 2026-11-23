@@ -54,6 +54,8 @@ struct Args {
     windows: Option<usize>,
     factors_file: Option<PathBuf>,
     far_refresh_ms: Option<u64>,
+    trigger_sigma: Option<f64>,
+    far_phase_ms: Option<u64>,
     mc_n: usize,
     tick_reprice: bool,
     reprice_from: Option<u64>,
@@ -86,6 +88,8 @@ fn parse_args() -> Args {
         windows: None,
         factors_file: None,
         far_refresh_ms: None,
+        trigger_sigma: None,
+        far_phase_ms: None,
         mc_n: 1000,
         tick_reprice: false,
         reprice_from: None,
@@ -152,6 +156,14 @@ fn parse_args() -> Args {
             "--far-refresh-ms" => {
                 args.far_refresh_ms = Some(val.parse().expect("bad --far-refresh-ms"))
             }
+            "--trigger-sigma" => {
+                let s: f64 = val.parse().expect("bad --trigger-sigma");
+                assert!(s.is_finite() && s > 0.0, "--trigger-sigma must be finite and > 0");
+                args.trigger_sigma = Some(s);
+            }
+            "--far-phase-ms" => {
+                args.far_phase_ms = Some(val.parse().expect("bad --far-phase-ms"))
+            }
             "--mc-n" => args.mc_n = val.parse().expect("bad --mc-n"),
             "--tick-reprice" => args.tick_reprice = val.parse().expect("bad --tick-reprice"),
             "--reprice-from-utc" => {
@@ -212,6 +224,12 @@ fn apply(cfg: &mut GridConfig, args: &Args) {
     }
     if let Some(far_refresh_ms) = args.far_refresh_ms {
         cfg.simulation.far_refresh_ms = far_refresh_ms;
+    }
+    if let Some(trigger_sigma) = args.trigger_sigma {
+        cfg.simulation.far_trigger_sigma = trigger_sigma;
+    }
+    if let Some(far_phase_ms) = args.far_phase_ms {
+        cfg.simulation.far_phase_ms = far_phase_ms;
     }
     if let Some(ref path) = args.factors_file {
         let text = fs::read_to_string(path)
@@ -490,9 +508,10 @@ fn print_reprice_and_triggers(
     periods: &[(String, u64, u64)],
 ) {
     println!(
-        "REPRICE_STATS windows={} far_refresh_ms={} mc_n={} tick_reprice={} samples={} full={} near={} trigger={} cadence={} mean_us={} full_mean_us={} near_mean_us={}",
+        "REPRICE_STATS windows={} far_refresh_ms={} trigger_sigma={:.2} mc_n={} tick_reprice={} samples={} full={} near={} trigger={} cadence={} mean_us={} full_mean_us={} near_mean_us={}",
         cfg.simulation.quote_window_count,
         cfg.simulation.far_refresh_ms,
+        cfg.simulation.far_trigger_sigma,
         args.mc_n,
         args.tick_reprice,
         stats.sample_count,

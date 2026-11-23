@@ -6,11 +6,51 @@ use super::types::{
 const CALIBRATION_WINDOWS: usize = 6;
 const CALIBRATION_SIGMA_BUCKETS: usize = 3;
 
+/// 7-day pooled (2026-11-17..23) calibrated distance factors for NVDA 3c windows 6..24.
+/// Format: `(window_index, [dist0, dist1, dist2, dist3, dist4, dist5, dist6])`.
+const NVDA_FAR_FACTORS: [(usize, [f64; 7]); 18] = [
+    (6, [0.915500, 0.787886, 0.674303, 0.676690, 0.698808, 0.708506, 0.716205]),
+    (7, [0.956309, 0.838050, 0.714763, 0.720958, 0.746935, 0.754675, 0.761753]),
+    (8, [0.920529, 0.833251, 0.698605, 0.684425, 0.698700, 0.725891, 0.713776]),
+    (9, [0.975982, 0.849490, 0.702724, 0.679485, 0.696976, 0.728635, 0.722569]),
+    (10, [0.997099, 0.884279, 0.731311, 0.703358, 0.735471, 0.746692, 0.773285]),
+    (11, [1.046875, 0.893161, 0.718590, 0.678903, 0.699242, 0.740150, 0.748076]),
+    (12, [0.990748, 0.868789, 0.704594, 0.674567, 0.682855, 0.712492, 0.727833]),
+    (13, [0.975552, 0.887015, 0.746451, 0.708756, 0.720100, 0.723786, 0.757471]),
+    (14, [0.921093, 0.861437, 0.747703, 0.701401, 0.697334, 0.730425, 0.723374]),
+    (15, [0.962366, 0.857728, 0.736418, 0.683781, 0.694551, 0.709820, 0.745036]),
+    (16, [0.988912, 0.872927, 0.749080, 0.688375, 0.716163, 0.748739, 0.750772]),
+    (17, [0.953921, 0.883206, 0.766248, 0.709945, 0.714758, 0.755511, 0.763527]),
+    (18, [0.918614, 0.850272, 0.747562, 0.676167, 0.674508, 0.696607, 0.747554]),
+    (19, [0.917869, 0.860163, 0.772573, 0.714645, 0.703067, 0.734216, 0.785153]),
+    (20, [0.901802, 0.817703, 0.745006, 0.692211, 0.687672, 0.721056, 0.745266]),
+    (21, [0.896949, 0.817724, 0.750544, 0.713878, 0.707060, 0.730446, 0.752610]),
+    (22, [0.961336, 0.861987, 0.786015, 0.729680, 0.711046, 0.754437, 0.772309]),
+    (23, [0.964201, 0.867056, 0.790175, 0.712352, 0.700964, 0.711032, 0.737530]),
+];
+
 fn set_distance_factors(cfg: &mut GridConfig, dist_factors: &[(usize, f64)]) {
     cfg.calibration.factors.clear();
     for window_index in 0..CALIBRATION_WINDOWS {
         for sigma_bucket in 0..CALIBRATION_SIGMA_BUCKETS {
             for &(dist_bucket, factor) in dist_factors {
+                cfg.calibration.factors.insert(
+                    CalibrationKey {
+                        window_index,
+                        dist_bucket,
+                        sigma_bucket,
+                    },
+                    factor,
+                );
+            }
+        }
+    }
+}
+
+fn set_far_distance_factors(cfg: &mut GridConfig, table: &[(usize, [f64; 7])]) {
+    for &(window_index, factors) in table {
+        for (dist_bucket, &factor) in factors.iter().enumerate() {
+            for sigma_bucket in 0..CALIBRATION_SIGMA_BUCKETS {
                 cfg.calibration.factors.insert(
                     CalibrationKey {
                         window_index,
@@ -87,6 +127,7 @@ pub fn stock_grid_config_for_ticker(
         cfg.pricing.off_hours_m_base = Some(0.094);
         cfg.pricing.current_row_logit_shift = 0.0;
         set_distance_factors(&mut cfg, &[(1, 0.72), (2, 0.545), (3, 0.505), (4, 0.96)]);
+        set_far_distance_factors(&mut cfg, &NVDA_FAR_FACTORS);
     } else if symbol.eq_ignore_ascii_case("AAPL") {
         // AAPL/SP500 priors derive from HL xyz 1m candles scaled to existing xyz priors; other parameters copy TSLA and are not calibrated.
         cfg.volatility.sigma_ref = 0.0000933;
@@ -238,6 +279,22 @@ mod tests {
                 sigma_bucket: 1,
             }),
             Some(&0.545)
+        );
+        assert_eq!(
+            nvda.calibration.factors.get(&CalibrationKey {
+                window_index: 6,
+                dist_bucket: 0,
+                sigma_bucket: 1,
+            }),
+            Some(&0.915500)
+        );
+        assert_eq!(
+            nvda.calibration.factors.get(&CalibrationKey {
+                window_index: 23,
+                dist_bucket: 6,
+                sigma_bucket: 2,
+            }),
+            Some(&0.737530)
         );
 
         assert_eq!(tsla.volatility.sigma_ref, 0.00011);

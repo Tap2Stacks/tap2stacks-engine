@@ -7,15 +7,17 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use st_engine::grid::stock_grid_config_for_ticker;
-use st_engine::horizon::DEFAULT_WINDOWS;
+use st_engine::grid::{OhlcBar, stock_grid_config_for_ticker};
+use st_engine::horizon::{
+    DEFAULT_TRIGGER_SIGMA, DEFAULT_WINDOWS, FAR_REFRESH_MS, stagger_phase_ms,
+};
 use st_engine::logging::init_tracing;
 use st_engine::price::{
     FeedHealth, HealthTracker, HyperliquidConfig, PriceTick, fetch_candle_warmup, read_hl_jsonl,
     spawn_hyperliquid_stream, spawn_price_pipeline,
 };
 use st_engine::protocol::{EngineIn, EngineOut};
-use st_engine::quote::{CellKey, QuoteEngine};
+use st_engine::quote::{CellKey, QuoteEngine, SampleResult};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
@@ -273,6 +275,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or_else(|| DEFAULT_HL_INFO_URL.to_string());
     let warmup_minutes = warmup_minutes_from_env();
     let quote_windows = quote_windows_from_env();
+    let far_trigger_sigma = far_trigger_sigma_from_env();
 
     let clock = Arc::new(MonotonicWallClock::new());
     let hub = Arc::new(ClientHub::new());
@@ -319,7 +322,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         (handle.health_rx, handle.prev_day_px)
     };
 
-    for spec in tickers {
+    let ticker_count = tickers.len();
+    for (ticker_index, spec) in tickers.into_iter().enumerate() {
         let tick_rx = tick_receivers
             .remove(&spec.coin)
             .expect("missing tick receiver for configured coin");
@@ -331,6 +335,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let health_rx_clone = health_rx.clone();
         let prev_day_px_clone = Arc::clone(&prev_day_px);
         let seed_variance_prior = seed_variance_priors.get(&spec.coin).copied();
+        let far_phase_ms = stagger_phase_ms(ticker_index, ticker_count, FAR_REFRESH_MS);
         tokio::spawn(run_ticker_task(
             spec,
             TickerTaskInput {
@@ -342,6 +347,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 clock: clock_clone,
                 seed_variance_prior,
                 quote_windows,
+                far_trigger_sigma,
+                far_phase_ms,
             },
         ));
     }
@@ -424,6 +431,8 @@ struct TickerTaskInput {
     clock: Arc<MonotonicWallClock>,
     seed_variance_prior: Option<f64>,
     quote_windows: usize,
+    far_trigger_sigma: f64,
+    far_phase_ms: u64,
 }
 
 async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
@@ -436,6 +445,8 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         clock,
         seed_variance_prior,
         quote_windows,
+        far_trigger_sigma,
+        far_phase_ms,
     } = input;
     let (price_runtime, _price_worker_handle) = spawn_price_pipeline(
         MAX_COMPLETED_BARS,
@@ -448,9 +459,15 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
     } else {
         let mut cfg = stock_grid_config_for_ticker(&spec.ticker, spec.band_cents, Vec::new());
         cfg.simulation.quote_window_count = quote_windows;
+        cfg.simulation.far_trigger_sigma = far_trigger_sigma;
+        cfg.simulation.far_phase_ms = far_phase_ms;
         QuoteEngine::with_config(spec.ticker.clone(), spec.band_cents, cfg)
     };
     quote_engine.set_seed_variance_prior(seed_variance_prior);
+
+    let (mc_done_tx, mut mc_done_rx) = mpsc::channel::<Option<SampleResult>>(1);
+    let mut mc_busy = false;
+    let mut queued_mc: Option<(PriceTick, Vec<OhlcBar>)> = None;
 
     let stale_after_ms = STALE_AFTER.as_millis() as u64;
     let mut quote_tick = interval_at(Instant::now() + QUOTE_INTERVAL, QUOTE_INTERVAL);
@@ -507,7 +524,30 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
                 }
                 let maybe_snapshot = grid_rx.borrow_and_update().clone();
                 if let (Some(tick), Some(snapshot)) = (pending_tick.take(), maybe_snapshot) {
-                    quote_engine.on_sample(tick, &snapshot.history);
+                    if mc_busy {
+                        queued_mc = Some((tick, snapshot.history));
+                    } else if let Some(job) = quote_engine.prepare_sample_job(tick, snapshot.history) {
+                        mc_busy = true;
+                        let tx = mc_done_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = tx.blocking_send(job.run());
+                        });
+                    }
+                }
+            }
+            maybe_mc = mc_done_rx.recv() => {
+                mc_busy = false;
+                if let Some(Some(result)) = maybe_mc {
+                    quote_engine.apply_sample_result(result);
+                }
+                if let Some((tick, history)) = queued_mc.take() {
+                    if let Some(job) = quote_engine.prepare_sample_job(tick, history) {
+                        mc_busy = true;
+                        let tx = mc_done_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = tx.blocking_send(job.run());
+                        });
+                    }
                 }
             }
             maybe_exposure = exposure_rx.recv() => {
@@ -826,6 +866,26 @@ fn quote_windows_from_env() -> usize {
     }
 }
 
+fn parse_trigger_sigma(raw: &str) -> Option<f64> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn far_trigger_sigma_from_env() -> f64 {
+    match env::var("ENGINE_FAR_TRIGGER_SIGMA") {
+        Ok(raw) if !raw.trim().is_empty() => match parse_trigger_sigma(&raw) {
+            Some(value) => value,
+            None => {
+                warn!(value = %raw, "invalid ENGINE_FAR_TRIGGER_SIGMA; using default");
+                DEFAULT_TRIGGER_SIGMA
+            }
+        },
+        _ => DEFAULT_TRIGGER_SIGMA,
+    }
+}
+
 fn parse_tickers(raw: &str) -> Result<Vec<TickerSpec>, Box<dyn Error + Send + Sync>> {
     let mut specs = Vec::new();
     let mut seen_tickers = HashSet::new();
@@ -930,5 +990,16 @@ mod tests {
         assert_eq!(parse_quote_windows("0"), None);
         assert_eq!(parse_quote_windows("-1"), None);
         assert_eq!(parse_quote_windows("abc"), None);
+    }
+
+    #[test]
+    fn trigger_sigma_parser_defaults_to_two_and_rejects_invalid() {
+        assert!((DEFAULT_TRIGGER_SIGMA - 2.0).abs() < 1e-12);
+        assert_eq!(parse_trigger_sigma("2.0"), Some(2.0));
+        assert_eq!(parse_trigger_sigma(" 1.5 "), Some(1.5));
+        assert_eq!(parse_trigger_sigma("0"), None);
+        assert_eq!(parse_trigger_sigma("-2"), None);
+        assert_eq!(parse_trigger_sigma("NaN"), None);
+        assert_eq!(parse_trigger_sigma("inf"), None);
     }
 }

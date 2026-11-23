@@ -6,10 +6,37 @@ pub const NEAR_WINDOWS: usize = 6;
 pub const FAR_REFRESH_MS: u64 = 5_000;
 pub const DEFAULT_WINDOWS: usize = 6;
 pub const TWO_MINUTE_WINDOWS: usize = 24;
+pub const DEFAULT_TRIGGER_SIGMA: f64 = 2.0;
 pub const CAP25_EPS: f64 = 1e-6;
 pub const MIN_CALIBRATION_COUNT: usize = 200;
 
 const SIGMA_BUCKETS: usize = 3;
+
+pub fn far_reprice_due_sigma(
+    now_ms: u64,
+    price: f64,
+    last_ms: u64,
+    last_price: f64,
+    sigma: f64,
+    interval_ms: u64,
+    trigger_sigma: f64,
+) -> bool {
+    let elapsed = now_ms.saturating_sub(last_ms);
+    if elapsed >= interval_ms {
+        return true;
+    }
+    if !(price > 0.0 && last_price > 0.0 && sigma > 0.0) {
+        return true;
+    }
+    if !(trigger_sigma.is_finite() && trigger_sigma > 0.0) {
+        return false;
+    }
+    let dt_seconds = elapsed as f64 / 1_000.0;
+    if dt_seconds <= 0.0 {
+        return false;
+    }
+    (price / last_price).ln().abs() > trigger_sigma * sigma * dt_seconds.sqrt()
+}
 
 pub fn far_reprice_due(
     now_ms: u64,
@@ -19,18 +46,34 @@ pub fn far_reprice_due(
     sigma: f64,
     interval_ms: u64,
 ) -> bool {
-    let elapsed = now_ms.saturating_sub(last_ms);
-    if elapsed >= interval_ms {
-        return true;
-    }
-    if !(price > 0.0 && last_price > 0.0 && sigma > 0.0) {
-        return true;
-    }
-    let dt_seconds = elapsed as f64 / 1_000.0;
-    if dt_seconds <= 0.0 {
-        return false;
-    }
-    (price / last_price).ln().abs() > sigma * dt_seconds.sqrt()
+    far_reprice_due_sigma(
+        now_ms,
+        price,
+        last_ms,
+        last_price,
+        sigma,
+        interval_ms,
+        1.0,
+    )
+}
+
+pub fn move_trigger_due_sigma(
+    now_ms: u64,
+    price: f64,
+    last_ms: u64,
+    last_price: f64,
+    sigma: f64,
+    trigger_sigma: f64,
+) -> bool {
+    far_reprice_due_sigma(
+        now_ms,
+        price,
+        last_ms,
+        last_price,
+        sigma,
+        u64::MAX,
+        trigger_sigma,
+    )
 }
 
 pub fn move_trigger_due(
@@ -40,7 +83,29 @@ pub fn move_trigger_due(
     last_price: f64,
     sigma: f64,
 ) -> bool {
-    far_reprice_due(now_ms, price, last_ms, last_price, sigma, u64::MAX)
+    move_trigger_due_sigma(now_ms, price, last_ms, last_price, sigma, 1.0)
+}
+
+/// Returns `true` when `now_ms` crosses into a later staggered `interval_ms` slot than `last_ms`.
+pub fn cadence_slot_due(now_ms: u64, last_ms: u64, interval_ms: u64, phase_ms: u64) -> bool {
+    if interval_ms == 0 {
+        return true;
+    }
+    if now_ms.saturating_sub(last_ms) >= interval_ms {
+        return true;
+    }
+    let phase = phase_ms % interval_ms;
+    let prev_slot = last_ms.saturating_sub(phase) / interval_ms;
+    let curr_slot = now_ms.saturating_sub(phase) / interval_ms;
+    curr_slot > prev_slot
+}
+
+/// Evenly spreads `ticker_index` in `0..ticker_count` across `interval_ms`.
+pub fn stagger_phase_ms(ticker_index: usize, ticker_count: usize, interval_ms: u64) -> u64 {
+    if ticker_count <= 1 || interval_ms == 0 {
+        return 0;
+    }
+    ((ticker_index % ticker_count) as u64).saturating_mul(interval_ms) / (ticker_count as u64)
 }
 
 pub fn factor_from_counts(
@@ -483,5 +548,39 @@ mod tests {
         assert_eq!(s2.peak_open_taps, 2);
         // Minute 0: 30s@$10 + 30s@$20 = $15; Minute 1: 60s@$20 = $20; Minute 2: 30s@$10 = $5 -> mean $40/3.
         assert!((s2.mean_active_stake - 40.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_sigma_trigger_ignores_one_point_five_sigma_and_fires_above_two() {
+        let sigma = 0.001_f64;
+        let mid = 100.0 * (1.5 * sigma).exp();
+        let big = 100.0 * (2.5 * sigma).exp();
+        assert!(move_trigger_due_sigma(1_000, mid, 0, 100.0, sigma, 1.0));
+        assert!(!move_trigger_due_sigma(1_000, mid, 0, 100.0, sigma, DEFAULT_TRIGGER_SIGMA));
+        assert!(move_trigger_due_sigma(1_000, big, 0, 100.0, sigma, DEFAULT_TRIGGER_SIGMA));
+    }
+
+    #[test]
+    fn staggered_phases_keep_four_tickers_on_distinct_seconds() {
+        let phases: Vec<u64> = (0..4)
+            .map(|idx| stagger_phase_ms(idx, 4, FAR_REFRESH_MS))
+            .collect();
+        assert_eq!(phases, vec![0, 1_250, 2_500, 3_750]);
+
+        let mut last = [1_795_000_000_000_u64; 4];
+        for sec in 1..60u64 {
+            let now = 1_795_000_000_000_u64 + sec * 1_000;
+            let mut due_count = 0usize;
+            for idx in 0..4 {
+                if cadence_slot_due(now, last[idx], FAR_REFRESH_MS, phases[idx]) {
+                    due_count += 1;
+                    last[idx] = now;
+                }
+            }
+            assert!(
+                due_count <= 1,
+                "expected at most 1 ticker full-reprice at sec={sec}, got {due_count}"
+            );
+        }
     }
 }

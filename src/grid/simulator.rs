@@ -4,7 +4,10 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
-use super::touch::{window_hit_discrete_steps, window_hit_probability_steps};
+use super::touch::{
+    BRIDGE_PRUNE_EXPONENT, window_hit_discrete_steps, window_hit_probability_log_steps,
+    window_hit_probability_steps,
+};
 use super::types::{GridConfig, PriceBand, RuntimeState, TouchMode};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +32,8 @@ struct CellEval {
     cell_index: usize,
     lower: f64,
     upper: f64,
+    log_lower: f64,
+    log_upper: f64,
     window_index: usize,
 }
 
@@ -89,7 +94,7 @@ pub fn simulate_summary(
     liabilities: Option<&[f64]>,
 ) -> SimulationSummary {
     let windows = precompute_windows(config, max_horizon);
-    let cells = precompute_cells(bands, config);
+    let cells = precompute_cells(bands, spot, config);
     if let Some(seed) = config.simulation.seed {
         let mut rng = StdRng::seed_from_u64(seed);
         simulate_summary_with_rng(
@@ -352,6 +357,91 @@ fn simulate_hit_batch_chunk(
         .sigma
         .max(config.volatility.variance_floor.sqrt());
 
+    if config.simulation.touch_mode == TouchMode::Continuous {
+        let sigma_sq = sigma.powi(2);
+        let neg_two_inv_denom = -2.0 / (sigma_sq + config.simulation.bridge_epsilon);
+        let mut w_bounds = vec![(0.0_f64, 0.0_f64); windows.len()];
+        if config.simulation.use_antithetic && paths > 1 {
+            let base_paths = paths.div_ceil(2);
+            let anti_paths = paths / 2;
+            let mut base_log_path = Vec::with_capacity(max_horizon + 1);
+            let mut anti_log_path = Vec::with_capacity(max_horizon + 1);
+
+            for base_index in 0..base_paths {
+                let include_antithetic = base_index < anti_paths;
+                fill_log_path_pair(
+                    &mut base_log_path,
+                    if include_antithetic {
+                        Some(&mut anti_log_path)
+                    } else {
+                        None
+                    },
+                    spot,
+                    max_horizon,
+                    runtime_state,
+                    config,
+                    rng,
+                );
+                accumulate_log_path_stats(
+                    &base_log_path,
+                    cells,
+                    windows,
+                    &mut w_bounds,
+                    neg_two_inv_denom,
+                    &mut sum,
+                    &mut squared_sum,
+                    &mut scenario_payouts,
+                    liabilities,
+                    rng,
+                );
+                if include_antithetic {
+                    accumulate_log_path_stats(
+                        &anti_log_path,
+                        cells,
+                        windows,
+                        &mut w_bounds,
+                        neg_two_inv_denom,
+                        &mut sum,
+                        &mut squared_sum,
+                        &mut scenario_payouts,
+                        liabilities,
+                        rng,
+                    );
+                }
+            }
+        } else {
+            let mut log_path = Vec::with_capacity(max_horizon + 1);
+            for _ in 0..paths {
+                fill_log_path_pair(
+                    &mut log_path,
+                    None,
+                    spot,
+                    max_horizon,
+                    runtime_state,
+                    config,
+                    rng,
+                );
+                accumulate_log_path_stats(
+                    &log_path,
+                    cells,
+                    windows,
+                    &mut w_bounds,
+                    neg_two_inv_denom,
+                    &mut sum,
+                    &mut squared_sum,
+                    &mut scenario_payouts,
+                    liabilities,
+                    rng,
+                );
+            }
+        }
+        return BatchStats {
+            sum,
+            squared_sum,
+            scenario_payouts,
+        };
+    }
+
     if config.simulation.use_antithetic && paths > 1 {
         let base_paths = paths.div_ceil(2);
         let anti_paths = paths / 2;
@@ -489,6 +579,88 @@ fn accumulate_path_stats(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn accumulate_log_path_stats(
+    log_path: &[f64],
+    cells: &[CellEval],
+    windows: &[WindowEval],
+    w_bounds: &mut [(f64, f64)],
+    neg_two_inv_denom: f64,
+    sum: &mut [f64],
+    squared_sum: &mut [f64],
+    scenario_payouts: &mut Vec<f64>,
+    liabilities: Option<&[f64]>,
+    rng: &mut impl Rng,
+) {
+    let last_idx = log_path.len().saturating_sub(1);
+    for (w_idx, window) in windows.iter().enumerate() {
+        let s_idx = window.start.min(last_idx);
+        let e_idx = window.end.min(last_idx);
+        let mut lo = log_path[s_idx];
+        let mut hi = lo;
+        for &val in &log_path[s_idx..=e_idx] {
+            if val < lo {
+                lo = val;
+            }
+            if val > hi {
+                hi = val;
+            }
+        }
+        w_bounds[w_idx] = (lo, hi);
+    }
+
+    let mut scenario_payout = 0.0;
+    for cell in cells {
+        let (w_min, w_max) = w_bounds[cell.window_index];
+        let p = if w_max >= cell.log_lower && w_min <= cell.log_upper {
+            1.0
+        } else if w_max < cell.log_lower {
+            let d = cell.log_lower - w_max;
+            if neg_two_inv_denom * d * d <= BRIDGE_PRUNE_EXPONENT {
+                0.0
+            } else {
+                let window = windows[cell.window_index];
+                window_hit_probability_log_steps(
+                    log_path,
+                    cell.log_lower,
+                    cell.log_upper,
+                    window.start,
+                    window.end,
+                    neg_two_inv_denom,
+                )
+            }
+        } else {
+            let d = w_min - cell.log_upper;
+            if neg_two_inv_denom * d * d <= BRIDGE_PRUNE_EXPONENT {
+                0.0
+            } else {
+                let window = windows[cell.window_index];
+                window_hit_probability_log_steps(
+                    log_path,
+                    cell.log_lower,
+                    cell.log_upper,
+                    window.start,
+                    window.end,
+                    neg_two_inv_denom,
+                )
+            }
+        };
+        if p > 0.0 {
+            sum[cell.cell_index] += p;
+            squared_sum[cell.cell_index] += p * p;
+            if let Some(liabilities) = liabilities {
+                if liabilities[cell.cell_index] > 0.0 && rng.random_bool(p.clamp(0.0, 1.0)) {
+                    scenario_payout += liabilities[cell.cell_index];
+                }
+            }
+        }
+    }
+
+    if liabilities.is_some() {
+        scenario_payouts.push(scenario_payout);
+    }
+}
+
 fn precompute_windows(config: &GridConfig, max_horizon: usize) -> Vec<WindowEval> {
     let n_steps = max_horizon;
     config
@@ -504,16 +676,21 @@ fn precompute_windows(config: &GridConfig, max_horizon: usize) -> Vec<WindowEval
         .collect()
 }
 
-fn precompute_cells(bands: &[PriceBand], config: &GridConfig) -> Vec<CellEval> {
+fn precompute_cells(bands: &[PriceBand], spot: f64, config: &GridConfig) -> Vec<CellEval> {
     let window_count = config.spec.windows.len();
+    let base_spot = spot.max(config.volatility.variance_floor);
     let mut cells = Vec::with_capacity(bands.len() * window_count);
     for band in bands {
         let row_offset = band.row_index * window_count;
+        let log_lower = (band.lower.max(1e-9) / base_spot).ln();
+        let log_upper = (band.upper.max(1e-9) / base_spot).ln();
         for window_index in 0..window_count {
             cells.push(CellEval {
                 cell_index: row_offset + window_index,
                 lower: band.lower,
                 upper: band.upper,
+                log_lower,
+                log_upper,
                 window_index,
             });
         }
@@ -570,6 +747,59 @@ fn simulate_path_pair(
     );
 
     (path, antithetic_path)
+}
+
+fn fill_log_path_pair(
+    log_path: &mut Vec<f64>,
+    mut antithetic_log_path: Option<&mut Vec<f64>>,
+    spot: f64,
+    horizon_secs: usize,
+    runtime_state: &RuntimeState,
+    config: &GridConfig,
+    rng: &mut impl Rng,
+) {
+    log_path.clear();
+    if let Some(anti_path) = antithetic_log_path.as_mut() {
+        anti_path.clear();
+    }
+
+    let base_spot = spot.max(config.volatility.variance_floor);
+    let rel_floor = (1e-9_f64 / base_spot).ln();
+    let mut log_price = 0.0_f64;
+    let mut antithetic_log_price = 0.0_f64;
+    let normal = StandardNormal;
+    let sigma = runtime_state
+        .volatility
+        .sigma
+        .max(config.volatility.variance_floor.sqrt());
+    let lambda_intensity = runtime_state
+        .volatility
+        .jump_intensity
+        .max(config.volatility.jump.hawkes_mu0);
+    let p_jump = if config.volatility.jump.enabled && lambda_intensity > 0.0 {
+        1.0 - (-lambda_intensity).exp()
+    } else {
+        0.0
+    };
+
+    log_path.push(log_price);
+    if let Some(anti_path) = antithetic_log_path.as_mut() {
+        anti_path.push(antithetic_log_price);
+    }
+
+    for _ in 0..horizon_secs {
+        let z: f64 = normal.sample(rng);
+        let diffusion = config.simulation.mu + sigma * z;
+        let jump = sample_jump(p_jump, runtime_state, config, rng);
+        log_price += diffusion + jump;
+        log_path.push(log_price.max(rel_floor));
+
+        if let Some(anti_path) = antithetic_log_path.as_mut() {
+            let antithetic_diffusion = config.simulation.mu - sigma * z;
+            antithetic_log_price += antithetic_diffusion + jump;
+            anti_path.push(antithetic_log_price.max(rel_floor));
+        }
+    }
 }
 
 fn fill_path_pair(
@@ -700,6 +930,240 @@ mod tests {
             let expected_sum = 2.0 * config.simulation.mu;
 
             assert!((base_return + anti_return - expected_sum).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn fast_log_bridge_pruning_matches_reference_touch_across_24_windows() {
+        // Pruning bound check: below 1.0_f64, ULP spacing is 2^-53 ≈ 1.11e-16 (half of f64::EPSILON),
+        // so rounding 1.0 - x to 1.0 requires x < 2^-54 = 0.25 * f64::EPSILON ≈ 5.55e-17.
+        // exp(-38.0) ≈ 3.14e-17 < 2^-54, so 1.0 - exp(BRIDGE_PRUNE_EXPONENT) == 1.0 bit-for-bit (0 ULP cut).
+        let half_ulp_below_one = 0.25 * f64::EPSILON;
+        assert!(BRIDGE_PRUNE_EXPONENT.exp() < half_ulp_below_one);
+        assert_eq!(1.0_f64 - BRIDGE_PRUNE_EXPONENT.exp(), 1.0_f64);
+
+        let mut cfg = crate::grid::stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg.spec.windows = (0..24u32)
+            .map(|i| crate::grid::types::TimeWindow {
+                start_secs: 5 + i * 5,
+                end_secs: 10 + i * 5,
+            })
+            .collect();
+        let runtime_state = test_runtime_state(&cfg);
+        let spot = 140.00_f64;
+        let bands: Vec<PriceBand> = (0..20usize)
+            .map(|row_index| {
+                let lower = 140.00 + (row_index as f64 - 9.0) * 0.03;
+                PriceBand {
+                    row_index,
+                    lower,
+                    upper: lower + 0.03,
+                }
+            })
+            .collect();
+        let max_horizon = 125usize;
+        let windows = precompute_windows(&cfg, max_horizon);
+        let cells = precompute_cells(&bands, spot, &cfg);
+        let sigma = runtime_state.volatility.sigma;
+        let neg_two_inv_denom = -2.0 / (sigma * sigma + cfg.simulation.bridge_epsilon);
+
+        let mut rng_ref = StdRng::seed_from_u64(99);
+        let mut rng_fast = StdRng::seed_from_u64(99);
+        let mut path = Vec::with_capacity(max_horizon + 1);
+        let mut log_path = Vec::with_capacity(max_horizon + 1);
+        let mut sum_ref = vec![0.0_f64; cells.len()];
+        let mut sq_ref = vec![0.0_f64; cells.len()];
+        let mut sum_fast = vec![0.0_f64; cells.len()];
+        let mut sq_fast = vec![0.0_f64; cells.len()];
+        let mut pay_ref = Vec::new();
+        let mut pay_fast = Vec::new();
+        let mut w_bounds = vec![(0.0_f64, 0.0_f64); windows.len()];
+
+        for _ in 0..40 {
+            fill_path_pair(&mut path, None, spot, max_horizon, &runtime_state, &cfg, false, &mut rng_ref);
+            fill_log_path_pair(&mut log_path, None, spot, max_horizon, &runtime_state, &cfg, &mut rng_fast);
+            accumulate_path_stats(
+                &path,
+                &cells,
+                &windows,
+                sigma,
+                cfg.volatility.variance_floor,
+                cfg.simulation.bridge_epsilon,
+                TouchMode::Continuous,
+                &mut sum_ref,
+                &mut sq_ref,
+                &mut pay_ref,
+                None,
+                &mut rng_ref,
+            );
+            accumulate_log_path_stats(
+                &log_path,
+                &cells,
+                &windows,
+                &mut w_bounds,
+                neg_two_inv_denom,
+                &mut sum_fast,
+                &mut sq_fast,
+                &mut pay_fast,
+                None,
+                &mut rng_fast,
+            );
+        }
+        // Tolerance derivation:
+        // The reference path accumulates ~2e-4 returns onto ln(spot) ≈ 4.94 (ULP ≈ 8.9e-16),
+        // then rounds through exp() and (L / P).ln(), introducing Δd ≈ 1e-15 in log-distance.
+        // In p_hit = exp(-2*d0*d1/sigma^2), max |Δp_hit| <= 1.72 * (Δd / sigma) ≈ 8e-12 per step
+        // (for NVDA sigma = 2.3e-4), giving ~2e-12..1e-11 relative drift across 5 steps.
+        // We assert <= 1e-10 relative error and <= 1e-11 absolute error for cells near 0.
+        for i in 0..cells.len() {
+            let diff = (sum_ref[i] - sum_fast[i]).abs();
+            let tol = 1e-11_f64.max(1e-10 * sum_ref[i].abs());
+            assert!(
+                diff <= tol,
+                "cell {i} mismatch: ref={} fast={} diff={diff:e} tol={tol:e}",
+                sum_ref[i],
+                sum_fast[i]
+            );
+        }
+    }
+
+    #[test]
+    fn default_six_window_nvda_quote_matches_pre_e13_reference() {
+        let windows: Vec<crate::grid::types::TimeWindow> = (0..6u32)
+            .map(|i| crate::grid::types::TimeWindow {
+                start_secs: 5 + i * 5,
+                end_secs: 10 + i * 5,
+            })
+            .collect();
+        let mut cfg = crate::grid::stock_grid_config_for_ticker("NVDA", 3, windows);
+        cfg.simulation.mc_n_min = 500;
+        cfg.simulation.mc_n_max = 500;
+        cfg.simulation.seed = Some(42);
+        cfg.simulation.use_parallel = false;
+        assert_eq!(cfg.simulation.quote_window_count, 6);
+
+        let spot = 157.53_f64;
+        let runtime_state = test_runtime_state(&cfg);
+        let bands: Vec<PriceBand> = (0..cfg.spec.rows)
+            .map(|row_index| {
+                let lower = 157.50 - 0.01 + (row_index as f64 - cfg.spec.center_row as f64) * 0.03;
+                PriceBand {
+                    row_index,
+                    lower,
+                    upper: lower + 0.03,
+                }
+            })
+            .collect();
+        let max_horizon = 35usize;
+
+        // Production fast path.
+        let fast_summary = simulate_summary(spot, &bands, &cfg, &runtime_state, max_horizon, None);
+
+        // Pre-E13 reference path (antithetic fill_path_pair + accumulate_path_stats, same seed).
+        let w_eval = precompute_windows(&cfg, max_horizon);
+        let c_eval = precompute_cells(&bands, spot, &cfg);
+        let sigma = runtime_state
+            .volatility
+            .sigma
+            .max(cfg.volatility.variance_floor.sqrt());
+        let mut rng_ref = StdRng::seed_from_u64(42);
+        let mut sum_ref = vec![0.0_f64; c_eval.len()];
+        let mut sq_ref = vec![0.0_f64; c_eval.len()];
+        let mut pay_ref = Vec::new();
+        let mut base_path = Vec::with_capacity(max_horizon + 1);
+        let mut anti_path = Vec::with_capacity(max_horizon + 1);
+        let base_paths = 500usize.div_ceil(2);
+        let anti_paths = 500usize / 2;
+        for base_index in 0..base_paths {
+            let include_anti = base_index < anti_paths;
+            fill_path_pair(
+                &mut base_path,
+                Some(&mut anti_path),
+                spot,
+                max_horizon,
+                &runtime_state,
+                &cfg,
+                include_anti,
+                &mut rng_ref,
+            );
+            accumulate_path_stats(
+                &base_path,
+                &c_eval,
+                &w_eval,
+                sigma,
+                cfg.volatility.variance_floor,
+                cfg.simulation.bridge_epsilon,
+                TouchMode::Continuous,
+                &mut sum_ref,
+                &mut sq_ref,
+                &mut pay_ref,
+                None,
+                &mut rng_ref,
+            );
+            if include_anti {
+                accumulate_path_stats(
+                    &anti_path,
+                    &c_eval,
+                    &w_eval,
+                    sigma,
+                    cfg.volatility.variance_floor,
+                    cfg.simulation.bridge_epsilon,
+                    TouchMode::Continuous,
+                    &mut sum_ref,
+                    &mut sq_ref,
+                    &mut pay_ref,
+                    None,
+                    &mut rng_ref,
+                );
+            }
+        }
+
+        let vol = runtime_state.volatility;
+        let window_count = cfg.spec.windows.len();
+        for row_index in 0..cfg.spec.rows {
+            for window_index in 0..window_count {
+                let ref_raw = sum_ref[row_index * window_count + window_index] / 500.0;
+                let fast_raw = fast_summary.mean_probabilities[row_index][window_index];
+                let raw_diff = (ref_raw - fast_raw).abs();
+                let raw_tol = 1e-11_f64.max(1e-10 * ref_raw.abs());
+                assert!(
+                    raw_diff <= raw_tol,
+                    "row={row_index} win={window_index} raw ref={ref_raw} fast={fast_raw}"
+                );
+
+                let ref_p = crate::grid::compute_quote_probability(
+                    ref_raw,
+                    row_index,
+                    window_index,
+                    cfg.spec.windows[window_index],
+                    vol,
+                    cfg.spec.center_row,
+                    &cfg,
+                );
+                let fast_p = crate::grid::compute_quote_probability(
+                    fast_raw,
+                    row_index,
+                    window_index,
+                    cfg.spec.windows[window_index],
+                    vol,
+                    cfg.spec.center_row,
+                    &cfg,
+                );
+                for m_base in [cfg.pricing.m_base, cfg.pricing.off_hours_m_base.unwrap()] {
+                    let ref_m = crate::grid::price_multiplier_with_margin(
+                        ref_p, vol, 0.0, 1.0, m_base, &cfg,
+                    );
+                    let fast_m = crate::grid::price_multiplier_with_margin(
+                        fast_p, vol, 0.0, 1.0, m_base, &cfg,
+                    );
+                    let m_diff = (ref_m - fast_m).abs();
+                    let m_tol = 1e-11_f64.max(1e-10 * ref_m.abs());
+                    assert!(
+                        m_diff <= m_tol,
+                        "row={row_index} win={window_index} m_base={m_base} mult ref={ref_m} fast={fast_m} diff={m_diff:e}"
+                    );
+                }
+            }
         }
     }
 }

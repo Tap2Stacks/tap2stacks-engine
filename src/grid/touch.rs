@@ -82,6 +82,44 @@ pub(crate) fn window_hit_probability_steps(
     1.0 - p_not_touch
 }
 
+/// Below `1.0_f64`, ULP spacing is `2^-53 ≈ 1.11e-16`, so half-ULP is `2^-54 ≈ 5.55e-17`.
+/// `exp(-38.0) ≈ 3.14e-17 < 2^-54`, so `1.0 - exp(exponent) == 1.0` bit-for-bit in IEEE-754 f64.
+pub(crate) const BRIDGE_PRUNE_EXPONENT: f64 = -38.0;
+
+/// Fast log-space equivalent of `window_hit_probability_steps`.
+/// `log_path[t]` is `ln(price[t])`; `log_lower`/`log_upper` are `ln(band.lower)`/`ln(band.upper)`;
+/// `neg_two_inv_denom` is `-2.0 / (sigma_sq + epsilon)`.
+pub(crate) fn window_hit_probability_log_steps(
+    log_path: &[f64],
+    log_lower: f64,
+    log_upper: f64,
+    start: usize,
+    end: usize,
+    neg_two_inv_denom: f64,
+) -> f64 {
+    let mut p_not_touch = 1.0_f64;
+    for second in start..end {
+        let s = log_path[second];
+        let e = log_path[second + 1];
+        if s < log_lower && e < log_lower {
+            let exponent = neg_two_inv_denom * (log_lower - s) * (log_lower - e);
+            if exponent > BRIDGE_PRUNE_EXPONENT {
+                let p_hit = exponent.exp().clamp(0.0, 1.0);
+                p_not_touch *= 1.0 - p_hit;
+            }
+        } else if s > log_upper && e > log_upper {
+            let exponent = neg_two_inv_denom * (log_upper - s) * (log_upper - e);
+            if exponent > BRIDGE_PRUNE_EXPONENT {
+                let p_hit = exponent.exp().clamp(0.0, 1.0);
+                p_not_touch *= 1.0 - p_hit;
+            }
+        } else {
+            return 1.0;
+        }
+    }
+    1.0 - p_not_touch
+}
+
 pub fn interval_hit_probabilities(
     path: &[f64],
     band: PriceBand,
@@ -266,5 +304,40 @@ mod tests {
 
         assert_eq!(window_hit_discrete(&path, &lower_band, &window, 0), 1.0);
         assert_eq!(window_hit_discrete(&path, &upper_band, &window, 0), 1.0);
+    }
+
+    #[test]
+    fn log_space_bridge_matches_reference_touch_probability() {
+        let path = [140.00_f64, 140.04, 140.01, 140.07, 140.03, 140.09];
+        let log_path: Vec<f64> = path.iter().map(|p| p.ln()).collect();
+        let sigma = 0.0004_f64;
+        let eps = 1e-12_f64;
+        let neg_two_inv_denom = -2.0 / (sigma * sigma + eps);
+        let window = TimeWindow {
+            start_secs: 0,
+            end_secs: 5,
+        };
+        for row in -10..=10_i32 {
+            let lower = 140.00 + f64::from(row) * 0.03;
+            let upper = lower + 0.03;
+            let band = PriceBand {
+                row_index: 0,
+                lower,
+                upper,
+            };
+            let ref_p = window_hit_probability(&path, band, window, sigma, 0, eps);
+            let fast_p = window_hit_probability_log_steps(
+                &log_path,
+                lower.ln(),
+                upper.ln(),
+                0,
+                5,
+                neg_two_inv_denom,
+            );
+            assert!(
+                (ref_p - fast_p).abs() < 1e-12,
+                "row={row} ref={ref_p} fast={fast_p}"
+            );
+        }
     }
 }

@@ -272,6 +272,8 @@ pub struct SimulationConfig {
     pub touch_mode: TouchMode,
     pub quote_window_count: usize,
     pub far_refresh_ms: u64,
+    pub far_trigger_sigma: f64,
+    pub far_phase_ms: u64,
 }
 
 impl Default for SimulationConfig {
@@ -293,6 +295,8 @@ impl Default for SimulationConfig {
             touch_mode: TouchMode::Continuous,
             quote_window_count: crate::horizon::DEFAULT_WINDOWS,
             far_refresh_ms: crate::horizon::FAR_REFRESH_MS,
+            far_trigger_sigma: crate::horizon::DEFAULT_TRIGGER_SIGMA,
+            far_phase_ms: 0,
         }
     }
 }
