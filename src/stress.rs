@@ -24,7 +24,9 @@ const FAR_MULT_MAX: f64 = 25.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CellTap {
+    pub quote_ts_ms: u64,
     pub start_ms: u64,
+    pub window_index: usize,
     pub signed_dist: i64,
     pub dist: i64,
     pub multiplier: f64,
@@ -513,7 +515,9 @@ mod tests {
 
     fn tap(start_ms: u64, signed_dist: i64, multiplier: f64, move_sign: i8) -> CellTap {
         CellTap {
+            quote_ts_ms: start_ms.saturating_sub(QUOTE_LEAD_MS),
             start_ms,
+            window_index: 0,
             signed_dist,
             dist: signed_dist.abs(),
             multiplier,
@@ -676,5 +680,38 @@ mod tests {
         assert_eq!(max_mult, 25.0);
         let k = tripwire_k(0.008, 0.001, 60.0).unwrap();
         assert!((k - 0.008 / (0.001 * 60.0_f64.sqrt())).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policies_tap_into_far_windows_on_a_24_window_board() {
+        let quote_ts = 1_000_000_u64;
+        let mut board = Vec::new();
+        for window_index in 0..24usize {
+            let start_ms = quote_ts + ((window_index + 1) as u64) * WINDOW_MS;
+            for signed_dist in -3..=3i64 {
+                board.push(CellTap {
+                    quote_ts_ms: quote_ts,
+                    start_ms,
+                    window_index,
+                    signed_dist,
+                    dist: signed_dist.abs(),
+                    multiplier: if signed_dist.abs() == 3 { 15.0 } else { 2.0 },
+                    hit: false,
+                    us: true,
+                    move_sign: 1,
+                    sigma: 0.001,
+                    sigma_raw: 0.001,
+                });
+            }
+        }
+        let mut rng = StdRng::seed_from_u64(42);
+        for policy in ["closest", "row_sweep", "long_bias", "short_bias", "random_near", "momentum", "chase_far"] {
+            let picked = choose_taps(policy, &board, 18, &mut rng);
+            assert_eq!(picked.len(), 18, "policy={policy}");
+            assert!(
+                picked.iter().any(|t| t.window_index >= 6),
+                "expected policy {policy} to tap far windows (>=6)"
+            );
+        }
     }
 }

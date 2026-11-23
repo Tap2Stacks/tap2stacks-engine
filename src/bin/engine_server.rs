@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
+use st_engine::grid::stock_grid_config_for_ticker;
+use st_engine::horizon::DEFAULT_WINDOWS;
 use st_engine::logging::init_tracing;
 use st_engine::price::{
     FeedHealth, HealthTracker, HyperliquidConfig, PriceTick, fetch_candle_warmup, read_hl_jsonl,
@@ -270,6 +272,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_HL_INFO_URL.to_string());
     let warmup_minutes = warmup_minutes_from_env();
+    let quote_windows = quote_windows_from_env();
 
     let clock = Arc::new(MonotonicWallClock::new());
     let hub = Arc::new(ClientHub::new());
@@ -338,6 +341,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 hub: hub_clone,
                 clock: clock_clone,
                 seed_variance_prior,
+                quote_windows,
             },
         ));
     }
@@ -419,6 +423,7 @@ struct TickerTaskInput {
     hub: Arc<ClientHub>,
     clock: Arc<MonotonicWallClock>,
     seed_variance_prior: Option<f64>,
+    quote_windows: usize,
 }
 
 async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
@@ -430,6 +435,7 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         hub,
         clock,
         seed_variance_prior,
+        quote_windows,
     } = input;
     let (price_runtime, _price_worker_handle) = spawn_price_pipeline(
         MAX_COMPLETED_BARS,
@@ -437,7 +443,13 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         TICK_CHANNEL_CAPACITY,
     );
     let mut grid_rx = price_runtime.grid_rx;
-    let mut quote_engine = QuoteEngine::new(spec.ticker.clone(), spec.band_cents);
+    let mut quote_engine = if quote_windows == DEFAULT_WINDOWS {
+        QuoteEngine::new(spec.ticker.clone(), spec.band_cents)
+    } else {
+        let mut cfg = stock_grid_config_for_ticker(&spec.ticker, spec.band_cents, Vec::new());
+        cfg.simulation.quote_window_count = quote_windows;
+        QuoteEngine::with_config(spec.ticker.clone(), spec.band_cents, cfg)
+    };
     quote_engine.set_seed_variance_prior(seed_variance_prior);
 
     let stale_after_ms = STALE_AFTER.as_millis() as u64;
@@ -797,6 +809,23 @@ fn warmup_minutes_from_env() -> u64 {
     }
 }
 
+fn parse_quote_windows(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().filter(|&n| n >= 1)
+}
+
+fn quote_windows_from_env() -> usize {
+    match env::var("ENGINE_QUOTE_WINDOWS") {
+        Ok(raw) if !raw.trim().is_empty() => match parse_quote_windows(&raw) {
+            Some(value) => value,
+            None => {
+                warn!(value = %raw, "invalid ENGINE_QUOTE_WINDOWS; using default");
+                DEFAULT_WINDOWS
+            }
+        },
+        _ => DEFAULT_WINDOWS,
+    }
+}
+
 fn parse_tickers(raw: &str) -> Result<Vec<TickerSpec>, Box<dyn Error + Send + Sync>> {
     let mut specs = Vec::new();
     let mut seen_tickers = HashSet::new();
@@ -891,5 +920,15 @@ mod tests {
         assert!(constant_time_eq(b"secret-123", b"secret-123"));
         assert!(!constant_time_eq(b"secret-123", b"secret-124"));
         assert!(!constant_time_eq(b"secret-123", b"secret-12"));
+    }
+
+    #[test]
+    fn quote_windows_parser_defaults_to_six_and_accepts_opt_in_24() {
+        assert_eq!(DEFAULT_WINDOWS, 6);
+        assert_eq!(parse_quote_windows("24"), Some(24));
+        assert_eq!(parse_quote_windows(" 6 "), Some(6));
+        assert_eq!(parse_quote_windows("0"), None);
+        assert_eq!(parse_quote_windows("-1"), None);
+        assert_eq!(parse_quote_windows("abc"), None);
     }
 }

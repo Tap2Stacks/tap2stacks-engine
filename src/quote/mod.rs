@@ -7,12 +7,12 @@ use crate::grid::{
     compute_quote_probability, effective_m_base, estimate_runtime_state_with_seed_prior,
     price_multiplier_with_margin, simulate_summary, stock_grid_config_for_ticker,
 };
+use crate::horizon::{NEAR_WINDOWS, RepriceStats, move_trigger_due};
 use crate::price::PriceTick;
 use crate::session::is_us_regular_session;
 
 pub use book::{CellKey, ExposureBook};
 
-const WINDOW_COUNT: usize = 6;
 const WINDOW_WIDTH_MS: u64 = 5_000;
 const WINDOW_WIDTH_SECS: u32 = 5;
 const MIN_LEAD_MS: u64 = 5_000;
@@ -89,6 +89,11 @@ pub struct QuoteEngine {
     cached_scenario_payouts: Vec<f64>,
     cached_k_safety: Option<CachedSafety>,
     exposure: ExposureBook,
+    last_full_reprice_ms: Option<u64>,
+    last_full_end_window_ms: Option<u64>,
+    last_full_price: f64,
+    last_full_sigma: f64,
+    stats: RepriceStats,
 }
 
 impl QuoteEngine {
@@ -112,6 +117,11 @@ impl QuoteEngine {
             cached_scenario_payouts: Vec::new(),
             cached_k_safety: None,
             exposure: ExposureBook::default(),
+            last_full_reprice_ms: None,
+            last_full_end_window_ms: None,
+            last_full_price: 0.0,
+            last_full_sigma: 0.0,
+            stats: RepriceStats::default(),
         }
     }
 
@@ -125,13 +135,47 @@ impl QuoteEngine {
         self.volatility
     }
 
+    pub fn reprice_stats(&self) -> RepriceStats {
+        self.stats.clone()
+    }
+
     /// Runs Monte Carlo for a new price sample and caches per-cell probabilities and scenario payouts.
     pub fn on_sample(&mut self, tick: PriceTick, history: &[OhlcBar]) {
         if !tick.price.is_finite() || tick.price <= 0.0 || self.band_cents == 0 {
             return;
         }
 
-        let windows_ms = aligned_windows(tick.ts_ms, WINDOW_COUNT, WINDOW_WIDTH_MS, MIN_LEAD_MS);
+        let started = std::time::Instant::now();
+        let quote_windows = self.base_config.simulation.quote_window_count.max(1);
+        let far_refresh_ms = self.base_config.simulation.far_refresh_ms;
+        let full_windows = aligned_windows(tick.ts_ms, quote_windows, WINDOW_WIDTH_MS, MIN_LEAD_MS);
+        if full_windows.is_empty() {
+            return;
+        }
+        let elapsed_ms = self
+            .last_full_reprice_ms
+            .map(|last_ms| tick.ts_ms.saturating_sub(last_ms))
+            .unwrap_or(far_refresh_ms);
+        let window_rolled = self.last_full_end_window_ms != full_windows.last().map(|w| w.0);
+        let move_due = self.last_full_reprice_ms.is_some_and(|last_ms| {
+            move_trigger_due(
+                tick.ts_ms,
+                tick.price,
+                last_ms,
+                self.last_full_price,
+                self.last_full_sigma,
+            )
+        });
+        let cadence_due = elapsed_ms >= far_refresh_ms || window_rolled;
+        let full = quote_windows <= NEAR_WINDOWS
+            || self.last_full_reprice_ms.is_none()
+            || move_due
+            || cadence_due;
+        let windows_ms = if full {
+            full_windows.clone()
+        } else {
+            full_windows[..NEAR_WINDOWS.min(full_windows.len())].to_vec()
+        };
         let floor_sec_ms = (tick.ts_ms / 1_000) * 1_000;
         let relative_windows: Vec<TimeWindow> = windows_ms
             .iter()
@@ -193,6 +237,7 @@ impl QuoteEngine {
             tick.ts_ms >= cached.computed_at_ms
                 && tick.ts_ms - cached.computed_at_ms < config.pricing.k_safety_ttl_ms
         });
+        let refresh_safety = full && !k_safety_fresh;
 
         let simulation = simulate_summary(
             tick.price,
@@ -200,14 +245,14 @@ impl QuoteEngine {
             &config,
             &runtime_state,
             max_horizon,
-            if k_safety_fresh {
-                None
-            } else {
+            if refresh_safety {
                 Some(&liabilities_vector)
+            } else {
+                None
             },
         );
 
-        if !k_safety_fresh {
+        if refresh_safety {
             self.cached_scenario_payouts = simulation.scenario_payouts;
             let value = compute_k_safety(&self.cached_scenario_payouts, &config);
             self.cached_k_safety = Some(CachedSafety {
@@ -230,7 +275,7 @@ impl QuoteEngine {
             .unwrap_or(config.spec.center_row);
 
         let volatility = runtime_state.volatility;
-        let mut cached_cells = Vec::with_capacity(bands.len() * window_count);
+        let mut cached_cells = Vec::with_capacity(bands.len() * quote_windows);
         for (row_index, band) in bands.iter().enumerate() {
             let lower_cents = (band.lower * 100.0).round() as i64;
             let upper_cents = (band.upper * 100.0).round() as i64;
@@ -257,11 +302,43 @@ impl QuoteEngine {
                 });
             }
         }
+        let elapsed_ns = started.elapsed().as_nanos();
+        if !full {
+            let far_start = full_windows
+                .get(NEAR_WINDOWS)
+                .map(|window| window.0)
+                .unwrap_or(u64::MAX);
+            let far_end = full_windows.last().map(|window| window.0).unwrap_or(0);
+            for old in &self.cached_cells {
+                if old.key.window_start_ms >= far_start && old.key.window_start_ms <= far_end {
+                    cached_cells.push(*old);
+                }
+            }
+            self.stats.near_reprices += 1;
+            self.stats.near_ns += elapsed_ns;
+        } else {
+            self.stats.full_reprices += 1;
+            self.stats.full_ns += elapsed_ns;
+            if quote_windows > NEAR_WINDOWS && self.last_full_reprice_ms.is_some() {
+                if move_due && !cadence_due {
+                    self.stats.trigger_reprices += 1;
+                    self.stats.trigger_timestamps_ms.push(tick.ts_ms);
+                } else {
+                    self.stats.cadence_reprices += 1;
+                }
+            }
+            self.last_full_reprice_ms = Some(tick.ts_ms);
+            self.last_full_end_window_ms = full_windows.last().map(|window| window.0);
+            self.last_full_price = tick.price;
+            self.last_full_sigma = volatility.sigma.max(1e-8);
+        }
 
         self.spot = tick.price;
         self.config = config;
         self.volatility = Some(volatility);
         self.cached_cells = cached_cells;
+        self.stats.sample_count += 1;
+        self.stats.sample_ns += elapsed_ns;
     }
 
     /// Replaces the ticker's whole live exposure map.
@@ -702,5 +779,128 @@ mod tests {
         let q2 = baseline.price(us_ts);
 
         assert_eq!(q1.cells, q2.cells);
+    }
+
+    #[test]
+    fn far_windows_stay_cached_until_a_one_sigma_move() {
+        let mut cfg = crate::grid::stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg.simulation.quote_window_count = 24;
+        cfg.simulation.mc_n_min = 20;
+        cfg.simulation.mc_n_max = 20;
+        cfg.simulation.seed = Some(3);
+        cfg.simulation.use_parallel = false;
+        let mut engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
+        // Pick a timestamp inside (0, 5000] so +1s and +2s stay in the same 5s alignment bucket.
+        let ts = 1_795_000_001_000;
+        let spot = 140.0;
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        let first = engine.price(ts);
+        assert_eq!(first.cells.len(), 20 * 24);
+        let far_window = first
+            .cells
+            .iter()
+            .map(|c| c.window_start_ms)
+            .max()
+            .unwrap();
+        let far_before: Vec<(i64, f64)> = first
+            .cells
+            .iter()
+            .filter(|c| c.window_start_ms == far_window)
+            .map(|c| (c.lower_cents, c.hit_probability))
+            .collect();
+
+        // Quiet tick: only near windows (0-5) reprice; far cells stay cached and identical.
+        engine.on_sample(
+            PriceTick {
+                ts_ms: ts + 1_000,
+                price: spot * 1.00005,
+            },
+            &sample_history(spot),
+        );
+        let stats = engine.reprice_stats();
+        assert_eq!(stats.full_reprices, 1);
+        assert_eq!(stats.near_reprices, 1);
+        assert_eq!(stats.trigger_reprices, 0);
+        let second = engine.price(ts + 1_000);
+        assert_eq!(second.cells.len(), 20 * 24);
+        let far_quiet: Vec<(i64, f64)> = second
+            .cells
+            .iter()
+            .filter(|c| c.window_start_ms == far_window)
+            .map(|c| (c.lower_cents, c.hit_probability))
+            .collect();
+        assert_eq!(far_before, far_quiet);
+
+        // News-sized (+2%) move triggers an early full 24-window reprice before the 5s cadence.
+        let jumped = spot * 1.02;
+        engine.on_sample(
+            PriceTick {
+                ts_ms: ts + 2_000,
+                price: jumped,
+            },
+            &sample_history(jumped),
+        );
+        let stats = engine.reprice_stats();
+        assert_eq!(stats.full_reprices, 2);
+        assert_eq!(stats.trigger_reprices, 1);
+        assert_eq!(stats.trigger_timestamps_ms, vec![ts + 2_000]);
+        let third = engine.price(ts + 2_000);
+        assert_eq!(third.cells.len(), 20 * 24);
+        let far_after: Vec<(i64, f64)> = third
+            .cells
+            .iter()
+            .filter(|c| c.window_start_ms == far_window)
+            .map(|c| (c.lower_cents, c.hit_probability))
+            .collect();
+        assert_ne!(far_before, far_after);
+    }
+
+    #[test]
+    fn window_roll_refreshes_far_windows_without_dropping_tail_column() {
+        let mut cfg = crate::grid::stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg.simulation.quote_window_count = 24;
+        cfg.simulation.mc_n_min = 20;
+        cfg.simulation.mc_n_max = 20;
+        cfg.simulation.seed = Some(3);
+        cfg.simulation.use_parallel = false;
+        let mut engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
+        // At exact multiple of 5000ms, the next 1s tick rolls the 5s window grid forward by one column.
+        let ts = 1_795_000_000_000;
+        let spot = 140.0;
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        assert_eq!(engine.price(ts).cells.len(), 20 * 24);
+
+        engine.on_sample(
+            PriceTick {
+                ts_ms: ts + 1_000,
+                price: spot,
+            },
+            &sample_history(spot),
+        );
+        let stats = engine.reprice_stats();
+        assert_eq!(stats.full_reprices, 2);
+        assert_eq!(stats.cadence_reprices, 1);
+        assert_eq!(stats.trigger_reprices, 0);
+        assert_eq!(engine.price(ts + 1_000).cells.len(), 20 * 24);
+    }
+
+    #[test]
+    fn default_engine_stays_on_six_windows_with_no_split_reprice() {
+        let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
+        let ts = 1_795_000_001_000;
+        let spot = 140.0;
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(
+            PriceTick {
+                ts_ms: ts + 1_000,
+                price: spot * 1.02,
+            },
+            &sample_history(spot * 1.02),
+        );
+        let stats = engine.reprice_stats();
+        assert_eq!(stats.full_reprices, 2);
+        assert_eq!(stats.near_reprices, 0);
+        assert_eq!(stats.trigger_reprices, 0);
+        assert_eq!(engine.price(ts + 1_000).cells.len(), 20 * 6);
     }
 }

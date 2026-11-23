@@ -270,6 +270,8 @@ pub struct SimulationConfig {
     pub p_floor: f64,
     pub adaptive_mc: bool,
     pub touch_mode: TouchMode,
+    pub quote_window_count: usize,
+    pub far_refresh_ms: u64,
 }
 
 impl Default for SimulationConfig {
@@ -289,6 +291,8 @@ impl Default for SimulationConfig {
             p_floor: 0.01,
             adaptive_mc: false,
             touch_mode: TouchMode::Continuous,
+            quote_window_count: crate::horizon::DEFAULT_WINDOWS,
+            far_refresh_ms: crate::horizon::FAR_REFRESH_MS,
         }
     }
 }
