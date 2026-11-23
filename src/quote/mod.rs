@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::grid::{
     GridConfig, OhlcBar, PriceBand, TimeWindow, VolatilitySnapshot, compute_k_safety,
-    compute_quote_probability, effective_m_base, estimate_runtime_state,
+    compute_quote_probability, effective_m_base, estimate_runtime_state_with_seed_prior,
     price_multiplier_with_margin, simulate_summary, stock_grid_config_for_ticker,
 };
 use crate::price::PriceTick;
@@ -83,6 +83,7 @@ pub struct QuoteEngine {
     spot: f64,
     base_config: GridConfig,
     config: GridConfig,
+    seed_variance_prior: Option<f64>,
     volatility: Option<VolatilitySnapshot>,
     cached_cells: Vec<CachedCell>,
     cached_scenario_payouts: Vec<f64>,
@@ -105,12 +106,18 @@ impl QuoteEngine {
             spot: 0.0,
             config: base_config.clone(),
             base_config,
+            seed_variance_prior: None,
             volatility: None,
             cached_cells: Vec::new(),
             cached_scenario_payouts: Vec::new(),
             cached_k_safety: None,
             exposure: ExposureBook::default(),
         }
+    }
+
+    /// Sets a measured variance used instead of `sigma_ref²` as the cold-start prior.
+    pub fn set_seed_variance_prior(&mut self, variance: Option<f64>) {
+        self.seed_variance_prior = variance.filter(|value| (*value).is_finite() && *value > 0.0);
     }
 
     /// Runs Monte Carlo for a new price sample and caches per-cell probabilities and scenario payouts.
@@ -139,7 +146,12 @@ impl QuoteEngine {
             return;
         }
 
-        let Ok(runtime_state) = estimate_runtime_state(tick.price, history, &config) else {
+        let Ok(runtime_state) = estimate_runtime_state_with_seed_prior(
+            tick.price,
+            history,
+            &config,
+            self.seed_variance_prior,
+        ) else {
             return;
         };
 

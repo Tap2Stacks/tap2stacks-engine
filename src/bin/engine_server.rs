@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use st_engine::logging::init_tracing;
 use st_engine::price::{
-    FeedHealth, HealthTracker, HyperliquidConfig, PriceTick, read_hl_jsonl,
+    FeedHealth, HealthTracker, HyperliquidConfig, PriceTick, fetch_candle_warmup, read_hl_jsonl,
     spawn_hyperliquid_stream, spawn_price_pipeline,
 };
 use st_engine::protocol::{EngineIn, EngineOut};
@@ -24,7 +24,9 @@ use tokio_tungstenite::tungstenite::{Bytes, Message, Utf8Bytes};
 use tracing::{debug, error, info, warn};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
-const DEFAULT_TICKERS: &str = "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8";
+const DEFAULT_TICKERS: &str = "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8,AAPL=xyz:AAPL:8,SP500=xyz:SP500:150";
+const DEFAULT_HL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
+const DEFAULT_HL_WARMUP_MINUTES: u64 = 180;
 const STALE_AFTER: Duration = Duration::from_secs(3);
 const HL_HEALTH_INTERVAL: Duration = Duration::from_millis(500);
 const QUOTE_INTERVAL: Duration = Duration::from_millis(100);
@@ -262,6 +264,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
+    let hl_info_url = env::var("HL_INFO_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_HL_INFO_URL.to_string());
+    let warmup_minutes = warmup_minutes_from_env();
+
     let clock = Arc::new(MonotonicWallClock::new());
     let hub = Arc::new(ClientHub::new());
 
@@ -278,6 +287,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         tick_receivers.insert(spec.coin.clone(), tick_rx);
     }
 
+    let mut seed_variance_priors: HashMap<String, f64> = HashMap::new();
     let (health_rx, prev_day_px) = if let Some(ref replay_path) = replay_file {
         info!(replay_path = %replay_path, "starting engine_server in replay mode");
         let health_rx = spawn_replay_stream(
@@ -288,6 +298,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         )?;
         (health_rx, Arc::new(RwLock::new(HashMap::new())))
     } else {
+        if warmup_minutes > 0 {
+            seed_variance_priors =
+                fetch_warmup_priors(&tickers, &hl_info_url, warmup_minutes).await;
+        }
         let mut hl_config = HyperliquidConfig {
             coins: tickers.iter().map(|t| t.coin.clone()).collect(),
             stale_after: STALE_AFTER,
@@ -313,14 +327,18 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let clock_clone = Arc::clone(&clock);
         let health_rx_clone = health_rx.clone();
         let prev_day_px_clone = Arc::clone(&prev_day_px);
+        let seed_variance_prior = seed_variance_priors.get(&spec.coin).copied();
         tokio::spawn(run_ticker_task(
             spec,
-            tick_rx,
-            exposure_rx,
-            health_rx_clone,
-            prev_day_px_clone,
-            hub_clone,
-            clock_clone,
+            TickerTaskInput {
+                raw_tick_rx: tick_rx,
+                exposure_rx,
+                health_rx: health_rx_clone,
+                prev_day_px: prev_day_px_clone,
+                hub: hub_clone,
+                clock: clock_clone,
+                seed_variance_prior,
+            },
         ));
     }
 
@@ -344,15 +362,75 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 }
 
-async fn run_ticker_task(
-    spec: TickerSpec,
-    mut raw_tick_rx: mpsc::Receiver<PriceTick>,
-    mut exposure_rx: mpsc::Receiver<Vec<(CellKey, f64)>>,
-    mut health_rx: watch::Receiver<HashMap<String, FeedHealth>>,
+async fn fetch_warmup_priors(
+    tickers: &[TickerSpec],
+    info_url: &str,
+    warmup_minutes: u64,
+) -> HashMap<String, f64> {
+    let mut priors = HashMap::new();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(error = %err, "hyperliquid warmup client unavailable; using static volatility priors");
+            return priors;
+        }
+    };
+    let end_time_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for spec in tickers {
+        match fetch_candle_warmup(&client, info_url, &spec.coin, warmup_minutes, end_time_ms).await
+        {
+            Ok(estimate) => {
+                info!(
+                    ticker = %spec.ticker,
+                    coin = %spec.coin,
+                    candle_count = estimate.candle_count,
+                    last_close = estimate.last_close,
+                    sigma_per_second = estimate.sigma_per_second,
+                    variance_per_second = estimate.variance_per_second,
+                    "hyperliquid warmup volatility prior"
+                );
+                priors.insert(spec.coin.clone(), estimate.variance_per_second);
+            }
+            Err(err) => {
+                warn!(
+                    ticker = %spec.ticker,
+                    coin = %spec.coin,
+                    error = %err,
+                    "hyperliquid warmup unavailable; using static volatility prior"
+                );
+            }
+        }
+    }
+    priors
+}
+
+struct TickerTaskInput {
+    raw_tick_rx: mpsc::Receiver<PriceTick>,
+    exposure_rx: mpsc::Receiver<Vec<(CellKey, f64)>>,
+    health_rx: watch::Receiver<HashMap<String, FeedHealth>>,
     prev_day_px: Arc<RwLock<HashMap<String, f64>>>,
     hub: Arc<ClientHub>,
     clock: Arc<MonotonicWallClock>,
-) {
+    seed_variance_prior: Option<f64>,
+}
+
+async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
+    let TickerTaskInput {
+        mut raw_tick_rx,
+        mut exposure_rx,
+        mut health_rx,
+        prev_day_px,
+        hub,
+        clock,
+        seed_variance_prior,
+    } = input;
     let (price_runtime, _price_worker_handle) = spawn_price_pipeline(
         MAX_COMPLETED_BARS,
         GRID_LOOKBACK_BARS,
@@ -360,6 +438,7 @@ async fn run_ticker_task(
     );
     let mut grid_rx = price_runtime.grid_rx;
     let mut quote_engine = QuoteEngine::new(spec.ticker.clone(), spec.band_cents);
+    quote_engine.set_seed_variance_prior(seed_variance_prior);
 
     let stale_after_ms = STALE_AFTER.as_millis() as u64;
     let mut quote_tick = interval_at(Instant::now() + QUOTE_INTERVAL, QUOTE_INTERVAL);
@@ -705,6 +784,19 @@ async fn handle_client_text(
     }
 }
 
+fn warmup_minutes_from_env() -> u64 {
+    match env::var("HL_WARMUP_MINUTES") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
+            Ok(value) => value,
+            Err(_) => {
+                warn!(value = %raw, "invalid HL_WARMUP_MINUTES; using default");
+                DEFAULT_HL_WARMUP_MINUTES
+            }
+        },
+        _ => DEFAULT_HL_WARMUP_MINUTES,
+    }
+}
+
 fn parse_tickers(raw: &str) -> Result<Vec<TickerSpec>, Box<dyn Error + Send + Sync>> {
     let mut specs = Vec::new();
     let mut seen_tickers = HashSet::new();
@@ -769,13 +861,19 @@ mod tests {
     #[test]
     fn parses_default_tickers_with_colon_in_coin() {
         let parsed = parse_tickers(DEFAULT_TICKERS).unwrap();
-        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.len(), 4);
         assert_eq!(parsed[0].ticker, "NVDA");
         assert_eq!(parsed[0].coin, "xyz:NVDA");
         assert_eq!(parsed[0].band_cents, 3);
         assert_eq!(parsed[1].ticker, "TSLA");
         assert_eq!(parsed[1].coin, "xyz:TSLA");
         assert_eq!(parsed[1].band_cents, 8);
+        assert_eq!(parsed[2].ticker, "AAPL");
+        assert_eq!(parsed[2].coin, "xyz:AAPL");
+        assert_eq!(parsed[2].band_cents, 8);
+        assert_eq!(parsed[3].ticker, "SP500");
+        assert_eq!(parsed[3].coin, "xyz:SP500");
+        assert_eq!(parsed[3].band_cents, 150);
     }
 
     #[test]

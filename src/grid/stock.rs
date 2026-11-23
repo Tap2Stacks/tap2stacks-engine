@@ -64,7 +64,7 @@ pub fn stock_grid_config(band_cents: u32, windows: Vec<TimeWindow>) -> GridConfi
     }
 }
 
-/// Builds a ticker-specific `GridConfig` for US equities (`NVDA`, `TSLA`).
+/// Builds a ticker-specific `GridConfig` for US equities (`NVDA`, `TSLA`, `AAPL`, `SP500`).
 pub fn stock_grid_config_for_ticker(
     ticker: &str,
     band_cents: u32,
@@ -87,6 +87,21 @@ pub fn stock_grid_config_for_ticker(
         cfg.pricing.off_hours_m_base = Some(0.094);
         cfg.pricing.current_row_logit_shift = 0.0;
         set_distance_factors(&mut cfg, &[(1, 0.72), (2, 0.545), (3, 0.505), (4, 0.96)]);
+    } else if symbol.eq_ignore_ascii_case("AAPL") {
+        // AAPL/SP500 priors derive from HL xyz 1m candles scaled to existing xyz priors; other parameters copy TSLA and are not calibrated.
+        cfg.volatility.sigma_ref = 0.0000933;
+        cfg.volatility.sigma_scale = 1.073;
+        cfg.volatility.variance_floor = 1.50e-9;
+        cfg.pricing.m_base = 0.012;
+        cfg.pricing.current_row_logit_shift = 0.0;
+        set_distance_factors(&mut cfg, &[(1, 0.71), (2, 0.49), (3, 0.51), (4, 0.94)]);
+    } else if symbol.eq_ignore_ascii_case("SP500") {
+        cfg.volatility.sigma_ref = 0.0000655;
+        cfg.volatility.sigma_scale = 1.073;
+        cfg.volatility.variance_floor = 7.37e-10;
+        cfg.pricing.m_base = 0.012;
+        cfg.pricing.current_row_logit_shift = 0.0;
+        set_distance_factors(&mut cfg, &[(1, 0.71), (2, 0.49), (3, 0.51), (4, 0.94)]);
     } else {
         cfg.volatility.sigma_ref = 0.00020;
     }
@@ -204,7 +219,9 @@ mod tests {
             end_secs: 10,
         }];
         let nvda = stock_grid_config_for_ticker("NVDA", 3, windows.clone());
-        let tsla = stock_grid_config_for_ticker("xyz:TSLA", 8, windows);
+        let tsla = stock_grid_config_for_ticker("xyz:TSLA", 8, windows.clone());
+        let aapl = stock_grid_config_for_ticker("xyz:AAPL", 8, windows.clone());
+        let sp500 = stock_grid_config_for_ticker("SP500", 150, windows);
         assert_eq!(nvda.volatility.sigma_ref, 0.00023);
         assert_eq!(nvda.volatility.sigma_scale, 1.035);
         assert_eq!(nvda.volatility.variance_floor, 1.8e-9);
@@ -234,6 +251,34 @@ mod tests {
         assert_eq!(tsla.pricing.current_row_logit_shift, 0.0);
         assert_eq!(
             tsla.calibration.factors.get(&CalibrationKey {
+                window_index: 0,
+                dist_bucket: 2,
+                sigma_bucket: 1,
+            }),
+            Some(&0.49)
+        );
+
+        assert_eq!(aapl.volatility.sigma_ref, 0.0000933);
+        assert_eq!(aapl.volatility.sigma_scale, 1.073);
+        assert_eq!(aapl.volatility.variance_floor, 1.50e-9);
+        assert_eq!(aapl.pricing.m_base, 0.012);
+        assert_eq!(aapl.pricing.off_hours_m_base, None);
+        assert_eq!(
+            aapl.calibration.factors.get(&CalibrationKey {
+                window_index: 0,
+                dist_bucket: 2,
+                sigma_bucket: 1,
+            }),
+            Some(&0.49)
+        );
+
+        assert_eq!(sp500.volatility.sigma_ref, 0.0000655);
+        assert_eq!(sp500.volatility.sigma_scale, 1.073);
+        assert_eq!(sp500.volatility.variance_floor, 7.37e-10);
+        assert_eq!(sp500.pricing.m_base, 0.012);
+        assert_eq!(sp500.pricing.off_hours_m_base, None);
+        assert_eq!(
+            sp500.calibration.factors.get(&CalibrationKey {
                 window_index: 0,
                 dist_bucket: 2,
                 sigma_bucket: 1,
