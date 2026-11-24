@@ -21,7 +21,9 @@ use st_engine::stress::{
     minute_starts, move_sign, normal_session_starts, parse_period, parse_utc, price_at_or_before,
     quoted_sigma_at, realized_step_sigma, stake_stats, tripwire_k, worst_edge_minute, worst_minute,
 };
-use st_engine::v2::{PricingModel, Regime, V2_M_BASE};
+use st_engine::v2::{
+    PricingModel, Regime, V2_M_BASE, load_v2_params_file, v2_ticker_params_for_source,
+};
 
 const DAY_MS: u64 = 86_400_000;
 const M3_DIST_WEIGHTS: [f64; 6] = [0.35, 0.35, 0.15, 0.08, 0.04, 0.03];
@@ -75,6 +77,8 @@ struct Args {
     model: PricingModel,
     max_multiplier: Option<f64>,
     v2_preset: Option<Regime>,
+    v2_params_file: Option<PathBuf>,
+    dump_v2_params: bool,
     accuracy_table: bool,
 }
 
@@ -159,12 +163,26 @@ fn parse_args() -> Args {
         model: PricingModel::V1,
         max_multiplier: None,
         v2_preset: None,
+        v2_params_file: None,
+        dump_v2_params: false,
         accuracy_table: false,
     };
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
         let key = raw[i].as_str();
+        if key == "--dump-v2-params" {
+            if let Some(next) = raw.get(i + 1) {
+                if next == "true" || next == "false" {
+                    args.dump_v2_params = next == "true";
+                    i += 2;
+                    continue;
+                }
+            }
+            args.dump_v2_params = true;
+            i += 1;
+            continue;
+        }
         let val = raw
             .get(i + 1)
             .unwrap_or_else(|| panic!("missing value for {key}"));
@@ -269,6 +287,7 @@ fn parse_args() -> Args {
                 args.v2_preset =
                     Some(Regime::parse(val).expect("bad --v2-preset (quiet|normal|volatile|news)"))
             }
+            "--v2-params-file" => args.v2_params_file = Some(PathBuf::from(val)),
             "--accuracy-table" => {
                 args.accuracy_table = val.parse().expect("bad --accuracy-table")
             }
@@ -276,12 +295,18 @@ fn parse_args() -> Args {
         }
         i += 2;
     }
+    if args.dump_v2_params {
+        if args.coin.is_empty() {
+            panic!("usage: policy_backtest --dump-v2-params --coin <coin> [--source hyperliquid|deribit]");
+        }
+        return args;
+    }
     if (args.files.is_empty() && args.data_dirs.is_empty())
         || args.coin.is_empty()
         || args.band_cents == 0
     {
         panic!(
-            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--source hyperliquid|deribit] [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
+            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--source hyperliquid|deribit] [--v2-params-file <path.json>] [--dump-v2-params] [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
         );
     }
     if let (Some(f), Some(t)) = (args.date_from_ms, args.date_to_excl_ms) {
@@ -1616,6 +1641,23 @@ fn run_event(
 
 fn main() {
     let args = parse_args();
+    if args.dump_v2_params {
+        let Some(params) = v2_ticker_params_for_source(&args.coin, args.source) else {
+            eprintln!(
+                "no compiled v2 params for coin '{}' on source '{}'",
+                args.coin,
+                args.source.as_str()
+            );
+            std::process::exit(2);
+        };
+        let json = params.to_json_pretty().unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        println!("{json}");
+        return;
+    }
+
     let ticker = match args.source {
         PriceSource::Hyperliquid => args
             .coin
@@ -1627,6 +1669,33 @@ fn main() {
     };
     let mut cfg = stock_grid_config_for_ticker(&ticker, args.band_cents, Vec::new());
     apply(&mut cfg, &args);
+    if let Some(ref path) = args.v2_params_file {
+        let loaded = load_v2_params_file(path).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        if !loaded.matches_coin(&args.coin) {
+            eprintln!(
+                "v2 params file {} has ticker '{}', which does not match --coin '{}'",
+                path.display(),
+                loaded.ticker,
+                args.coin
+            );
+            std::process::exit(2);
+        }
+        if loaded.band_cents != args.band_cents {
+            eprintln!(
+                "warning: --v2-params-file {} specifies band_cents={}, differing from --band-cents={}; using --band-cents={}",
+                path.display(),
+                loaded.band_cents,
+                args.band_cents,
+                args.band_cents
+            );
+        }
+        let leaked = loaded.leak_static();
+        println!("v2_params_file={} {}", path.display(), leaked.one_line_summary());
+        cfg.simulation.v2_params_override = Some(leaked);
+    }
     let cur_shift = cfg.pricing.current_row_logit_shift;
     let adj_shift = cfg.pricing.adjacent_row_logit_shift;
     let hl_ticks = load_hl_ticks(&args);

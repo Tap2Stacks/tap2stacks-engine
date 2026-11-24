@@ -15,8 +15,8 @@ use crate::price::{PriceSource, PriceTick};
 use crate::session::is_us_regular_session;
 use crate::v2::{
     PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, compute_book_lead,
-    dynamic_news_preset, price_grid_v2_with_book, v2_m_eff, v2_price_multiplier,
-    v2_ticker_params_for_source,
+    dynamic_news_preset, normalize_v2_ticker, price_grid_v2_with_book, v2_m_eff,
+    v2_price_multiplier, v2_ticker_params_for_source,
 };
 
 pub use book::{CellKey, ExposureBook};
@@ -542,10 +542,16 @@ impl QuoteEngine {
     pub fn with_config(ticker: String, band_cents: u32, base_config: GridConfig) -> Self {
         let (v2_params, m4_params) = match base_config.simulation.pricing_model {
             PricingModel::V1 => (None, None),
-            PricingModel::V2 => (
-                v2_ticker_params_for_source(&ticker, base_config.simulation.price_source),
-                None,
-            ),
+            PricingModel::V2 => {
+                let params = base_config
+                    .simulation
+                    .v2_params_override
+                    .filter(|p| normalize_v2_ticker(p.ticker) == normalize_v2_ticker(&ticker))
+                    .or_else(|| {
+                        v2_ticker_params_for_source(&ticker, base_config.simulation.price_source)
+                    });
+                (params, None)
+            }
             PricingModel::M4 => match (
                 v2_ticker_params_for_source(&ticker, PriceSource::Hyperliquid),
                 m4_ticker_params(&ticker),
@@ -1508,5 +1514,51 @@ mod tests {
         let q_tsla = tsla_eng.price(ts);
         assert_eq!(q_tsla.band_cents, 10);
         assert_eq!(q_tsla.cells.len(), 20 * 6);
+    }
+
+    #[test]
+    fn v2_params_json_round_trip_produces_bit_identical_quote_engine_quotes_for_both_sources() {
+        use crate::v2::parse_v2_params_json;
+
+        let ts = 1_795_057_200_000_u64;
+        for (ticker, band_cents, spot, mid_px, oracle_px, source) in [
+            ("NVDA", 3_u32, 139.99_f64, 140.04_f64, 139.99_f64, PriceSource::Hyperliquid),
+            ("TSLA", 8_u32, 364.04_f64, 364.14_f64, 364.04_f64, PriceSource::Hyperliquid),
+            ("NVDA", 3_u32, 139.99_f64, 140.04_f64, 139.99_f64, PriceSource::Deribit),
+            ("TSLA", 8_u32, 364.04_f64, 364.14_f64, 364.04_f64, PriceSource::Deribit),
+        ] {
+            let compiled = v2_ticker_params_for_source(ticker, source).unwrap();
+            let dumped = compiled.to_json_pretty().unwrap();
+            let loaded = parse_v2_params_json(&dumped).unwrap().leak_static();
+
+            let mut cfg_compiled = stock_grid_config_for_ticker(ticker, band_cents, Vec::new());
+            cfg_compiled.simulation.pricing_model = PricingModel::V2;
+            cfg_compiled.simulation.price_source = source;
+
+            let mut cfg_loaded = cfg_compiled.clone();
+            cfg_loaded.simulation.v2_params_override = Some(loaded);
+
+            let mut eng_compiled =
+                QuoteEngine::with_config(ticker.to_string(), band_cents, cfg_compiled);
+            let mut eng_loaded =
+                QuoteEngine::with_config(ticker.to_string(), band_cents, cfg_loaded);
+
+            let hist = sample_history(spot);
+            let tick = PriceTick {
+                ts_ms: ts,
+                price: spot,
+                mid_px: Some(mid_px),
+                oracle_px: Some(oracle_px),
+            };
+            eng_compiled.on_sample(tick, &hist);
+            eng_loaded.on_sample(tick, &hist);
+
+            assert_eq!(
+                eng_compiled.price(ts),
+                eng_loaded.price(ts),
+                "round-trip quote mismatch for {ticker} on {}",
+                source.as_str()
+            );
+        }
     }
 }

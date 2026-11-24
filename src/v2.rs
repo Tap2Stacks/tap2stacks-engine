@@ -8,6 +8,10 @@
 //! `v2_ticker_params` and stay on model v1.
 
 use std::collections::VecDeque;
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::grid::{compute_k_skew, GridConfig, PriceBand, TimeWindow};
 use crate::horizon::NEAR_WINDOWS;
@@ -142,7 +146,7 @@ impl Regime {
 }
 
 /// Fitted zero-inflated cent-jump parameters for one regime preset.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RegimePreset {
     /// Empirical unconditional 1-second move probability `q = P(ΔC != 0)`.
     pub q_1s: f64,
@@ -451,24 +455,261 @@ pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     ],
 };
 
-/// Returns source-specific v2 parameters for tickers with configured tables (`NVDA`, `TSLA`).
-/// Tickers without v2 parameters (`AAPL`, `SP500`) return `None` and stay on model v1.
-pub fn v2_ticker_params_for_source(
-    ticker: &str,
-    source: PriceSource,
-) -> Option<&'static TickerV2Params> {
+/// Normalizes a ticker, Hyperliquid coin (`xyz:NVDA`), Deribit index (`nvda_usdc`), or
+/// Deribit channel (`deribit_price_index.nvda_usdc`) to uppercase base symbol (`NVDA`).
+pub fn normalize_v2_ticker(ticker: &str) -> String {
     let trimmed = ticker.trim();
     let stripped = trimmed
         .strip_prefix("deribit_price_index.")
         .unwrap_or(trimmed);
     let base = stripped.split(':').next_back().unwrap_or(stripped);
     let lower = base.to_ascii_lowercase();
-    let symbol = lower.strip_suffix("_usdc").unwrap_or(&lower);
-    match (source, symbol) {
-        (PriceSource::Hyperliquid, "nvda") => Some(&NVDA_V2_PARAMS),
-        (PriceSource::Hyperliquid, "tsla") => Some(&TSLA_V2_PARAMS),
-        (PriceSource::Deribit, "nvda") => Some(&NVDA_DERIBIT_V2_PARAMS),
-        (PriceSource::Deribit, "tsla") => Some(&TSLA_DERIBIT_V2_PARAMS),
+    let sym = lower.strip_suffix("_usdc").unwrap_or(&lower);
+    let sym = sym.strip_suffix("-perpetual").unwrap_or(sym);
+    sym.to_ascii_uppercase()
+}
+
+/// Owned JSON representation of `TickerV2Params` used by offline tools
+/// (`--v2-params-file` / `--dump-v2-params`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TickerV2ParamsJson {
+    pub ticker: String,
+    pub band_cents: u32,
+    pub reference_price: f64,
+    pub clock_secs: u64,
+    pub void_gap_ms: u64,
+    pub book_lead_secs: u64,
+    pub book_gap_beta: f64,
+    pub book_gap_clamp_cents: i64,
+    pub book_max_age_ms: u64,
+    pub rms_ref_cents: f64,
+    pub thresholds_rms_cents: [f64; 3],
+    pub shock_single_step_cents: i64,
+    pub presets: [RegimePreset; 4],
+    pub transition_1min: [[f64; 4]; 4],
+}
+
+impl TickerV2ParamsJson {
+    pub fn from_params(params: &TickerV2Params) -> Self {
+        Self {
+            ticker: params.ticker.to_string(),
+            band_cents: params.band_cents,
+            reference_price: params.reference_price,
+            clock_secs: params.clock_secs,
+            void_gap_ms: params.void_gap_ms,
+            book_lead_secs: params.book_lead_secs,
+            book_gap_beta: params.book_gap_beta,
+            book_gap_clamp_cents: params.book_gap_clamp_cents,
+            book_max_age_ms: params.book_max_age_ms,
+            rms_ref_cents: params.rms_ref_cents,
+            thresholds_rms_cents: params.thresholds_rms_cents,
+            shock_single_step_cents: params.shock_single_step_cents,
+            presets: params.presets,
+            transition_1min: params.transition_1min,
+        }
+    }
+
+    pub fn matches_coin(&self, coin_or_ticker: &str) -> bool {
+        normalize_v2_ticker(&self.ticker) == normalize_v2_ticker(coin_or_ticker)
+    }
+
+    /// Validates all parameter bounds and stochastic constraints, failing fast with a clear error.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ticker.trim().is_empty() {
+            return Err("v2 params validation error: ticker must not be empty".into());
+        }
+        if self.band_cents == 0 {
+            return Err("v2 params validation error: band_cents must be >= 1".into());
+        }
+        if !self.reference_price.is_finite() || self.reference_price <= 0.0 {
+            return Err(format!(
+                "v2 params validation error: reference_price ({}) must be finite and > 0",
+                self.reference_price
+            ));
+        }
+        if self.clock_secs < 1 {
+            return Err(format!(
+                "v2 params validation error: clock_secs ({}) must be >= 1",
+                self.clock_secs
+            ));
+        }
+        if self.void_gap_ms == 0 {
+            return Err("v2 params validation error: void_gap_ms must be >= 1".into());
+        }
+        if !self.book_gap_beta.is_finite() {
+            return Err(format!(
+                "v2 params validation error: book_gap_beta ({}) must be finite",
+                self.book_gap_beta
+            ));
+        }
+        if self.book_gap_clamp_cents < 0 {
+            return Err(format!(
+                "v2 params validation error: book_gap_clamp_cents ({}) must be >= 0",
+                self.book_gap_clamp_cents
+            ));
+        }
+        if !self.rms_ref_cents.is_finite() || self.rms_ref_cents <= 0.0 {
+            return Err(format!(
+                "v2 params validation error: rms_ref_cents ({}) must be finite and > 0",
+                self.rms_ref_cents
+            ));
+        }
+        if self.shock_single_step_cents <= 0 {
+            return Err(format!(
+                "v2 params validation error: shock_single_step_cents ({}) must be > 0",
+                self.shock_single_step_cents
+            ));
+        }
+
+        let [t0, t1, t2] = self.thresholds_rms_cents;
+        for (idx, t) in [t0, t1, t2].iter().enumerate() {
+            if !t.is_finite() || *t <= 0.0 {
+                return Err(format!(
+                    "v2 params validation error: thresholds_rms_cents[{idx}] ({t}) must be finite and > 0"
+                ));
+            }
+        }
+        if !(t0 < t1 && t1 < t2) {
+            return Err(format!(
+                "v2 params validation error: thresholds_rms_cents ([{t0}, {t1}, {t2}]) must be strictly increasing"
+            ));
+        }
+
+        for (idx, preset) in self.presets.iter().enumerate() {
+            let name = Regime::from_index(idx).as_str();
+            for (field, val) in [
+                ("q_1s", preset.q_1s),
+                ("p_move", preset.p_move),
+                ("mix_weight", preset.mix_weight),
+            ] {
+                if !val.is_finite() || !(0.0..=1.0).contains(&val) {
+                    return Err(format!(
+                        "v2 params validation error: presets[{idx}] ({name}).{field} ({val}) must be in [0, 1]"
+                    ));
+                }
+            }
+            for (field, val) in [("p1", preset.p1), ("p2", preset.p2)] {
+                if !val.is_finite() || val <= 0.0 || val > 1.0 {
+                    return Err(format!(
+                        "v2 params validation error: presets[{idx}] ({name}).{field} ({val}) must be in (0, 1]"
+                    ));
+                }
+            }
+            if !preset.rms_median_cents.is_finite() || preset.rms_median_cents <= 0.0 {
+                return Err(format!(
+                    "v2 params validation error: presets[{idx}] ({name}).rms_median_cents ({}) must be finite and > 0",
+                    preset.rms_median_cents
+                ));
+            }
+            if !preset.m_base.is_finite() || !(0.0..1.0).contains(&preset.m_base) {
+                return Err(format!(
+                    "v2 params validation error: presets[{idx}] ({name}).m_base ({}) must be in [0, 1)",
+                    preset.m_base
+                ));
+            }
+        }
+
+        for (r, row) in self.transition_1min.iter().enumerate() {
+            let mut sum = 0.0_f64;
+            for (c, &v) in row.iter().enumerate() {
+                if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                    return Err(format!(
+                        "v2 params validation error: transition_1min[{r}][{c}] ({v}) must be in [0, 1]"
+                    ));
+                }
+                sum += v;
+            }
+            if (sum - 1.0).abs() > 1e-6 {
+                return Err(format!(
+                    "v2 params validation error: transition_1min[{r}] row sum ({sum:.9}) must equal 1 within 1e-6"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Converts validated owned JSON params into a leaked `'static` reference for offline tools.
+    pub fn leak_static(self) -> &'static TickerV2Params {
+        let ticker: &'static str = Box::leak(self.ticker.into_boxed_str());
+        Box::leak(Box::new(TickerV2Params {
+            ticker,
+            band_cents: self.band_cents,
+            reference_price: self.reference_price,
+            clock_secs: self.clock_secs,
+            void_gap_ms: self.void_gap_ms,
+            book_lead_secs: self.book_lead_secs,
+            book_gap_beta: self.book_gap_beta,
+            book_gap_clamp_cents: self.book_gap_clamp_cents,
+            book_max_age_ms: self.book_max_age_ms,
+            rms_ref_cents: self.rms_ref_cents,
+            thresholds_rms_cents: self.thresholds_rms_cents,
+            shock_single_step_cents: self.shock_single_step_cents,
+            presets: self.presets,
+            transition_1min: self.transition_1min,
+        }))
+    }
+}
+
+impl TickerV2Params {
+    /// Serializes this parameter table as pretty JSON matching `TickerV2ParamsJson`.
+    pub fn to_json_pretty(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&TickerV2ParamsJson::from_params(self))
+            .map_err(|err| format!("failed to serialize v2 params: {err}"))
+    }
+
+    /// Compact one-line summary for offline tool startup logs.
+    pub fn one_line_summary(&self) -> String {
+        format!(
+            "ticker={} band_cents={} clock={}s void_gap={}ms book_lead={}s beta={:.3} clamp={}c book_max_age={}ms rms_ref={:.3}c thresh=[{:.3},{:.3},{:.3}] shock={}c m_base=[{:.3},{:.3},{:.3},{:.3}]",
+            self.ticker,
+            self.band_cents,
+            self.clock_secs,
+            self.void_gap_ms,
+            self.book_lead_secs,
+            self.book_gap_beta,
+            self.book_gap_clamp_cents,
+            self.book_max_age_ms,
+            self.rms_ref_cents,
+            self.thresholds_rms_cents[0],
+            self.thresholds_rms_cents[1],
+            self.thresholds_rms_cents[2],
+            self.shock_single_step_cents,
+            self.presets[0].m_base,
+            self.presets[1].m_base,
+            self.presets[2].m_base,
+            self.presets[3].m_base,
+        )
+    }
+}
+
+/// Parses and validates a JSON string representing `TickerV2ParamsJson`.
+pub fn parse_v2_params_json(raw: &str) -> Result<TickerV2ParamsJson, String> {
+    let parsed: TickerV2ParamsJson =
+        serde_json::from_str(raw).map_err(|err| format!("invalid v2 params JSON: {err}"))?;
+    parsed.validate()?;
+    Ok(parsed)
+}
+
+/// Loads, parses, and validates a `TickerV2ParamsJson` file from disk.
+pub fn load_v2_params_file(path: &Path) -> Result<TickerV2ParamsJson, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed reading v2 params file {}: {err}", path.display()))?;
+    parse_v2_params_json(&raw)
+        .map_err(|err| format!("{} ({})", err, path.display()))
+}
+
+/// Returns source-specific v2 parameters for tickers with configured tables (`NVDA`, `TSLA`).
+/// Tickers without v2 parameters (`AAPL`, `SP500`) return `None` and stay on model v1.
+pub fn v2_ticker_params_for_source(
+    ticker: &str,
+    source: PriceSource,
+) -> Option<&'static TickerV2Params> {
+    match (source, normalize_v2_ticker(ticker).as_str()) {
+        (PriceSource::Hyperliquid, "NVDA") => Some(&NVDA_V2_PARAMS),
+        (PriceSource::Hyperliquid, "TSLA") => Some(&TSLA_V2_PARAMS),
+        (PriceSource::Deribit, "NVDA") => Some(&NVDA_DERIBIT_V2_PARAMS),
+        (PriceSource::Deribit, "TSLA") => Some(&TSLA_DERIBIT_V2_PARAMS),
         _ => None,
     }
 }
@@ -2272,5 +2513,159 @@ mod tests {
                 lead_secs: 2,
             }
         );
+    }
+
+    #[test]
+    fn v2_params_json_round_trip_matches_compiled_tables_for_both_sources() {
+        let windows: Vec<TimeWindow> = (0..8)
+            .map(|i| TimeWindow {
+                start_secs: (5 + 5 * i) as u32,
+                end_secs: (10 + 5 * i) as u32,
+            })
+            .collect();
+        for (ticker, source, spot, band_c, mid, mark) in [
+            ("NVDA", PriceSource::Hyperliquid, 139.99_f64, 3_i64, 140.04_f64, 139.99_f64),
+            ("TSLA", PriceSource::Hyperliquid, 364.04_f64, 8_i64, 364.14_f64, 364.04_f64),
+            ("NVDA", PriceSource::Deribit, 139.99_f64, 3_i64, 140.04_f64, 139.99_f64),
+            ("TSLA", PriceSource::Deribit, 364.04_f64, 8_i64, 364.14_f64, 364.04_f64),
+        ] {
+            let compiled = v2_ticker_params_for_source(ticker, source).unwrap();
+            let dumped = compiled.to_json_pretty().unwrap();
+            let parsed = parse_v2_params_json(&dumped).unwrap();
+            assert!(parsed.matches_coin(ticker));
+            let loaded = parsed.leak_static();
+            assert_eq!(loaded, compiled);
+
+            let spot_c = (spot * 100.0).round() as i64;
+            let bands: Vec<PriceBand> = (-2..=2_i64)
+                .enumerate()
+                .map(|(row_index, k)| PriceBand {
+                    row_index,
+                    lower: (spot_c + k * band_c) as f64 / 100.0,
+                    upper: (spot_c + (k + 1) * band_c) as f64 / 100.0,
+                })
+                .collect();
+            let adj_compiled = compute_book_lead(Some(mid), Some(mark), Some(0), compiled);
+            let adj_loaded = compute_book_lead(Some(mid), Some(mark), Some(0), loaded);
+            assert_eq!(adj_compiled, adj_loaded);
+
+            let p_compiled = price_grid_v2_with_book(
+                spot,
+                &bands,
+                &windows,
+                compiled,
+                Regime::Normal,
+                None,
+                None,
+                adj_compiled,
+            );
+            let p_loaded = price_grid_v2_with_book(
+                spot,
+                &bands,
+                &windows,
+                loaded,
+                Regime::Normal,
+                None,
+                None,
+                adj_loaded,
+            );
+            assert_eq!(p_compiled, p_loaded);
+        }
+    }
+
+    #[test]
+    fn v2_params_json_validation_catches_every_error() {
+        let base = TickerV2ParamsJson::from_params(&NVDA_DERIBIT_V2_PARAMS);
+        assert!(base.validate().is_ok());
+
+        // Coin matching across naming variants.
+        assert!(base.matches_coin("NVDA"));
+        assert!(base.matches_coin("xyz:NVDA"));
+        assert!(base.matches_coin("nvda_usdc"));
+        assert!(base.matches_coin("deribit_price_index.nvda_usdc"));
+        assert!(!base.matches_coin("TSLA"));
+        assert!(!base.matches_coin("xyz:TSLA"));
+
+        // clock_secs < 1
+        let mut bad = base.clone();
+        bad.clock_secs = 0;
+        assert!(bad.validate().unwrap_err().contains("clock_secs"));
+
+        // Probabilities outside [0, 1]
+        let prob_mutators: [fn(&mut TickerV2ParamsJson); 9] = [
+            |p| p.presets[0].q_1s = -0.01,
+            |p| p.presets[0].q_1s = 1.01,
+            |p| p.presets[1].p_move = -0.1,
+            |p| p.presets[1].p_move = 1.5,
+            |p| p.presets[3].mix_weight = -0.01,
+            |p| p.presets[3].mix_weight = 1.1,
+            |p| p.presets[2].m_base = -0.01,
+            |p| p.presets[2].m_base = 1.0,
+            |p| p.transition_1min[0][0] = -0.1,
+        ];
+        for mutator in prob_mutators {
+            let mut c = base.clone();
+            mutator(&mut c);
+            assert!(c.validate().is_err(), "expected probability error");
+        }
+
+        // p1, p2 must be in (0, 1] (0.0 rejected, 1.0 accepted, >1.0 rejected)
+        for bad_p in [0.0_f64, -0.2, 1.01, f64::NAN] {
+            let mut c1 = base.clone();
+            c1.presets[0].p1 = bad_p;
+            assert!(c1.validate().unwrap_err().contains("p1"));
+            let mut c2 = base.clone();
+            c2.presets[3].p2 = bad_p;
+            assert!(c2.validate().unwrap_err().contains("p2"));
+        }
+        let mut ok_one = base.clone();
+        ok_one.presets[0].p1 = 1.0;
+        ok_one.presets[0].p2 = 1.0;
+        assert!(ok_one.validate().is_ok());
+
+        // Thresholds must be strictly increasing and > 0
+        for bad_thresh in [
+            [0.0_f64, 2.0, 5.0],
+            [-1.0, 2.0, 5.0],
+            [2.0, 2.0, 5.0],
+            [3.0, 2.0, 5.0],
+            [1.0, 5.0, 4.0],
+        ] {
+            let mut c = base.clone();
+            c.thresholds_rms_cents = bad_thresh;
+            assert!(c.validate().unwrap_err().contains("thresholds_rms_cents"));
+        }
+
+        // Transition row sum must equal 1 within 1e-6
+        let mut bad_row = base.clone();
+        bad_row.transition_1min[1][1] += 2e-6;
+        assert!(bad_row.validate().unwrap_err().contains("row sum"));
+
+        let mut ok_row = base.clone();
+        ok_row.transition_1min[1][1] += 5e-7;
+        assert!(ok_row.validate().is_ok());
+
+        // Basic scalar sanity checks
+        let mut empty_ticker = base.clone();
+        empty_ticker.ticker = "  ".to_string();
+        assert!(empty_ticker.validate().is_err());
+
+        let mut zero_band = base.clone();
+        zero_band.band_cents = 0;
+        assert!(zero_band.validate().is_err());
+
+        let mut bad_ref = base.clone();
+        bad_ref.reference_price = 0.0;
+        assert!(bad_ref.validate().is_err());
+
+        let mut bad_void = base.clone();
+        bad_void.void_gap_ms = 0;
+        assert!(bad_void.validate().is_err());
+
+        let mut bad_clamp = base.clone();
+        bad_clamp.book_gap_clamp_cents = -1;
+        assert!(bad_clamp.validate().is_err());
+
+        assert!(parse_v2_params_json("{not json").is_err());
     }
 }

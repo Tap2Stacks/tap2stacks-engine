@@ -277,6 +277,8 @@ pub struct SimulationConfig {
     pub pricing_model: crate::v2::PricingModel,
     pub v2_forced_regime: Option<crate::v2::Regime>,
     pub price_source: crate::price::PriceSource,
+    /// Optional offline override replacing the compiled v2 table for a matching ticker.
+    pub v2_params_override: Option<&'static crate::v2::TickerV2Params>,
 }
 
 impl Default for SimulationConfig {
@@ -303,6 +305,7 @@ impl Default for SimulationConfig {
             pricing_model: crate::v2::PricingModel::V1,
             v2_forced_regime: None,
             price_source: crate::price::PriceSource::Hyperliquid,
+            v2_params_override: None,
         }
     }
 }

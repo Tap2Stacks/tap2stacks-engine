@@ -7,7 +7,9 @@ use crate::grid::GridConfig;
 use crate::horizon::{RepriceStats, row_dist_bucket};
 use crate::price::{PriceCache, PriceTick};
 use crate::quote::{QuoteEngine, StockCell};
-use crate::v2::{Regime, RegimeDetector, TickerV2Params, v2_ticker_params_for_source};
+use crate::v2::{
+    Regime, RegimeDetector, TickerV2Params, normalize_v2_ticker, v2_ticker_params_for_source,
+};
 
 use eval::{collect_gaps_over, window_hit_bands_with_gap, window_is_void_with_gap};
 pub use stats::{
@@ -89,12 +91,31 @@ pub struct CalibrationReport {
     pub reprice_stats: RepriceStats,
 }
 
+fn resolve_v2_params(opts: &CalibrateOptions) -> Option<&'static TickerV2Params> {
+    opts.base_config
+        .simulation
+        .v2_params_override
+        .filter(|p| normalize_v2_ticker(p.ticker) == normalize_v2_ticker(&opts.ticker))
+        .or_else(|| {
+            v2_ticker_params_for_source(&opts.ticker, opts.base_config.simulation.price_source)
+        })
+}
+
+fn resolve_void_gap_ms(opts: &CalibrateOptions) -> u64 {
+    opts.base_config
+        .simulation
+        .v2_params_override
+        .filter(|p| normalize_v2_ticker(p.ticker) == normalize_v2_ticker(&opts.ticker))
+        .map(|p| p.void_gap_ms)
+        .unwrap_or_else(|| opts.base_config.simulation.price_source.timing().void_gap_ms)
+}
+
 pub fn run_calibration(ticks: &[PriceTick], opts: &CalibrateOptions) -> CalibrationReport {
     let mut report = CalibrationReport::default();
     if ticks.len() < 2 {
         return report;
     }
-    let void_gap_ms = opts.base_config.simulation.price_source.timing().void_gap_ms;
+    let void_gap_ms = resolve_void_gap_ms(opts);
     report.gaps_over_3s = collect_gaps_over(ticks, void_gap_ms);
 
     let first_ts = ticks[0].ts_ms;
@@ -210,11 +231,7 @@ impl EngineReplayState {
                 opts.band_cents,
                 opts.base_config.clone(),
             ),
-            causal_detector: v2_ticker_params_for_source(
-                &opts.ticker,
-                opts.base_config.simulation.price_source,
-            )
-            .map(|params| (RegimeDetector::new(), params)),
+            causal_detector: resolve_v2_params(opts).map(|params| (RegimeDetector::new(), params)),
             feed_start_ms: first_ts,
             last_tick: None,
             last_quoted_tick_ts: None,
@@ -240,11 +257,8 @@ impl EngineReplayState {
                         opts.band_cents,
                         opts.base_config.clone(),
                     );
-                    self.causal_detector = v2_ticker_params_for_source(
-                        &opts.ticker,
-                        opts.base_config.simulation.price_source,
-                    )
-                    .map(|params| (RegimeDetector::new(), params));
+                    self.causal_detector =
+                        resolve_v2_params(opts).map(|params| (RegimeDetector::new(), params));
                     self.feed_start_ms = tick.ts_ms;
                     self.last_quoted_tick_ts = None;
                 }
@@ -309,7 +323,7 @@ fn evaluate_window(
     let center_lower_cents = anchor_cents - (band_c / 2);
     let dist_max = opts.base_config.pricing.calibration_dist_max;
 
-    let void_gap_ms = opts.base_config.simulation.price_source.timing().void_gap_ms;
+    let void_gap_ms = resolve_void_gap_ms(opts);
     if !opts.all_windows {
         let window_cells: Vec<StockCell> = quote
             .cells

@@ -13,12 +13,16 @@ use st_engine::horizon::{
     parse_factor_table,
 };
 use st_engine::price::{PriceSource, PriceTick, deribit_ticker_symbol, read_ticks_for_source};
+use st_engine::v2::{PricingModel, load_v2_params_file, v2_ticker_params_for_source};
 
 struct CliArgs {
     files: Vec<PathBuf>,
     coin: String,
     source: PriceSource,
     band_cents: u32,
+    model: PricingModel,
+    v2_params_file: Option<PathBuf>,
+    dump_v2_params: bool,
     distance_factors: [Option<f64>; 6],
     sigma_scale: Option<f64>,
     sigma_ref: Option<f64>,
@@ -51,6 +55,9 @@ impl Default for CliArgs {
             coin: String::new(),
             source: PriceSource::Hyperliquid,
             band_cents: 0,
+            model: PricingModel::V1,
+            v2_params_file: None,
+            dump_v2_params: false,
             distance_factors: [None; 6],
             sigma_scale: None,
             sigma_ref: None,
@@ -152,6 +159,14 @@ fn apply_arg(out: &mut CliArgs, key: &str, val: &str) -> Result<(), String> {
         "--dump-counts" => {
             out.dump_counts = val.parse().map_err(|_| "bad --dump-counts")?;
         }
+        "--model" => {
+            out.model = PricingModel::parse(val)
+                .ok_or_else(|| "bad --model (expected v1, v2, or m4)".to_string())?;
+        }
+        "--v2-params-file" => out.v2_params_file = Some(PathBuf::from(val)),
+        "--dump-v2-params" => {
+            out.dump_v2_params = val.parse().map_err(|_| "bad --dump-v2-params")?;
+        }
         _ => return Err(format!("unknown arg: {key}")),
     }
     Ok(())
@@ -163,15 +178,36 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut i = 0;
     while i < args.len() {
         let key = args[i].as_str();
+        if key == "--dump-v2-params" {
+            if let Some(next) = args.get(i + 1) {
+                if next == "true" || next == "false" {
+                    out.dump_v2_params = next == "true";
+                    i += 2;
+                    continue;
+                }
+            }
+            out.dump_v2_params = true;
+            i += 1;
+            continue;
+        }
         let val = args
             .get(i + 1)
             .ok_or_else(|| format!("missing value for {key}"))?;
         apply_arg(&mut out, key, val)?;
         i += 2;
     }
+    if out.dump_v2_params {
+        if out.coin.is_empty() {
+            return Err(
+                "usage: calibrate --dump-v2-params --coin <coin> [--source hyperliquid|deribit]"
+                    .into(),
+            );
+        }
+        return Ok(out);
+    }
     if out.files.is_empty() || out.coin.is_empty() || out.band_cents == 0 {
         return Err(
-            "usage: calibrate --file <jsonl> --coin <coin> --band-cents <n> [--source hyperliquid|deribit]"
+            "usage: calibrate --file <jsonl> --coin <coin> --band-cents <n> [--source hyperliquid|deribit] [--model v1|v2|m4] [--v2-params-file <path.json>] [--dump-v2-params]"
                 .into(),
         );
     }
@@ -180,6 +216,7 @@ fn parse_args() -> Result<CliArgs, String> {
 
 fn apply_overrides(cfg: &mut GridConfig, cli: &CliArgs) -> Result<(), String> {
     cfg.simulation.price_source = cli.source;
+    cfg.simulation.pricing_model = cli.model;
     if let Some(windows) = cli.windows {
         cfg.simulation.quote_window_count = windows;
     }
@@ -573,6 +610,22 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2);
     });
+    if cli.dump_v2_params {
+        let Some(params) = v2_ticker_params_for_source(&cli.coin, cli.source) else {
+            eprintln!(
+                "no compiled v2 params for coin '{}' on source '{}'",
+                cli.coin,
+                cli.source.as_str()
+            );
+            std::process::exit(2);
+        };
+        let json = params.to_json_pretty().unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        println!("{json}");
+        return;
+    }
     let ticks = load_ticks(&cli);
     let ticker = match cli.source {
         PriceSource::Deribit => deribit_ticker_symbol(&cli.coin),
@@ -587,6 +640,33 @@ fn main() {
     if let Err(err) = apply_overrides(&mut cfg, &cli) {
         eprintln!("{err}");
         std::process::exit(2);
+    }
+    if let Some(ref path) = cli.v2_params_file {
+        let loaded = load_v2_params_file(path).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        if !loaded.matches_coin(&cli.coin) {
+            eprintln!(
+                "v2 params file {} has ticker '{}', which does not match --coin '{}'",
+                path.display(),
+                loaded.ticker,
+                cli.coin
+            );
+            std::process::exit(2);
+        }
+        if loaded.band_cents != cli.band_cents {
+            eprintln!(
+                "warning: --v2-params-file {} specifies band_cents={}, differing from --band-cents={}; using --band-cents={}",
+                path.display(),
+                loaded.band_cents,
+                cli.band_cents,
+                cli.band_cents
+            );
+        }
+        let leaked = loaded.leak_static();
+        println!("v2_params_file={} {}", path.display(), leaked.one_line_summary());
+        cfg.simulation.v2_params_override = Some(leaked);
     }
     print_report(&cli, &cfg, &ticker, &ticks);
 }
@@ -649,5 +729,14 @@ mod tests {
         let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
         apply_overrides(&mut cfg, &cli).unwrap();
         assert_eq!(cfg.simulation.price_source, PriceSource::Deribit);
+
+        apply_arg(&mut cli, "--model", "v2").unwrap();
+        apply_arg(&mut cli, "--v2-params-file", "/tmp/nvda.json").unwrap();
+        apply_arg(&mut cli, "--dump-v2-params", "true").unwrap();
+        apply_overrides(&mut cfg, &cli).unwrap();
+        assert_eq!(cfg.simulation.pricing_model, PricingModel::V2);
+        assert_eq!(cli.v2_params_file, Some(PathBuf::from("/tmp/nvda.json")));
+        assert!(cli.dump_v2_params);
+        assert!(apply_arg(&mut cli, "--model", "v9").is_err());
     }
 }

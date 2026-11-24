@@ -8,7 +8,10 @@ use st_engine::horizon::{DEFAULT_TRIGGER_SIGMA, FAR_REFRESH_MS, stagger_phase_ms
 use st_engine::price::{PriceCache, PriceSource, PriceTick, read_ticks_for_source};
 use st_engine::quote::QuoteEngine;
 use st_engine::stress::parse_utc;
-use st_engine::v2::PricingModel;
+use st_engine::v2::{
+    PricingModel, TickerV2Params, load_v2_params_file, normalize_v2_ticker,
+    v2_ticker_params_for_source,
+};
 
 const MAX_COMPLETED_BARS: usize = 600;
 const GRID_LOOKBACK_BARS: usize = 180;
@@ -34,6 +37,9 @@ struct Args {
     model: PricingModel,
     max_multiplier: Option<f64>,
     source: PriceSource,
+    v2_params_files: Vec<PathBuf>,
+    dump_v2_params: bool,
+    coin: String,
 }
 
 fn parse_args() -> Args {
@@ -49,11 +55,26 @@ fn parse_args() -> Args {
     let mut model = PricingModel::V1;
     let mut max_multiplier: Option<f64> = None;
     let mut source = PriceSource::Hyperliquid;
+    let mut v2_params_files: Vec<PathBuf> = Vec::new();
+    let mut dump_v2_params = false;
+    let mut coin = String::new();
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0usize;
     while i < raw.len() {
         let key = raw[i].as_str();
+        if key == "--dump-v2-params" {
+            if let Some(next) = raw.get(i + 1) {
+                if next == "true" || next == "false" {
+                    dump_v2_params = next == "true";
+                    i += 2;
+                    continue;
+                }
+            }
+            dump_v2_params = true;
+            i += 1;
+            continue;
+        }
         let val = raw
             .get(i + 1)
             .unwrap_or_else(|| panic!("missing value for {key}"));
@@ -77,13 +98,39 @@ fn parse_args() -> Args {
                 source =
                     PriceSource::parse(val).expect("bad --source (expected hyperliquid or deribit)")
             }
+            "--v2-params-file" => v2_params_files.push(PathBuf::from(val)),
+            "--coin" => coin = val.to_string(),
             _ => panic!("unknown arg {key}"),
         }
         i += 2;
     }
+    if dump_v2_params {
+        if coin.is_empty() {
+            panic!(
+                "usage: bench_horizon --dump-v2-params --coin <coin> [--source hyperliquid|deribit]"
+            );
+        }
+        return Args {
+            file,
+            from_ms,
+            to_ms,
+            windows,
+            mc_n,
+            trigger_sigma,
+            far_refresh_ms,
+            stagger,
+            seed,
+            model,
+            max_multiplier,
+            source,
+            v2_params_files,
+            dump_v2_params,
+            coin,
+        };
+    }
     if file.as_os_str().is_empty() || from_ms == 0 || to_ms <= from_ms {
         panic!(
-            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--source hyperliquid|deribit] [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2|m4] [--max-multiplier 50]"
+            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--source hyperliquid|deribit] [--v2-params-file <path.json>] [--dump-v2-params --coin <coin>] [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2|m4] [--max-multiplier 50]"
         );
     }
     Args {
@@ -99,6 +146,9 @@ fn parse_args() -> Args {
         model,
         max_multiplier,
         source,
+        v2_params_files,
+        dump_v2_params,
+        coin,
     }
 }
 
@@ -149,6 +199,35 @@ struct TickerState {
 
 fn main() {
     let args = parse_args();
+    if args.dump_v2_params {
+        let Some(params) = v2_ticker_params_for_source(&args.coin, args.source) else {
+            eprintln!(
+                "no compiled v2 params for coin '{}' on source '{}'",
+                args.coin,
+                args.source.as_str()
+            );
+            std::process::exit(2);
+        };
+        let json = params.to_json_pretty().unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        println!("{json}");
+        return;
+    }
+
+    let mut v2_overrides: Vec<(String, &'static TickerV2Params)> = Vec::new();
+    for path in &args.v2_params_files {
+        let loaded = load_v2_params_file(path).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        let norm = normalize_v2_ticker(&loaded.ticker);
+        let leaked = loaded.leak_static();
+        println!("v2_params_file={} {}", path.display(), leaked.one_line_summary());
+        v2_overrides.push((norm, leaked));
+    }
+
     let defs = [
         TickerDef {
             ticker: "NVDA".to_string(),
@@ -206,6 +285,18 @@ fn main() {
         cfg.simulation.seed = Some(args.seed + idx as u64);
         cfg.simulation.pricing_model = args.model;
         cfg.simulation.price_source = args.source;
+        if let Some((_, params)) = v2_overrides
+            .iter()
+            .rfind(|(sym, _)| sym == &normalize_v2_ticker(&def.ticker))
+        {
+            if params.band_cents != def.band_cents {
+                eprintln!(
+                    "warning: v2 params for {} specify band_cents={}, differing from bench band_cents={}; using band_cents={}",
+                    def.ticker, params.band_cents, def.band_cents, def.band_cents
+                );
+            }
+            cfg.simulation.v2_params_override = Some(*params);
+        }
         if let Some(cap) = args.max_multiplier {
             cfg.pricing.max_multiplier = cap;
         }
