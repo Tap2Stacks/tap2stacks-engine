@@ -14,8 +14,9 @@ use crate::m4::{MarkFormulaTracker, TickerM4Params, m4_ticker_params, price_grid
 use crate::price::{PriceSource, PriceTick};
 use crate::session::is_us_regular_session;
 use crate::v2::{
-    PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, dynamic_news_preset,
-    price_grid_v2, v2_m_eff, v2_price_multiplier, v2_ticker_params_for_source,
+    PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, compute_book_lead,
+    dynamic_news_preset, price_grid_v2_with_book, v2_m_eff, v2_price_multiplier,
+    v2_ticker_params_for_source,
 };
 
 pub use book::{CellKey, ExposureBook};
@@ -198,7 +199,13 @@ impl SampleJob {
                 } else {
                     None
                 };
-                let probs = price_grid_v2(
+                let book_lead = compute_book_lead(
+                    self.tick.mid_px,
+                    self.tick.oracle_px,
+                    None,
+                    v2_params,
+                );
+                let probs = price_grid_v2_with_book(
                     self.tick.price,
                     &bands,
                     &config.spec.windows,
@@ -206,6 +213,7 @@ impl SampleJob {
                     regime,
                     inferred_phase,
                     news_override,
+                    book_lead,
                 );
                 let preset_m_base = v2_params.presets[regime.index()].m_base;
                 let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents, preset_m_base);
@@ -1419,5 +1427,86 @@ mod tests {
             assert!(!engine.is_m4_active());
             assert!(!engine.is_v2_active());
         }
+    }
+
+    #[test]
+    fn deribit_v2_quote_engine_applies_book_lead_and_supports_custom_band_heights() {
+        let ts = 1_795_057_200_000_u64;
+        let spot = 146.00;
+        let hist = sample_history(spot);
+
+        // NVDA with 5c rows on Deribit v2: +5c book gap shifts w0 touch probs up above spot and down below.
+        let mut cfg = stock_grid_config_for_ticker("NVDA", 5, Vec::new());
+        cfg.simulation.pricing_model = PricingModel::V2;
+        cfg.simulation.price_source = PriceSource::Deribit;
+        let mut eng_flat = QuoteEngine::with_config("NVDA".to_string(), 5, cfg.clone());
+        let mut eng_up = QuoteEngine::with_config("NVDA".to_string(), 5, cfg);
+
+        eng_flat.on_sample(
+            PriceTick {
+                ts_ms: ts,
+                price: spot,
+                mid_px: Some(146.00),
+                oracle_px: Some(146.00),
+            },
+            &hist,
+        );
+        eng_up.on_sample(
+            PriceTick {
+                ts_ms: ts,
+                price: spot,
+                mid_px: Some(146.05),
+                oracle_px: Some(146.00),
+            },
+            &hist,
+        );
+
+        let q_flat = eng_flat.price(ts);
+        let q_up = eng_up.price(ts);
+        assert_eq!(q_flat.band_cents, 5);
+        assert_eq!(q_up.band_cents, 5);
+
+        let w0_start = q_flat.cells.iter().map(|c| c.window_start_ms).min().unwrap();
+        let above_flat = q_flat
+            .cells
+            .iter()
+            .find(|c| c.window_start_ms == w0_start && c.lower_cents > 14_605)
+            .unwrap();
+        let above_up = q_up
+            .cells
+            .iter()
+            .find(|c| c.window_start_ms == w0_start && c.lower_cents == above_flat.lower_cents)
+            .unwrap();
+        assert!(above_up.hit_probability > above_flat.hit_probability);
+
+        let below_flat = q_flat
+            .cells
+            .iter()
+            .find(|c| c.window_start_ms == w0_start && c.upper_cents < 14_595)
+            .unwrap();
+        let below_up = q_up
+            .cells
+            .iter()
+            .find(|c| c.window_start_ms == w0_start && c.lower_cents == below_flat.lower_cents)
+            .unwrap();
+        assert!(below_up.hit_probability < below_flat.hit_probability);
+
+        // TSLA with 10c rows on Deribit v2 quotes cleanly.
+        let mut tsla_cfg = stock_grid_config_for_ticker("TSLA", 10, Vec::new());
+        tsla_cfg.simulation.pricing_model = PricingModel::V2;
+        tsla_cfg.simulation.price_source = PriceSource::Deribit;
+        let mut tsla_eng = QuoteEngine::with_config("TSLA".to_string(), 10, tsla_cfg);
+        tsla_eng.on_sample(
+            PriceTick {
+                ts_ms: ts,
+                price: 364.00,
+                mid_px: Some(364.10),
+                oracle_px: Some(364.00),
+            },
+            &sample_history(364.00),
+        );
+        let q_tsla = tsla_eng.price(ts);
+        assert_eq!(q_tsla.band_cents, 10);
+        assert_eq!(q_tsla.cells.len(), 20 * 6);
     }
 }

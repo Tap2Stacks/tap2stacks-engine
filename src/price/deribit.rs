@@ -76,16 +76,16 @@ pub const DERIBIT_CARRY_INTERVAL_MS: u64 = 1_000;
 /// Single normalized socket event consumed by `DeribitSampler` (shared by live feed & replay).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeribitSampleEvent {
-    /// `deribit_price_index.<sym>_usdc` print.
+    /// `deribit_price_index.<sym>_usdc` print (the sole authoritative settlement price source).
     IndexPrint {
         index_name: String,
         price: f64,
         ts_ms: u64,
     },
-    /// `ticker.<SYM>_USDC-PERPETUAL.100ms` update.
+    /// `ticker.<SYM>_USDC-PERPETUAL.100ms` update: updates perp book mid/mark and proves
+    /// socket liveness only; never used as an index settlement price.
     Ticker {
         index_name: String,
-        index_price: Option<f64>,
         mid_px: Option<f64>,
         mark_price: Option<f64>,
         ts_ms: u64,
@@ -111,21 +111,40 @@ struct CoinSampleState {
     last_emitted_price: Option<f64>,
     last_emitted_ts_ms: Option<u64>,
     latest_mid_px: Option<f64>,
+    latest_mid_ts_ms: Option<u64>,
     latest_mark_px: Option<f64>,
+    latest_mark_ts_ms: Option<u64>,
+}
+
+impl CoinSampleState {
+    fn fresh_book(&self, now_ms: u64, max_age_ms: u64) -> (Option<f64>, Option<f64>) {
+        let mid = match (self.latest_mid_px, self.latest_mid_ts_ms) {
+            (Some(v), Some(ts)) if now_ms.saturating_sub(ts) <= max_age_ms => Some(v),
+            _ => None,
+        };
+        let mark = match (self.latest_mark_px, self.latest_mark_ts_ms) {
+            (Some(v), Some(ts)) if now_ms.saturating_sub(ts) <= max_age_ms => Some(v),
+            _ => None,
+        };
+        (mid, mark)
+    }
 }
 
 /// Shared Deribit sample-emission rule used identically by both the live WebSocket stream
 /// and `replay::read_drb_jsonl_reader`:
-/// - (a) Emits immediately when the index value changes (from `deribit_price_index.*` or a
-///   `ticker.*` message whose `index_price` differs from the last emitted value).
-/// - (b) Emits a carried unchanged sample whenever `>= 1 s` has elapsed since the coin's last
-///   emitted sample AND socket liveness is proven by an incoming event on the same socket.
+/// - (a) Emits immediately ONLY on a `deribit_price_index.*` print whose cent value differs
+///   from the last emitted value. `ticker.*` messages update perp book mid/mark and prove
+///   liveness only; their `index_price` is never used as a settlement price.
+/// - (b) Emits a carried unchanged sample (of the last printed index value) whenever `>= 1 s`
+///   has elapsed since the coin's last emitted sample AND socket liveness is proven by an
+///   incoming event on the same socket.
 /// - Attaches the latest perp book mid `(best_bid + best_ask) / 2` in `PriceTick.mid_px` and
-///   perp `mark_price` in `PriceTick.oracle_px` (`None` if not yet seen).
+///   perp `mark_price` in `PriceTick.oracle_px` when fresh (`<= book_max_age_ms`, else `None`).
 #[derive(Debug, Clone)]
 pub struct DeribitSampler {
     coins: Vec<String>,
     states: HashMap<String, CoinSampleState>,
+    book_max_age_ms: u64,
 }
 
 impl DeribitSampler {
@@ -146,6 +165,7 @@ impl DeribitSampler {
         Self {
             coins: ordered,
             states,
+            book_max_age_ms: crate::v2::DERIBIT_BOOK_MAX_AGE_MS,
         }
     }
 
@@ -153,11 +173,7 @@ impl DeribitSampler {
     /// before a fresh post-reconnect index/ticker reading arrives.
     pub fn reset_on_disconnect(&mut self) {
         for state in self.states.values_mut() {
-            state.last_emitted_cents = None;
-            state.last_emitted_price = None;
-            state.last_emitted_ts_ms = None;
-            state.latest_mid_px = None;
-            state.latest_mark_px = None;
+            *state = CoinSampleState::default();
         }
     }
 
@@ -184,13 +200,15 @@ impl DeribitSampler {
                             state.last_emitted_cents = Some(cents);
                             state.last_emitted_price = Some(*price);
                             state.last_emitted_ts_ms = Some(emit_ts);
+                            let (mid_px, oracle_px) =
+                                state.fresh_book(emit_ts, self.book_max_age_ms);
                             emitted.push((
                                 index_name.clone(),
                                 PriceTick {
                                     ts_ms: emit_ts,
                                     price: *price,
-                                    mid_px: state.latest_mid_px,
-                                    oracle_px: state.latest_mark_px,
+                                    mid_px,
+                                    oracle_px,
                                 },
                             ));
                             emitted_coin = Some(index_name.as_str());
@@ -200,7 +218,6 @@ impl DeribitSampler {
             }
             DeribitSampleEvent::Ticker {
                 index_name,
-                index_price,
                 mid_px,
                 mark_price,
                 ts_ms,
@@ -208,30 +225,11 @@ impl DeribitSampler {
                 if let Some(state) = self.states.get_mut(index_name) {
                     if let Some(mid) = mid_px.filter(|v| v.is_finite() && *v > 0.0) {
                         state.latest_mid_px = Some(mid);
+                        state.latest_mid_ts_ms = Some(*ts_ms);
                     }
                     if let Some(mark) = mark_price.filter(|v| v.is_finite() && *v > 0.0) {
                         state.latest_mark_px = Some(mark);
-                    }
-                    if let Some(price) = index_price.filter(|v| v.is_finite() && *v > 0.0) {
-                        let cents = (price * 100.0).round() as i64;
-                        if state.last_emitted_cents != Some(cents) {
-                            let emit_ts = state
-                                .last_emitted_ts_ms
-                                .map_or(*ts_ms, |prev| (*ts_ms).max(prev));
-                            state.last_emitted_cents = Some(cents);
-                            state.last_emitted_price = Some(price);
-                            state.last_emitted_ts_ms = Some(emit_ts);
-                            emitted.push((
-                                index_name.clone(),
-                                PriceTick {
-                                    ts_ms: emit_ts,
-                                    price,
-                                    mid_px: state.latest_mid_px,
-                                    oracle_px: state.latest_mark_px,
-                                },
-                            ));
-                            emitted_coin = Some(index_name.as_str());
-                        }
+                        state.latest_mark_ts_ms = Some(*ts_ms);
                     }
                 }
             }
@@ -250,13 +248,15 @@ impl DeribitSampler {
                 {
                     if event_ts_ms.saturating_sub(last_ts) >= DERIBIT_CARRY_INTERVAL_MS {
                         state.last_emitted_ts_ms = Some(event_ts_ms);
+                        let (mid_px, oracle_px) =
+                            state.fresh_book(event_ts_ms, self.book_max_age_ms);
                         emitted.push((
                             coin.clone(),
                             PriceTick {
                                 ts_ms: event_ts_ms,
                                 price,
-                                mid_px: state.latest_mid_px,
-                                oracle_px: state.latest_mark_px,
+                                mid_px,
+                                oracle_px,
                             },
                         ));
                     }
@@ -793,7 +793,6 @@ impl DeribitStream {
                 let event = match ticker.index_name() {
                     Some(index_name) => DeribitSampleEvent::Ticker {
                         index_name,
-                        index_price: ticker.index_price,
                         mid_px: ticker.mid_price(),
                         mark_price: ticker.mark_price,
                         ts_ms,
@@ -981,7 +980,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn live_deribit_handler_emits_1hz_carried_samples_handles_dead_socket_and_ticker_changes() {
+    async fn live_deribit_handler_emits_1hz_carried_samples_ignores_ticker_index_price_and_handles_dead_socket() {
         let (tx, mut rx) = mpsc::channel(16);
         let mut senders = HashMap::new();
         senders.insert("nvda_usdc".to_string(), tx);
@@ -1055,41 +1054,79 @@ mod tests {
         assert_eq!(carried_2.oracle_px, Some(146.15));
         assert!(!health_rx.borrow()["nvda_usdc"].stale);
 
-        // 4. Ticker index_price change within < 1 s emits immediately with updated mid/mark;
-        //    subsequent matching index print 20 ms later is suppressed (no duplicate).
-        let changed_ticker = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.18,"index_price":146.14,"best_bid_price":146.14,"best_ask_price":146.20,"timestamp":1795450002300}}}"#;
+        // 4. Ticker with a DIFFERENT index_price (146.99) within < 1 s must NOT emit a price
+        //    change; it only updates mid/mark. When >= 1 s later another ticker with index_price
+        //    146.99 arrives, it triggers a carried sample of the LAST PRINTED value (146.12).
+        let diverged_ticker_early = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.18,"index_price":146.99,"best_bid_price":146.14,"best_ask_price":146.20,"timestamp":1795450002300}}}"#;
         assert!(matches!(
             stream
-                .handle_text(changed_ticker, 1_795_450_002_320, &mut tracker, &mut sampler, &mut rpc_id)
+                .handle_text(
+                    diverged_ticker_early,
+                    1_795_450_002_320,
+                    &mut tracker,
+                    &mut sampler,
+                    &mut rpc_id,
+                )
                 .await,
             HandleOutcome::Continue
         ));
-        let immediate = rx.recv().await.expect("immediate ticker index_price change");
-        assert_eq!(immediate.ts_ms, 1_795_450_002_300);
-        assert_eq!(immediate.price, 146.14);
-        assert!((immediate.mid_px.unwrap() - 146.17).abs() < 1e-12);
-        assert_eq!(immediate.oracle_px, Some(146.18));
-        let dup_idx = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_price_index.nvda_usdc","data":{"index_name":"nvda_usdc","price":146.14,"timestamp":1795450002320}}}"#;
+        assert!(rx.try_recv().is_err(), "ticker index_price must not emit a price change");
+
+        let diverged_ticker_1s = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.18,"index_price":146.99,"best_bid_price":146.14,"best_ask_price":146.20,"timestamp":1795450003150}}}"#;
         assert!(matches!(
             stream
-                .handle_text(dup_idx, 1_795_450_002_330, &mut tracker, &mut sampler, &mut rpc_id)
+                .handle_text(
+                    diverged_ticker_1s,
+                    1_795_450_003_170,
+                    &mut tracker,
+                    &mut sampler,
+                    &mut rpc_id,
+                )
+                .await,
+            HandleOutcome::Continue
+        ));
+        let carried_3 = rx.recv().await.expect("carried sample of last printed index");
+        assert_eq!(carried_3.ts_ms, 1_795_450_003_150);
+        assert_eq!(carried_3.price, 146.12);
+        assert!((carried_3.mid_px.unwrap() - 146.17).abs() < 1e-12);
+        assert_eq!(carried_3.oracle_px, Some(146.18));
+
+        // 5. Real deribit_price_index print with new cent value (146.14) emits immediately;
+        //    unchanged repeat 20 ms later is suppressed.
+        let new_idx = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_price_index.nvda_usdc","data":{"index_name":"nvda_usdc","price":146.14,"timestamp":1795450003300}}}"#;
+        assert!(matches!(
+            stream
+                .handle_text(new_idx, 1_795_450_003_320, &mut tracker, &mut sampler, &mut rpc_id)
+                .await,
+            HandleOutcome::Continue
+        ));
+        let printed = rx.recv().await.expect("immediate deribit_price_index change");
+        assert_eq!(printed.ts_ms, 1_795_450_003_300);
+        assert_eq!(printed.price, 146.14);
+        assert!((printed.mid_px.unwrap() - 146.17).abs() < 1e-12);
+        assert_eq!(printed.oracle_px, Some(146.18));
+
+        let dup_idx = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"deribit_price_index.nvda_usdc","data":{"index_name":"nvda_usdc","price":146.14,"timestamp":1795450003320}}}"#;
+        assert!(matches!(
+            stream
+                .handle_text(dup_idx, 1_795_450_003_330, &mut tracker, &mut sampler, &mut rpc_id)
                 .await,
             HandleOutcome::Continue
         ));
         assert!(rx.try_recv().is_err());
 
-        // 5. Dead socket: no incoming frames -> zero carried samples emitted, stale after > 3 s.
-        let snap_2s = tracker.tick(1_795_450_004_330);
+        // 6. Dead socket: no incoming frames -> zero carried samples emitted, stale after > 3 s.
+        let snap_2s = tracker.tick(1_795_450_005_330);
         assert!(!snap_2s["nvda_usdc"].stale);
         assert!(rx.try_recv().is_err());
-        let snap_3s_plus = tracker.tick(1_795_450_005_331);
+        let snap_3s_plus = tracker.tick(1_795_450_006_331);
         assert!(snap_3s_plus["nvda_usdc"].stale);
         assert!(rx.try_recv().is_err());
 
-        // 6. Heartbeat test_request produces a public/test JSON-RPC reply.
+        // 7. Heartbeat test_request produces a public/test JSON-RPC reply.
         let hb_msg = r#"{"jsonrpc":"2.0","method":"heartbeat","params":{"type":"test_request"}}"#;
         match stream
-            .handle_text(hb_msg, 1_795_450_005_400, &mut tracker, &mut sampler, &mut rpc_id)
+            .handle_text(hb_msg, 1_795_450_006_400, &mut tracker, &mut sampler, &mut rpc_id)
             .await
         {
             HandleOutcome::SendText(reply) => {
@@ -1098,5 +1135,34 @@ mod tests {
             }
             _ => panic!("expected SendText reply for test_request heartbeat"),
         }
+    }
+
+    #[test]
+    fn deribit_sampler_drops_book_mid_and_mark_when_older_than_book_max_age_ms() {
+        let mut sampler = DeribitSampler::new(["nvda_usdc"]);
+        let t0 = 1_795_450_000_000_u64;
+        let _ = sampler.on_event(&DeribitSampleEvent::IndexPrint {
+            index_name: "nvda_usdc".to_string(),
+            price: 146.12,
+            ts_ms: t0,
+        });
+        let _ = sampler.on_event(&DeribitSampleEvent::Ticker {
+            index_name: "nvda_usdc".to_string(),
+            mid_px: Some(146.20),
+            mark_price: Some(146.15),
+            ts_ms: t0 + 100,
+        });
+
+        // At t0 + 2100 ms, ticker age is 2000 ms (<= book_max_age_ms) -> book still attached.
+        let fresh = sampler.on_event(&DeribitSampleEvent::Liveness { ts_ms: t0 + 2_100 });
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.mid_px, Some(146.20));
+        assert_eq!(fresh[0].1.oracle_px, Some(146.15));
+
+        // At t0 + 3101 ms, ticker age is 3001 ms (> book_max_age_ms) -> mid/oracle cleared to None.
+        let stale = sampler.on_event(&DeribitSampleEvent::Liveness { ts_ms: t0 + 3_101 });
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].1.mid_px, None);
+        assert_eq!(stale[0].1.oracle_px, None);
     }
 }

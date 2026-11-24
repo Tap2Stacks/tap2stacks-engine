@@ -41,6 +41,16 @@ pub const V2_NEWS_Q_MIN: f64 = 0.12;
 pub const V2_NEWS_R_CAP_MULT: f64 = 2.5;
 /// Minimum probability denominator clamp in `M_base = (1 - m_eff) / max(P, eps)`.
 pub const V2_P_EPSILON: f64 = 1e-6;
+/// PROVISIONAL Deribit order-book lead time `L` in seconds (`docs/odds-model-v2-coinbase-1s.md` §4).
+pub const DERIBIT_BOOK_LEAD_SECS: u64 = 2;
+/// PROVISIONAL Deribit book-gap catch-up slope `beta` on `(mid_px - oracle_px)` (`docs/odds-model-v2-coinbase-1s.md` §4).
+pub const DERIBIT_BOOK_GAP_BETA: f64 = 1.0;
+/// PROVISIONAL Deribit NVDA symmetric book-gap clamp `|G|` in cents (`docs/odds-model-v2-coinbase-1s.md` §4).
+pub const DERIBIT_NVDA_BOOK_GAP_CLAMP_CENTS: i64 = 20;
+/// PROVISIONAL Deribit TSLA symmetric book-gap clamp `|G|` in cents (`docs/odds-model-v2-coinbase-1s.md` §4).
+pub const DERIBIT_TSLA_BOOK_GAP_CLAMP_CENTS: i64 = 40;
+/// PROVISIONAL Deribit maximum age (ms) of perp book/mark reading before falling back to `G = 0`.
+pub const DERIBIT_BOOK_MAX_AGE_MS: u64 = 2_000;
 /// Half-width of the integer-cent DP lattice (`[-450c, +450c]`, `901` states).
 const DP_HALF_WIDTH: usize = 450;
 
@@ -161,6 +171,14 @@ pub struct TickerV2Params {
     pub clock_secs: u64,
     /// Source settlement void gap threshold in milliseconds.
     pub void_gap_ms: u64,
+    /// Order-book lead time `L` in seconds (Hyperliquid: `0`, Deribit: `2`).
+    pub book_lead_secs: u64,
+    /// Book-gap catch-up slope `beta` on `(mid_px - oracle_px)` (Hyperliquid: `0.0`, Deribit: `1.0`).
+    pub book_gap_beta: f64,
+    /// Symmetric clamp on `G` in integer cents (`|G| <= book_gap_clamp_cents`).
+    pub book_gap_clamp_cents: i64,
+    /// Maximum age (ms) of perp book/mark reading before falling back to `G = 0`.
+    pub book_max_age_ms: u64,
     /// Median `R_60` of the `Normal` regime (used as `R_ref` in `m_risk`).
     pub rms_ref_cents: f64,
     /// Empirical `[p50, p85, p99]` minute `R_60` thresholds in cents/s.
@@ -189,6 +207,10 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
     reference_price: 139.65,
     clock_secs: PriceSource::Hyperliquid.timing().clock_secs,
     void_gap_ms: PriceSource::Hyperliquid.timing().void_gap_ms,
+    book_lead_secs: 0,
+    book_gap_beta: 0.0,
+    book_gap_clamp_cents: 0,
+    book_max_age_ms: 0,
     rms_ref_cents: 1.60,
     thresholds_rms_cents: [1.162, 2.412, 8.390],
     shock_single_step_cents: 34,
@@ -254,6 +276,10 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
     reference_price: 363.97,
     clock_secs: PriceSource::Hyperliquid.timing().clock_secs,
     void_gap_ms: PriceSource::Hyperliquid.timing().void_gap_ms,
+    book_lead_secs: 0,
+    book_gap_beta: 0.0,
+    book_gap_clamp_cents: 0,
+    book_max_age_ms: 0,
     rms_ref_cents: 2.77,
     thresholds_rms_cents: [1.807, 4.359, 11.505],
     shock_single_step_cents: 46,
@@ -311,6 +337,10 @@ pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     reference_price: 139.65,
     clock_secs: PriceSource::Deribit.timing().clock_secs,
     void_gap_ms: PriceSource::Deribit.timing().void_gap_ms,
+    book_lead_secs: DERIBIT_BOOK_LEAD_SECS,
+    book_gap_beta: DERIBIT_BOOK_GAP_BETA,
+    book_gap_clamp_cents: DERIBIT_NVDA_BOOK_GAP_CLAMP_CENTS,
+    book_max_age_ms: DERIBIT_BOOK_MAX_AGE_MS,
     rms_ref_cents: 1.60,
     thresholds_rms_cents: [1.162, 2.412, 8.390],
     shock_single_step_cents: 34,
@@ -368,6 +398,10 @@ pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     reference_price: 363.97,
     clock_secs: PriceSource::Deribit.timing().clock_secs,
     void_gap_ms: PriceSource::Deribit.timing().void_gap_ms,
+    book_lead_secs: DERIBIT_BOOK_LEAD_SECS,
+    book_gap_beta: DERIBIT_BOOK_GAP_BETA,
+    book_gap_clamp_cents: DERIBIT_TSLA_BOOK_GAP_CLAMP_CENTS,
+    book_max_age_ms: DERIBIT_BOOK_MAX_AGE_MS,
     rms_ref_cents: 2.77,
     thresholds_rms_cents: [1.807, 4.359, 11.505],
     shock_single_step_cents: 46,
@@ -1051,15 +1085,47 @@ fn step_above_general(src: &[f64], preset: &RegimePreset, dst: &mut [f64]) {
     }
 }
 
-/// Computes exact v2 print-crossing touch probabilities `[row][window]` via 1-D Geometric IIR DP.
-///
-/// - Windows `0..min(6, windows.len())`: evolve purely in `regime`.
-/// - Windows `6..windows.len()`: blend in `params.transition_1min` via per-3s-tick Markov step
-///   `T_step = 0.95 * I + 0.05 * T` starting after window 5.
-/// - `inferred_phase`: if `Some(phi)`, evaluates exact conditional probability at `phi`;
-///   if `None`, averages uniformly over `phi in {0, 1, 2}`.
-/// - `news_override`: when currently in `Regime::News`, replaces `presets[News]` with the
-///   causally scaled `dynamic_news_preset(params, r60, q60)`.
+/// Effective book-lead DP shift `(G, L)` applied for a single quote tick
+/// (`docs/odds-model-v2-coinbase-1s.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BookLeadAdjustment {
+    /// Clamped integer-cent initial shift `G = clamp(round(beta * (mid - mark) * 100), ±clamp)`.
+    pub gap_cents: i64,
+    /// Pre-window horizon shortening `L` in seconds (0 when book is absent/stale or HL).
+    pub lead_secs: u64,
+}
+
+/// Computes the book-lead adjustment `(G, L)` from the latest perp book mid (`mid_px`) and
+/// perp mark (`oracle_px`). Returns `(0, 0)` whenever `beta == 0`, either quote is missing or
+/// invalid, or `book_age_ms` exceeds `params.book_max_age_ms`.
+pub fn compute_book_lead(
+    mid_px: Option<f64>,
+    oracle_px: Option<f64>,
+    book_age_ms: Option<u64>,
+    params: &TickerV2Params,
+) -> BookLeadAdjustment {
+    if params.book_gap_beta == 0.0
+        || params.book_gap_clamp_cents <= 0
+        || book_age_ms.is_some_and(|age| age > params.book_max_age_ms)
+    {
+        return BookLeadAdjustment::default();
+    }
+    let (Some(mid), Some(mark)) = (mid_px, oracle_px) else {
+        return BookLeadAdjustment::default();
+    };
+    if !mid.is_finite() || !mark.is_finite() || mid <= 0.0 || mark <= 0.0 {
+        return BookLeadAdjustment::default();
+    }
+    let raw = (params.book_gap_beta * (mid - mark) * 100.0).round() as i64;
+    let gap_cents = raw.clamp(-params.book_gap_clamp_cents, params.book_gap_clamp_cents);
+    BookLeadAdjustment {
+        gap_cents,
+        lead_secs: params.book_lead_secs,
+    }
+}
+
+/// Computes exact v2 print-crossing touch probabilities `[row][window]` via 1-D Geometric IIR DP
+/// without book-lead shift (`G = 0, L = 0`).
 pub fn price_grid_v2(
     spot: f64,
     bands: &[PriceBand],
@@ -1069,6 +1135,36 @@ pub fn price_grid_v2(
     inferred_phase: Option<usize>,
     news_override: Option<RegimePreset>,
 ) -> Vec<Vec<f64>> {
+    price_grid_v2_with_book(
+        spot,
+        bands,
+        windows,
+        params,
+        regime,
+        inferred_phase,
+        news_override,
+        BookLeadAdjustment::default(),
+    )
+}
+
+/// Computes exact v2 print-crossing touch probabilities `[row][window]` via 1-D Geometric IIR DP
+/// with optional book-lead adjustment `(G, L)`:
+///
+/// - Starts the DP at `c0 = round(spot * 100) + G` instead of `C = round(spot * 100)`.
+/// - Runs `(window.start_secs - L).max(0)` seconds before each window while preserving the
+///   full window duration (`end_secs - start_secs`, i.e. 5 window seconds unchanged).
+/// - With `G = 0` and `L = 0`, this is bit-identical to plain v2.
+#[allow(clippy::too_many_arguments)]
+pub fn price_grid_v2_with_book(
+    spot: f64,
+    bands: &[PriceBand],
+    windows: &[TimeWindow],
+    params: &TickerV2Params,
+    regime: Regime,
+    inferred_phase: Option<usize>,
+    news_override: Option<RegimePreset>,
+    book_lead: BookLeadAdjustment,
+) -> Vec<Vec<f64>> {
     let rows = bands.len();
     let w_count = windows.len();
     let mut probs = vec![vec![0.0_f64; w_count]; rows];
@@ -1077,6 +1173,8 @@ pub fn price_grid_v2(
     }
 
     let spot_cents = (spot * 100.0).round() as i64;
+    let start_cents = spot_cents + book_lead.gap_cents;
+    let lead = book_lead.lead_secs as usize;
     let half = DP_HALF_WIDTH;
     let n = 2 * half + 1;
     let row_bounds: Vec<(usize, usize)> = bands
@@ -1084,8 +1182,8 @@ pub fn price_grid_v2(
         .map(|band| {
             let lc = (band.lower * 100.0).round() as i64;
             let uc = (band.upper * 100.0).round() as i64;
-            let li = ((lc - spot_cents) + half as i64).clamp(0, n as i64) as usize;
-            let ui = ((uc - spot_cents) + half as i64).clamp(0, (n - 1) as i64) as usize;
+            let li = ((lc - start_cents) + half as i64).clamp(0, n as i64) as usize;
+            let ui = ((uc - start_cents) + half as i64).clamp(0, (n - 1) as i64) as usize;
             (li, ui)
         })
         .collect();
@@ -1143,8 +1241,9 @@ pub fn price_grid_v2(
         let mut far_initialized = false;
 
         for (w_idx, window) in windows.iter().enumerate() {
-            let ws = window.start_secs as usize;
-            let we = window.end_secs as usize;
+            let duration = (window.end_secs as usize).saturating_sub(window.start_secs as usize);
+            let ws = (window.start_secs as usize).saturating_sub(lead);
+            let we = ws + duration;
 
             if w_idx < NEAR_WINDOWS {
                 // Near horizon (windows 0..5): pure current preset r0.
@@ -1935,5 +2034,243 @@ mod tests {
 
         assert_eq!(det_hl.inferred_phase(13_000, 3), Some(0));
         assert_eq!(det_hl.current_regime(), Regime::News);
+    }
+
+    #[test]
+    fn book_lead_zero_matches_plain_v2_exactly_and_hl_stays_disabled() {
+        let windows: Vec<TimeWindow> = (0..8)
+            .map(|i| TimeWindow {
+                start_secs: (5 + 5 * i) as u32,
+                end_secs: (10 + 5 * i) as u32,
+            })
+            .collect();
+        let bands = vec![
+            PriceBand { row_index: 0, lower: 139.95, upper: 139.98 },
+            PriceBand { row_index: 1, lower: 139.98, upper: 140.01 },
+            PriceBand { row_index: 2, lower: 140.01, upper: 140.04 },
+        ];
+
+        // HL params have L = 0, beta = 0 -> compute_book_lead is always zero even with a large gap.
+        assert_eq!(NVDA_V2_PARAMS.book_lead_secs, 0);
+        assert_eq!(NVDA_V2_PARAMS.book_gap_beta, 0.0);
+        assert_eq!(TSLA_V2_PARAMS.book_lead_secs, 0);
+        assert_eq!(TSLA_V2_PARAMS.book_gap_beta, 0.0);
+        assert_eq!(
+            compute_book_lead(Some(140.20), Some(140.00), Some(100), &NVDA_V2_PARAMS),
+            BookLeadAdjustment::default()
+        );
+
+        let plain = price_grid_v2(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+        );
+        let with_zero = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+            BookLeadAdjustment {
+                gap_cents: 0,
+                lead_secs: 0,
+            },
+        );
+        assert_eq!(plain, with_zero);
+    }
+
+    #[test]
+    fn book_lead_positive_gap_shifts_probs_horizon_shortens_and_stale_or_clamp_works() {
+        let windows: Vec<TimeWindow> = (0..8)
+            .map(|i| TimeWindow {
+                start_secs: (5 + 5 * i) as u32,
+                end_secs: (10 + 5 * i) as u32,
+            })
+            .collect();
+        let bands = vec![
+            PriceBand { row_index: 0, lower: 139.92, upper: 139.95 }, // below spot
+            PriceBand { row_index: 1, lower: 139.95, upper: 139.98 }, // below spot
+            PriceBand { row_index: 2, lower: 139.98, upper: 140.01 }, // center
+            PriceBand { row_index: 3, lower: 140.01, upper: 140.04 }, // above spot
+            PriceBand { row_index: 4, lower: 140.04, upper: 140.07 }, // above spot
+        ];
+
+        // 1. G = +5c raises P(touch) for rows above spot and lowers it for rows below spot.
+        let p_base = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+            BookLeadAdjustment {
+                gap_cents: 0,
+                lead_secs: 0,
+            },
+        );
+        let p_up5 = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+            BookLeadAdjustment {
+                gap_cents: 5,
+                lead_secs: 0,
+            },
+        );
+        assert!(p_up5[0][0] < p_base[0][0], "row below must drop with G=+5c");
+        assert!(p_up5[1][0] < p_base[1][0], "row below must drop with G=+5c");
+        assert!(p_up5[3][0] > p_base[3][0], "row above must rise with G=+5c");
+        assert!(p_up5[4][0] > p_base[4][0], "row above must rise with G=+5c");
+
+        // 2. L = 2 shortens pre-window horizon by 2 s while keeping all 5 window seconds unchanged.
+        let shifted_windows: Vec<TimeWindow> = windows
+            .iter()
+            .map(|w| TimeWindow {
+                start_secs: w.start_secs - 2,
+                end_secs: w.end_secs - 2,
+            })
+            .collect();
+        let p_lead2 = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+            BookLeadAdjustment {
+                gap_cents: 0,
+                lead_secs: 2,
+            },
+        );
+        let p_shifted_plain = price_grid_v2(
+            139.99,
+            &bands,
+            &shifted_windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+        );
+        for r in 0..bands.len() {
+            for w in 0..windows.len() {
+                assert!(
+                    (p_lead2[r][w] - p_shifted_plain[r][w]).abs() < 1e-12,
+                    "r={r} w={w}: lead=2 {:.12} != shifted {:.12}",
+                    p_lead2[r][w],
+                    p_shifted_plain[r][w]
+                );
+            }
+        }
+        // Shortening pre-window horizon concentrates mass at center and reduces far-row touch prob.
+        assert!(p_lead2[2][0] > p_base[2][0]);
+        assert!(p_lead2[4][0] < p_base[4][0]);
+
+        // Floor at 0 when window_start <= L: [2, 7) with L=2 has 0 pre-steps and 5 window ticks.
+        let floor_win = vec![TimeWindow {
+            start_secs: 2,
+            end_secs: 7,
+        }];
+        let zero_pre_win = vec![TimeWindow {
+            start_secs: 1,
+            end_secs: 6,
+        }];
+        let p_floored = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &floor_win,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+            BookLeadAdjustment {
+                gap_cents: 0,
+                lead_secs: 2,
+            },
+        );
+        let p_zero_pre = price_grid_v2(
+            139.99,
+            &bands,
+            &zero_pre_win,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+        );
+        for r in 0..bands.len() {
+            assert!((p_floored[r][0] - p_zero_pre[r][0]).abs() < 1e-12);
+        }
+
+        // 3. Stale or missing book -> G = 0, L = 0; fresh book -> exact gap & clamp.
+        assert_eq!(
+            compute_book_lead(None, Some(140.00), Some(100), &NVDA_DERIBIT_V2_PARAMS),
+            BookLeadAdjustment::default()
+        );
+        assert_eq!(
+            compute_book_lead(Some(140.05), None, Some(100), &NVDA_DERIBIT_V2_PARAMS),
+            BookLeadAdjustment::default()
+        );
+        assert_eq!(
+            compute_book_lead(
+                Some(140.05),
+                Some(140.00),
+                Some(DERIBIT_BOOK_MAX_AGE_MS + 1),
+                &NVDA_DERIBIT_V2_PARAMS,
+            ),
+            BookLeadAdjustment::default()
+        );
+        assert_eq!(
+            compute_book_lead(
+                Some(140.05),
+                Some(140.00),
+                Some(DERIBIT_BOOK_MAX_AGE_MS),
+                &NVDA_DERIBIT_V2_PARAMS,
+            ),
+            BookLeadAdjustment {
+                gap_cents: 5,
+                lead_secs: DERIBIT_BOOK_LEAD_SECS,
+            }
+        );
+
+        // 4. Symmetric clamp: NVDA ±20c, TSLA ±40c.
+        assert_eq!(
+            compute_book_lead(Some(140.50), Some(140.00), Some(0), &NVDA_DERIBIT_V2_PARAMS),
+            BookLeadAdjustment {
+                gap_cents: 20,
+                lead_secs: 2,
+            }
+        );
+        assert_eq!(
+            compute_book_lead(Some(139.50), Some(140.00), Some(0), &NVDA_DERIBIT_V2_PARAMS),
+            BookLeadAdjustment {
+                gap_cents: -20,
+                lead_secs: 2,
+            }
+        );
+        assert_eq!(
+            compute_book_lead(Some(365.00), Some(364.00), Some(0), &TSLA_DERIBIT_V2_PARAMS),
+            BookLeadAdjustment {
+                gap_cents: 40,
+                lead_secs: 2,
+            }
+        );
+        assert_eq!(
+            compute_book_lead(Some(363.00), Some(364.00), Some(0), &TSLA_DERIBIT_V2_PARAMS),
+            BookLeadAdjustment {
+                gap_cents: -40,
+                lead_secs: 2,
+            }
+        );
     }
 }

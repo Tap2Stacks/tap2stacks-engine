@@ -67,12 +67,13 @@ pub fn read_hl_jsonl(path: &Path, coin: &str) -> io::Result<Vec<PriceTick>> {
 
 /// Parses recorded Deribit JSONL ticks for `coin` from any `BufRead` using the shared
 /// `DeribitSampler` rule (matching the live WebSocket feed):
-/// - Index changes from `deribit_price_index.<sym>_usdc` or `ticker.<SYM>_USDC-PERPETUAL.*`
-///   emit immediately.
+/// - New prices emit immediately ONLY on `deribit_price_index.<sym>_usdc` prints whose cent
+///   value differs from the last emitted value (`ticker.*.index_price` is never used as a
+///   settlement price).
 /// - Any recorded message of any channel proves socket liveness at its timestamp and emits a
-///   carried unchanged sample when `>= 1 s` has elapsed since the coin's last emitted sample.
-/// - Attaches the latest perp book midpoint (`mid_px`) and `mark_price` (`oracle_px`) from
-///   the coin's ticker messages (`None` until first seen).
+///   carried unchanged sample of the last printed index value when `>= 1 s` has elapsed.
+/// - Attaches the latest fresh perp book midpoint (`mid_px`) and `mark_price` (`oracle_px`)
+///   from the coin's ticker messages (`None` until seen or when older than `book_max_age_ms`).
 pub fn read_drb_jsonl_reader<R: BufRead>(reader: R, coin: &str) -> io::Result<Vec<PriceTick>> {
     let target_index = deribit_index_name(coin);
     let mut events = Vec::new();
@@ -114,7 +115,6 @@ pub fn read_drb_jsonl_reader<R: BufRead>(reader: R, coin: &str) -> io::Result<Ve
                     match ticker.index_name() {
                         Some(index_name) => DeribitSampleEvent::Ticker {
                             index_name,
-                            index_price: ticker.index_price,
                             mid_px: ticker.mid_price(),
                             mark_price: ticker.mark_price,
                             ts_ms,
@@ -264,19 +264,23 @@ mod tests {
         let jsonl = concat!(
             // t=0.1s: initial NVDA index print (no ticker seen yet -> mid/oracle None)
             r#"{"rx":1795450000120,"ch":"deribit_price_index.nvda_usdc","data":{"index_name":"nvda_usdc","price":146.12,"timestamp":1795450000100}}"#, "\n",
-            // t=0.3s: NVDA ticker arrives with same index_price -> updates mid/mark, no flood
-            r#"{"rx":1795450000320,"ch":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.16,"index_price":146.12,"best_bid_price":146.10,"best_ask_price":146.20,"timestamp":1795450000300}}"#, "\n",
-            // t=1.15s: NVDA index quiet, TSLA print proves socket alive -> NVDA gets 1 Hz carried sample
+            // t=0.3s: NVDA ticker arrives with a DIFFERENT index_price (146.99) -> must NOT emit
+            // a price change, only updates mid/mark
+            r#"{"rx":1795450000320,"ch":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.16,"index_price":146.99,"best_bid_price":146.10,"best_ask_price":146.20,"timestamp":1795450000300}}"#, "\n",
+            // t=1.15s: NVDA index quiet, TSLA print proves socket alive -> NVDA carries last printed 146.12
             r#"{"rx":1795450001160,"ch":"deribit_price_index.tsla_usdc","data":{"index_name":"tsla_usdc","price":379.45,"timestamp":1795450001150}}"#, "\n",
-            // t=2.20s: trades message on another channel proves socket alive -> NVDA gets 1 Hz carried sample
+            // t=2.20s: trades message on another channel proves socket alive -> NVDA carries 146.12
             r#"{"rx":1795450002210,"ch":"trades.TSLA_USDC-PERPETUAL.100ms","data":[{"price":379.50,"amount":2.0,"timestamp":1795450002200}]}"#, "\n",
             // 5-second recording hole (t=2.20s -> t=7.30s): NO lines recorded, so NO carried samples
-            // t=7.30s: NVDA ticker resumes with changed index_price -> immediate sample after 5.1s gap
-            r#"{"rx":1795450007310,"ch":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.22,"index_price":146.19,"best_bid_price":146.18,"best_ask_price":146.24,"timestamp":1795450007300}}"#, "\n",
+            // t=7.30s: NVDA ticker resumes with index_price=146.99 -> triggers carried sample of
+            // last printed 146.12 (after 5.1 s gap) with updated mid/mark
+            r#"{"rx":1795450007310,"ch":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.22,"index_price":146.99,"best_bid_price":146.18,"best_ask_price":146.24,"timestamp":1795450007300}}"#, "\n",
+            // t=7.40s: authoritative deribit_price_index print (146.19) -> emits immediately
+            r#"{"rx":1795450007410,"ch":"deribit_price_index.nvda_usdc","data":{"index_name":"nvda_usdc","price":146.19,"timestamp":1795450007400}}"#, "\n",
         );
 
         let nvda = read_drb_jsonl_reader(Cursor::new(jsonl), "NVDA").unwrap();
-        assert_eq!(nvda.len(), 4);
+        assert_eq!(nvda.len(), 5);
         assert_eq!(nvda[0], PriceTick::new(1_795_450_000_100, 146.12));
 
         assert_eq!(nvda[1].ts_ms, 1_795_450_001_150);
@@ -290,9 +294,14 @@ mod tests {
         assert_eq!(nvda[2].oracle_px, Some(146.16));
 
         assert_eq!(nvda[3].ts_ms, 1_795_450_007_300);
-        assert_eq!(nvda[3].price, 146.19);
+        assert_eq!(nvda[3].price, 146.12);
         assert!((nvda[3].mid_px.unwrap() - 146.21).abs() < 1e-12);
         assert_eq!(nvda[3].oracle_px, Some(146.22));
+
+        assert_eq!(nvda[4].ts_ms, 1_795_450_007_400);
+        assert_eq!(nvda[4].price, 146.19);
+        assert!((nvda[4].mid_px.unwrap() - 146.21).abs() < 1e-12);
+        assert_eq!(nvda[4].oracle_px, Some(146.22));
 
         // Verify the 5 s recording hole produces a > 3 s gap while quiet seconds stay <= 3 s.
         assert!(nvda[1].ts_ms - nvda[0].ts_ms <= 3_000);
