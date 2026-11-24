@@ -446,12 +446,12 @@ mod tests {
     #[test]
     fn segment_hit_catches_crossing_and_voids_gap_over_3000ms() {
         let ticks = vec![
-            PriceTick { ts_ms: 9_500, price: 157.40 },
-            PriceTick { ts_ms: 10_500, price: 157.70 },
-            PriceTick { ts_ms: 12_500, price: 157.75 },
-            PriceTick { ts_ms: 14_500, price: 157.80 },
-            PriceTick { ts_ms: 15_100, price: 157.80 },
-            PriceTick { ts_ms: 18_600, price: 157.90 }, // gap 3500ms > 3000ms in [15000, 20000)
+            PriceTick { ts_ms: 9_500, price: 157.40, mid_px: None, oracle_px: None },
+            PriceTick { ts_ms: 10_500, price: 157.70, mid_px: None, oracle_px: None },
+            PriceTick { ts_ms: 12_500, price: 157.75, mid_px: None, oracle_px: None },
+            PriceTick { ts_ms: 14_500, price: 157.80, mid_px: None, oracle_px: None },
+            PriceTick { ts_ms: 15_100, price: 157.80, mid_px: None, oracle_px: None },
+            PriceTick { ts_ms: 18_600, price: 157.90, mid_px: None, oracle_px: None }, // gap 3500ms > 3000ms in [15000, 20000)
         ];
         assert!(!window_is_void(&ticks, 0, 10_000, 15_000));
         let hits = window_hit_bands(&ticks, 0, 10_000, 15_000, &[(15752, 15755), (15785, 15790)]);
@@ -473,6 +473,8 @@ mod tests {
             ticks.push(PriceTick {
                 ts_ms: base_ts + sec * 1_000,
                 price,
+                mid_px: None,
+                oracle_px: None,
             });
         }
 
@@ -538,6 +540,8 @@ mod tests {
             ticks.push(PriceTick {
                 ts_ms: base_ts + sec * 1_000,
                 price,
+                mid_px: None,
+                oracle_px: None,
             });
             price += 0.001;
         }
@@ -545,11 +549,15 @@ mod tests {
         ticks.push(PriceTick {
             ts_ms: gap_start + 16_000,
             price: 141.0,
+            mid_px: None,
+            oracle_px: None,
         });
         for sec in 1..30_u64 {
             ticks.push(PriceTick {
                 ts_ms: gap_start + 16_000 + sec * 1_000,
                 price: 141.0,
+                mid_px: None,
+                oracle_px: None,
             });
         }
         let mut cfg = stock_grid_config(3, Vec::new());
@@ -584,6 +592,8 @@ mod tests {
             .map(|sec| PriceTick {
                 ts_ms: base_ts + sec * 1_000,
                 price: 140.0 + ((sec % 11) as f64 - 5.0) * 0.01,
+                mid_px: None,
+                oracle_px: None,
             })
             .collect();
         let mut cfg = stock_grid_config(3, Vec::new());
@@ -643,6 +653,8 @@ mod tests {
             ticks.push(PriceTick {
                 ts_ms: base_ts + sec * 1_000,
                 price,
+                mid_px: None,
+                oracle_px: None,
             });
         }
         let mut cfg = stock_grid_config(3, Vec::new());

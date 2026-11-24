@@ -224,10 +224,7 @@ pub fn spawn_binance_aggtrade_stream(
 fn parse_tick(raw: &str) -> Option<PriceTick> {
     let payload: AggTradePayload = serde_json::from_str(raw).ok()?;
     let price = payload.price.parse::<f64>().ok()?;
-    Some(PriceTick {
-        ts_ms: payload.trade_ts_ms,
-        price,
-    })
+    Some(PriceTick::new(payload.trade_ts_ms, price))
 }
 
 fn reconnect_delay(attempt: u32, base: Duration, max: Duration) -> Duration {

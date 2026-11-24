@@ -52,12 +52,13 @@ const FAR_MARKOV_STEP_WEIGHT: f64 = 3.0 / 60.0;
 /// Half-width of the integer-cent DP lattice (`[-450c, +450c]`, `901` states).
 const DP_HALF_WIDTH: usize = 450;
 
-/// Selects which odds model `QuoteEngine` runs. Default is `V1` until the owner approves v2.
+/// Selects which odds model `QuoteEngine` runs. Default is `V1` until the owner approves v2/m4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PricingModel {
     #[default]
     V1,
     V2,
+    M4,
 }
 
 impl PricingModel {
@@ -65,6 +66,7 @@ impl PricingModel {
         match raw.trim().to_ascii_lowercase().as_str() {
             "v1" | "1" => Some(Self::V1),
             "v2" | "2" => Some(Self::V2),
+            "m4" | "4" => Some(Self::M4),
             _ => None,
         }
     }
@@ -73,6 +75,7 @@ impl PricingModel {
         match self {
             Self::V1 => "v1",
             Self::V2 => "v2",
+            Self::M4 => "m4",
         }
     }
 }
@@ -1272,7 +1275,7 @@ mod tests {
             if sec == 10 || sec == 22 {
                 price += 0.01;
             }
-            det.on_tick(PriceTick { ts_ms: sec * 1_000, price }, &NVDA_V2_PARAMS);
+            det.on_tick(PriceTick { ts_ms: sec * 1_000, price, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         }
         assert_eq!(det.current_regime(), Regime::Quiet);
         // Last change was at sec=22 -> at quote_ts=40s, phi = ((22%3)+3-(40%3))%3 = (1+3-1)%3 = 0
@@ -1281,18 +1284,18 @@ mod tests {
         assert_eq!(det.inferred_phase(42_000), Some(1));
 
         // > 3s gap resets phase to None and does NOT trigger a bogus shock
-        det.on_tick(PriceTick { ts_ms: 46_000, price: 141.00 }, &NVDA_V2_PARAMS);
+        det.on_tick(PriceTick { ts_ms: 46_000, price: 141.00, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         assert_eq!(det.inferred_phase(46_000), None);
         assert_eq!(det.current_regime(), Regime::Quiet);
 
         // Single-print shock > 34c (4 * p99) promotes immediately to News on print 1
-        det.on_tick(PriceTick { ts_ms: 47_000, price: 141.40 }, &NVDA_V2_PARAMS);
+        det.on_tick(PriceTick { ts_ms: 47_000, price: 141.40, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         assert_eq!(det.current_regime(), Regime::News);
         assert_eq!(det.inferred_phase(47_000), Some(0));
 
         // Downgrade hysteresis: stays News during < 15s of calm before stepping down one level
         for sec in 48..120u64 {
-            det.on_tick(PriceTick { ts_ms: sec * 1_000, price: 141.40 }, &NVDA_V2_PARAMS);
+            det.on_tick(PriceTick { ts_ms: sec * 1_000, price: 141.40, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         }
         assert!(det.current_regime() < Regime::News);
     }
@@ -1439,18 +1442,18 @@ mod tests {
             if sec > 0 && sec % 5 == 0 {
                 price += 0.01;
             }
-            det.on_tick(PriceTick { ts_ms: sec * 1_000, price }, &NVDA_V2_PARAMS);
+            det.on_tick(PriceTick { ts_ms: sec * 1_000, price, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         }
         assert!((det.last_q60() - (6.0 / 30.0)).abs() < 1e-9);
 
         // 30c print (above old 3*p99=26c, below new 4*p99=34c) must NOT force News.
         price += 0.30;
-        det.on_tick(PriceTick { ts_ms: 31_000, price }, &NVDA_V2_PARAMS);
+        det.on_tick(PriceTick { ts_ms: 31_000, price, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         assert_ne!(det.current_regime(), Regime::News);
 
         // 35c print (> 4*p99=34c) promotes immediately to News on print 1.
         price += 0.35;
-        det.on_tick(PriceTick { ts_ms: 32_000, price }, &NVDA_V2_PARAMS);
+        det.on_tick(PriceTick { ts_ms: 32_000, price, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         assert_eq!(det.current_regime(), Regime::News);
         assert!((det.last_q60() - (8.0 / 32.0)).abs() < 1e-9);
     }

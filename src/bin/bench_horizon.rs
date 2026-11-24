@@ -65,7 +65,9 @@ fn parse_args() -> Args {
             "--far-refresh-ms" => far_refresh_ms = val.parse().expect("bad --far-refresh-ms"),
             "--stagger" => stagger = val.parse().expect("bad --stagger"),
             "--seed" => seed = val.parse().expect("bad --seed"),
-            "--model" => model = PricingModel::parse(val).expect("bad --model (expected v1 or v2)"),
+            "--model" => {
+                model = PricingModel::parse(val).expect("bad --model (expected v1, v2, or m4)")
+            }
             "--max-multiplier" => {
                 max_multiplier = Some(val.parse().expect("bad --max-multiplier"))
             }
@@ -75,7 +77,7 @@ fn parse_args() -> Args {
     }
     if file.as_os_str().is_empty() || from_ms == 0 || to_ms <= from_ms {
         panic!(
-            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2] [--max-multiplier 50]"
+            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2|m4] [--max-multiplier 50]"
         );
     }
     Args {
@@ -122,7 +124,7 @@ fn synthetic_ticks(from_ms: u64, to_ms: u64, base_price: f64, seed_offset: u64) 
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let unit = ((state >> 33) as f64 / u32::MAX as f64) - 0.5;
         price *= (unit * 0.0004).exp();
-        ticks.push(PriceTick { ts_ms: ts, price });
+        ticks.push(PriceTick::new(ts, price));
         ts = ts.saturating_add(1_000);
     }
     ticks

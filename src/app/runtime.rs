@@ -80,10 +80,7 @@ mod tests {
         for (index, price) in [100.0, 100.5, 101.0, 101.5].into_iter().enumerate() {
             price_runtime
                 .tick_tx
-                .send(PriceTick {
-                    ts_ms: 1_000 * (index as u64 + 1),
-                    price,
-                })
+                .send(PriceTick::new(1_000 * (index as u64 + 1), price))
                 .await
                 .unwrap();
         }
@@ -107,10 +104,7 @@ mod tests {
     #[test]
     fn build_view_copies_latest_price_and_grid() {
         let price = PriceSnapshot {
-            latest_tick: Some(PriceTick {
-                ts_ms: 1_000,
-                price: 123.0,
-            }),
+            latest_tick: Some(PriceTick::new(1_000, 123.0)),
             latest_server_ts_ms: Some(1_111),
             completed_bars: vec![OhlcBar {
                 open: 120.0,
@@ -145,10 +139,7 @@ mod tests {
     #[test]
     fn build_view_handles_missing_grid() {
         let price = PriceSnapshot {
-            latest_tick: Some(PriceTick {
-                ts_ms: 2_000,
-                price: 125.0,
-            }),
+            latest_tick: Some(PriceTick::new(2_000, 125.0)),
             latest_server_ts_ms: Some(2_111),
             completed_bars: Vec::new(),
             current_bar: None,

@@ -413,7 +413,16 @@ impl HyperliquidStream {
         publish_health(&self.health_tx, tracker.snapshot());
 
         if let Some(tx) = self.senders.get(&coin) {
-            if tx.send(PriceTick { ts_ms: now_ms, price }).await.is_err() {
+            if tx
+                .send(PriceTick {
+                    ts_ms: now_ms,
+                    price,
+                    mid_px: ctx.mid_px,
+                    oracle_px: ctx.oracle_px,
+                })
+                .await
+                .is_err()
+            {
                 warn!(%coin, "Hyperliquid price receiver dropped");
                 if self.all_senders_closed() {
                     return false;
@@ -524,6 +533,47 @@ mod tests {
         let parsed_min = parse_asset_ctx(mark_only).expect("expected valid mark-only AssetCtx");
         assert_eq!(parsed_min.mid_px, None);
         assert_eq!(parsed_min.oracle_px, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_stream_emits_price_tick_with_and_without_mid_and_oracle_px() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut senders = HashMap::new();
+        senders.insert("xyz:NVDA".to_string(), tx);
+        let (health_tx, _health_rx) = watch::channel(HashMap::new());
+        let stream = HyperliquidStream {
+            config: HyperliquidConfig::default(),
+            senders,
+            health_tx,
+            prev_day_px: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let mut tracker = HealthTracker::new(["xyz:NVDA"], Duration::from_secs(3));
+
+        let with_both = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"oraclePx":"145.88","markPx":"145.98","midPx":"146.005"}}}"#;
+        assert!(stream.handle_text(with_both, 1_000, &mut tracker).await);
+        let t1 = rx.recv().await.expect("expected tick with mid/oracle");
+        assert_eq!(
+            t1,
+            PriceTick {
+                ts_ms: 1_000,
+                price: 145.98,
+                mid_px: Some(146.005),
+                oracle_px: Some(145.88),
+            }
+        );
+
+        let without_both = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"146.02"}}}"#;
+        assert!(stream.handle_text(without_both, 2_000, &mut tracker).await);
+        let t2 = rx.recv().await.expect("expected tick without mid/oracle");
+        assert_eq!(
+            t2,
+            PriceTick {
+                ts_ms: 2_000,
+                price: 146.02,
+                mid_px: None,
+                oracle_px: None,
+            }
+        );
     }
 
     #[test]

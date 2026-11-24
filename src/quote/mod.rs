@@ -10,6 +10,7 @@ use crate::grid::{
 use crate::horizon::{
     NEAR_WINDOWS, RepriceStats, cadence_slot_due, move_trigger_due_sigma,
 };
+use crate::m4::{MarkFormulaTracker, TickerM4Params, m4_ticker_params, price_grid_m4};
 use crate::price::PriceTick;
 use crate::session::is_us_regular_session;
 use crate::v2::{
@@ -76,6 +77,8 @@ pub struct SampleJob {
     last_full_sigma: f64,
     v2_params: Option<&'static TickerV2Params>,
     v2_detector: RegimeDetector,
+    m4_params: Option<&'static TickerM4Params>,
+    m4_tracker: MarkFormulaTracker,
 }
 
 /// Computed Monte Carlo sample update ready to apply to `QuoteEngine`.
@@ -130,17 +133,6 @@ impl SampleJob {
                 .v2_forced_regime
                 .map(|r| v2_params.presets[r.index()].rms_median_cents)
                 .unwrap_or_else(|| self.v2_detector.last_r60().max(0.0));
-            let q60 = self
-                .base_config
-                .simulation
-                .v2_forced_regime
-                .map(|r| v2_params.presets[r.index()].q_1s)
-                .unwrap_or_else(|| self.v2_detector.last_q60());
-            let news_override = if regime == Regime::News {
-                Some(dynamic_news_preset(v2_params, r60, q60))
-            } else {
-                None
-            };
             let inferred_phase = self.v2_detector.inferred_phase(self.tick.ts_ms);
 
             let floor_sec_ms = (self.tick.ts_ms / 1_000) * 1_000;
@@ -168,15 +160,55 @@ impl SampleJob {
                 config.spec.center_row,
                 self.band_cents,
             );
-            let probs = price_grid_v2(
-                self.tick.price,
-                &bands,
-                &config.spec.windows,
-                v2_params,
-                regime,
-                inferred_phase,
-                news_override,
-            );
+            let (probs, m_eff) = if let Some(m4_params) = self.m4_params {
+                self.m4_tracker.on_tick(self.tick);
+                let state = self.m4_tracker.state(self.tick.price);
+                let regime_m4 = &m4_params.presets[regime.index()];
+                let mc_n = self.base_config.simulation.mc_n_min.max(1);
+                let base_seed = self
+                    .base_config
+                    .simulation
+                    .seed
+                    .unwrap_or(0x517C_C1B7_2722_0A95);
+                let seed = base_seed
+                    ^ self.tick.ts_ms.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (state.mark_cents as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                let probs = price_grid_m4(
+                    &bands,
+                    &config.spec.windows,
+                    state,
+                    regime_m4,
+                    inferred_phase,
+                    mc_n,
+                    seed,
+                );
+                let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents, regime_m4.m_base);
+                (probs, m_eff)
+            } else {
+                let q60 = self
+                    .base_config
+                    .simulation
+                    .v2_forced_regime
+                    .map(|r| v2_params.presets[r.index()].q_1s)
+                    .unwrap_or_else(|| self.v2_detector.last_q60());
+                let news_override = if regime == Regime::News {
+                    Some(dynamic_news_preset(v2_params, r60, q60))
+                } else {
+                    None
+                };
+                let probs = price_grid_v2(
+                    self.tick.price,
+                    &bands,
+                    &config.spec.windows,
+                    v2_params,
+                    regime,
+                    inferred_phase,
+                    news_override,
+                );
+                let preset_m_base = v2_params.presets[regime.index()].m_base;
+                let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents, preset_m_base);
+                (probs, m_eff)
+            };
 
             let mut new_cells = Vec::with_capacity(bands.len() * quote_windows);
             for (row_index, band) in bands.iter().enumerate() {
@@ -196,9 +228,6 @@ impl SampleJob {
                     });
                 }
             }
-
-            let preset_m_base = v2_params.presets[regime.index()].m_base;
-            let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents, preset_m_base);
             let sigma_eff = (r60 / (100.0 * self.tick.price)).max(1e-8);
             let volatility = VolatilitySnapshot {
                 variance: sigma_eff * sigma_eff,
@@ -486,6 +515,8 @@ pub struct QuoteEngine {
     stats: RepriceStats,
     v2_params: Option<&'static TickerV2Params>,
     v2_detector: RegimeDetector,
+    m4_params: Option<&'static TickerM4Params>,
+    m4_tracker: MarkFormulaTracker,
     v2_last_m_eff: f64,
     v2_last_regime: Option<Regime>,
 }
@@ -499,10 +530,13 @@ impl QuoteEngine {
 
     /// Creates a `QuoteEngine` using an explicit `GridConfig` template (for calibration/tuning).
     pub fn with_config(ticker: String, band_cents: u32, base_config: GridConfig) -> Self {
-        let v2_params = if base_config.simulation.pricing_model == PricingModel::V2 {
-            v2_ticker_params(&ticker)
-        } else {
-            None
+        let (v2_params, m4_params) = match base_config.simulation.pricing_model {
+            PricingModel::V1 => (None, None),
+            PricingModel::V2 => (v2_ticker_params(&ticker), None),
+            PricingModel::M4 => match (v2_ticker_params(&ticker), m4_ticker_params(&ticker)) {
+                (Some(v2), Some(m4)) => (Some(v2), Some(m4)),
+                _ => (None, None),
+            },
         };
         Self {
             ticker,
@@ -524,21 +558,31 @@ impl QuoteEngine {
             stats: RepriceStats::default(),
             v2_params,
             v2_detector: RegimeDetector::new(),
+            m4_params,
+            m4_tracker: MarkFormulaTracker::new(),
             v2_last_m_eff: V2_M_BASE,
             v2_last_regime: None,
         }
     }
 
-    /// Feeds a raw tick to the causal v2 regime/phase tracker (no-op on v1).
+    /// Feeds a raw tick to the causal v2/m4 trackers (no-op on v1).
     pub fn observe_tick(&mut self, tick: PriceTick) {
         if let Some(params) = self.v2_params {
             self.v2_detector.on_tick(tick, params);
+        }
+        if self.m4_params.is_some() {
+            self.m4_tracker.on_tick(tick);
         }
     }
 
     /// Returns `true` when odds model v2 is active for this ticker.
     pub fn is_v2_active(&self) -> bool {
-        self.v2_params.is_some()
+        self.v2_params.is_some() && self.m4_params.is_none()
+    }
+
+    /// Returns `true` when odds model m4 (trade.xyz mark formula) is active for this ticker.
+    pub fn is_m4_active(&self) -> bool {
+        self.m4_params.is_some()
     }
 
     /// Returns the latest v2 regime if v2 is active for this ticker.
@@ -580,6 +624,8 @@ impl QuoteEngine {
             last_full_sigma: self.last_full_sigma,
             v2_params: self.v2_params,
             v2_detector: self.v2_detector.clone(),
+            m4_params: self.m4_params,
+            m4_tracker: self.m4_tracker.clone(),
         })
     }
 
@@ -794,7 +840,7 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_001_234;
         let spot = 157.53;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         let before = engine.price(ts);
         let target = before
@@ -839,7 +885,7 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_001_234;
         let spot = 157.53;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         let before = engine.price(ts);
         engine.set_exposure(vec![
@@ -868,7 +914,7 @@ mod tests {
         let mut engine = QuoteEngine::new("TSLA".to_string(), 8);
         let ts = 1_795_000_001_234;
         let spot = 250.00;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         let q1 = engine.price(ts);
         assert_eq!(q1.cells.len(), 20 * 6);
@@ -905,7 +951,7 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_001_234;
         let spot = 157.53;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         let start = Instant::now();
         for i in 0..100 {
@@ -925,7 +971,7 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_004_000;
         let spot = 157.53;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         // First window starts at 1_795_000_010_000. At now = 1_795_000_004_500, lead is 5500 ms -> all 6 windows kept.
         let q_all = engine.price(1_795_000_004_500);
@@ -961,7 +1007,7 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_001_234;
         let spot = 157.53;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         let baseline = engine.price(ts);
         let target = baseline
@@ -998,7 +1044,7 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_001_234;
         let spot = 157.53;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
 
         let q = engine.price(ts);
         let first_window = q.cells[0].window_start_ms;
@@ -1050,11 +1096,11 @@ mod tests {
         let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
         cfg.simulation.seed = Some(42);
         let mut us_engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg.clone());
-        us_engine.on_sample(PriceTick { ts_ms: us_ts, price: spot }, &sample_history(spot));
+        us_engine.on_sample(PriceTick { ts_ms: us_ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
         let us_quote = us_engine.price(us_ts);
 
         let mut off_engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
-        off_engine.on_sample(PriceTick { ts_ms: off_ts, price: spot }, &sample_history(spot));
+        off_engine.on_sample(PriceTick { ts_ms: off_ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
         let off_quote = off_engine.price(off_ts);
 
         assert_eq!(us_quote.cells.len(), off_quote.cells.len());
@@ -1084,12 +1130,12 @@ mod tests {
         let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
         cfg.simulation.seed = Some(42);
         let mut with_off_hours = QuoteEngine::with_config("NVDA".to_string(), 3, cfg.clone());
-        with_off_hours.on_sample(PriceTick { ts_ms: us_ts, price: spot }, &history);
+        with_off_hours.on_sample(PriceTick { ts_ms: us_ts, price: spot, mid_px: None, oracle_px: None }, &history);
         let q1 = with_off_hours.price(us_ts);
 
         cfg.pricing.off_hours_m_base = None;
         let mut baseline = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
-        baseline.on_sample(PriceTick { ts_ms: us_ts, price: spot }, &history);
+        baseline.on_sample(PriceTick { ts_ms: us_ts, price: spot, mid_px: None, oracle_px: None }, &history);
         let q2 = baseline.price(us_ts);
 
         assert_eq!(q1.cells, q2.cells);
@@ -1108,7 +1154,7 @@ mod tests {
         let mut engine = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
         let ts = 1_795_000_001_000;
         let spot = 140.0;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
         let sigma = engine.volatility().unwrap().sigma;
         let first = engine.price(ts);
         assert_eq!(first.cells.len(), 20 * 24);
@@ -1126,6 +1172,8 @@ mod tests {
             PriceTick {
                 ts_ms: ts + 1_000,
                 price: mid_move,
+                mid_px: None,
+                oracle_px: None,
             },
             &sample_history(spot),
         );
@@ -1149,6 +1197,8 @@ mod tests {
             PriceTick {
                 ts_ms: ts + 2_000,
                 price: jumped,
+                mid_px: None,
+                oracle_px: None,
             },
             &sample_history(jumped),
         );
@@ -1186,7 +1236,7 @@ mod tests {
         let spot = 140.0;
         let hist = sample_history(spot);
         for engine in &mut engines {
-            engine.on_sample(PriceTick { ts_ms: base_ts, price: spot }, &hist);
+            engine.on_sample(PriceTick { ts_ms: base_ts, price: spot, mid_px: None, oracle_px: None }, &hist);
             assert_eq!(engine.price(base_ts).cells.len(), 20 * 24);
         }
 
@@ -1197,7 +1247,7 @@ mod tests {
             let mut full_this_sec = 0usize;
             for engine in &mut engines {
                 let before_full = engine.reprice_stats().full_reprices;
-                engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &hist);
+                engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &hist);
                 assert_eq!(engine.price(ts).cells.len(), 20 * 24, "sec={sec}");
                 if engine.reprice_stats().full_reprices > before_full {
                     full_this_sec += 1;
@@ -1225,10 +1275,10 @@ mod tests {
         let ts = 1_795_000_001_000;
         let spot = 140.0;
         let hist = sample_history(spot);
-        sync_engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &hist);
+        sync_engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &hist);
 
         let job = async_engine
-            .prepare_sample_job(PriceTick { ts_ms: ts, price: spot }, hist)
+            .prepare_sample_job(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, hist)
             .unwrap();
         let res = job.run().unwrap();
         async_engine.apply_sample_result(res);
@@ -1241,11 +1291,13 @@ mod tests {
         let mut engine = QuoteEngine::new("NVDA".to_string(), 3);
         let ts = 1_795_000_001_000;
         let spot = 140.0;
-        engine.on_sample(PriceTick { ts_ms: ts, price: spot }, &sample_history(spot));
+        engine.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &sample_history(spot));
         engine.on_sample(
             PriceTick {
                 ts_ms: ts + 1_000,
                 price: spot * 1.02,
+                mid_px: None,
+                oracle_px: None,
             },
             &sample_history(spot * 1.02),
         );
@@ -1283,8 +1335,8 @@ mod tests {
         let ts = 1_795_057_200_000_u64;
         let spot = 139.99;
         let hist = sample_history(spot);
-        e_clean.on_sample(PriceTick { ts_ms: ts, price: spot }, &hist);
-        e_dirty.on_sample(PriceTick { ts_ms: ts, price: spot }, &hist);
+        e_clean.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &hist);
+        e_dirty.on_sample(PriceTick { ts_ms: ts, price: spot, mid_px: None, oracle_px: None }, &hist);
 
         let q_clean = e_clean.price(ts);
         let q_dirty = e_dirty.price(ts);
@@ -1303,6 +1355,61 @@ mod tests {
                 !engine.is_v2_active(),
                 "{ticker} has no recorded tick history and must stay on v1"
             );
+        }
+    }
+
+    #[test]
+    fn m4_switch_leaves_v1_and_v2_identical_and_activates_for_nvda_tsla() {
+        let ts = 1_795_057_200_000_u64;
+        let spot = 145.98;
+        let hist = sample_history(spot);
+        let tick_bare = PriceTick::new(ts, spot);
+        let tick_full = PriceTick {
+            ts_ms: ts,
+            price: spot,
+            mid_px: Some(146.04),
+            oracle_px: Some(145.92),
+        };
+
+        // Adding optional mid_px / oracle_px to PriceTick must leave v1 and v2 outputs identical.
+        for model in [PricingModel::V1, PricingModel::V2] {
+            let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+            cfg.simulation.pricing_model = model;
+            cfg.simulation.seed = Some(42);
+            cfg.simulation.mc_n_min = 500;
+            cfg.simulation.mc_n_max = 500;
+            let mut e_bare = QuoteEngine::with_config("NVDA".to_string(), 3, cfg.clone());
+            let mut e_full = QuoteEngine::with_config("NVDA".to_string(), 3, cfg);
+            assert!(!e_bare.is_m4_active());
+            e_bare.on_sample(tick_bare, &hist);
+            e_full.on_sample(tick_full, &hist);
+            assert_eq!(e_bare.price(ts), e_full.price(ts));
+        }
+
+        // M4 activates on NVDA & TSLA, falls back to v1 on AAPL & SP500.
+        let mut cfg_m4 = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg_m4.simulation.pricing_model = PricingModel::M4;
+        cfg_m4.simulation.seed = Some(42);
+        cfg_m4.simulation.mc_n_min = 2_000;
+        cfg_m4.simulation.mc_n_max = 2_000;
+        let mut e_m4 = QuoteEngine::with_config("NVDA".to_string(), 3, cfg_m4);
+        assert!(e_m4.is_m4_active());
+        assert!(!e_m4.is_v2_active());
+        e_m4.on_sample(tick_full, &hist);
+        let q_m4 = e_m4.price(ts);
+        assert_eq!(q_m4.cells.len(), 20 * 6);
+        assert!(
+            q_m4.cells
+                .iter()
+                .all(|c| c.multiplier >= 1.05 && c.multiplier <= 25.0)
+        );
+
+        for ticker in ["AAPL", "SP500"] {
+            let mut cfg = stock_grid_config_for_ticker(ticker, 8, Vec::new());
+            cfg.simulation.pricing_model = PricingModel::M4;
+            let engine = QuoteEngine::with_config(ticker.to_string(), 8, cfg);
+            assert!(!engine.is_m4_active());
+            assert!(!engine.is_v2_active());
         }
     }
 }

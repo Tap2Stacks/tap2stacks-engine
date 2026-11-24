@@ -55,10 +55,10 @@ pub fn read_hl_jsonl_ctx(path: &Path, coin: &str) -> io::Result<Vec<HlTick>> {
     read_hl_jsonl_ctx_reader(BufReader::new(file), coin)
 }
 
-/// Reads recorded Hyperliquid JSONL ticks for `coin`, using `rx` as `ts_ms` and
-/// skipping non-`activeAssetCtx` lines or other coins.
+/// Reads recorded Hyperliquid JSONL ticks for `coin`, using `rx` as `ts_ms`, populating
+/// optional `mid_px` / `oracle_px`, and skipping non-`activeAssetCtx` lines or other coins.
 pub fn read_hl_jsonl(path: &Path, coin: &str) -> io::Result<Vec<PriceTick>> {
-    read_hl_jsonl_ctx(path, coin).map(|ticks| ticks.into_iter().map(HlTick::to_price_tick).collect())
+    read_hl_jsonl_ctx(path, coin)
 }
 
 #[cfg(test)]

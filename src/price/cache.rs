@@ -138,10 +138,10 @@ mod tests {
     #[test]
     fn aggregates_ticks_into_one_second_ohlc() {
         let mut cache = PriceCache::new(8);
-        cache.apply_tick(PriceTick { ts_ms: 1_000, price: 100.0 }).unwrap();
-        cache.apply_tick(PriceTick { ts_ms: 1_200, price: 101.0 }).unwrap();
-        cache.apply_tick(PriceTick { ts_ms: 1_800, price: 99.5 }).unwrap();
-        cache.apply_tick(PriceTick { ts_ms: 2_000, price: 102.0 }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 1_000, price: 100.0, mid_px: None, oracle_px: None }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 1_200, price: 101.0, mid_px: None, oracle_px: None }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 1_800, price: 99.5, mid_px: None, oracle_px: None }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 2_000, price: 102.0, mid_px: None, oracle_px: None }).unwrap();
 
         let snapshot = cache.snapshot();
         assert_eq!(snapshot.completed_bars.len(), 1);
@@ -168,8 +168,8 @@ mod tests {
     #[test]
     fn fills_missing_seconds_with_flat_bars() {
         let mut cache = PriceCache::new(8);
-        cache.apply_tick(PriceTick { ts_ms: 1_000, price: 100.0 }).unwrap();
-        cache.apply_tick(PriceTick { ts_ms: 4_000, price: 104.0 }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 1_000, price: 100.0, mid_px: None, oracle_px: None }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 4_000, price: 104.0, mid_px: None, oracle_px: None }).unwrap();
 
         let snapshot = cache.snapshot();
         assert_eq!(snapshot.completed_bars.len(), 3);
@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn produces_grid_snapshot_with_current_bar_included() {
         let mut cache = PriceCache::new(8);
-        cache.apply_tick(PriceTick { ts_ms: 1_000, price: 100.0 }).unwrap();
-        cache.apply_tick(PriceTick { ts_ms: 2_000, price: 101.0 }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 1_000, price: 100.0, mid_px: None, oracle_px: None }).unwrap();
+        cache.apply_tick(PriceTick { ts_ms: 2_000, price: 101.0, mid_px: None, oracle_px: None }).unwrap();
 
         let grid = cache.grid_snapshot(2).unwrap();
         assert_eq!(grid.spot, 101.0);

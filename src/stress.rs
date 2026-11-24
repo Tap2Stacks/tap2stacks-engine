@@ -698,8 +698,8 @@ mod tests {
     #[test]
     fn sixteen_second_gap_is_voided_on_every_overlapping_window() {
         let ticks = vec![
-            PriceTick { ts_ms: 0, price: 140.0 },
-            PriceTick { ts_ms: 16_000, price: 141.0 },
+            PriceTick { ts_ms: 0, price: 140.0, mid_px: None, oracle_px: None },
+            PriceTick { ts_ms: 16_000, price: 141.0, mid_px: None, oracle_px: None },
         ];
         let audits = audit_feed_gaps(&ticks, WINDOW_MS);
         assert_eq!(audits.len(), 1);
@@ -714,6 +714,8 @@ mod tests {
             .map(|sec| PriceTick {
                 ts_ms: sec * 1000,
                 price: if sec % 2 == 0 { 100.0 } else { 100.0 * 0.01_f64.exp() },
+                mid_px: None,
+                oracle_px: None,
             })
             .collect();
         let (sigma, returns) = realized_step_sigma(&ticks, 0, 5_000).unwrap();

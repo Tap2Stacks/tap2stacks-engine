@@ -541,6 +541,8 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
                 let pipeline_tick = PriceTick {
                     ts_ms: pipeline_ts,
                     price: tick.price,
+                    mid_px: tick.mid_px,
+                    oracle_px: tick.oracle_px,
                 };
                 pending_tick = Some(tick);
 
@@ -692,7 +694,7 @@ fn spawn_replay_stream(
                 let mut prev_rx = ticks[0].ts_ms;
                 if !emit_replay_tick(
                     &coin,
-                    ticks[0].price,
+                    ticks[0],
                     &tx,
                     &tracker_coin,
                     &health_tx_coin,
@@ -711,7 +713,7 @@ fn spawn_replay_stream(
                     }
                     if !emit_replay_tick(
                         &coin,
-                        tick.price,
+                        *tick,
                         &tx,
                         &tracker_coin,
                         &health_tx_coin,
@@ -733,7 +735,7 @@ fn spawn_replay_stream(
 
 async fn emit_replay_tick(
     coin: &str,
-    price: f64,
+    tick: PriceTick,
     tx: &mpsc::Sender<PriceTick>,
     tracker: &Mutex<HealthTracker>,
     health_tx: &watch::Sender<HashMap<String, FeedHealth>>,
@@ -746,7 +748,14 @@ async fn emit_replay_tick(
         guard.snapshot()
     };
     publish_health(health_tx, snapshot);
-    tx.send(PriceTick { ts_ms: now_ms, price }).await.is_ok()
+    tx.send(PriceTick {
+        ts_ms: now_ms,
+        price: tick.price,
+        mid_px: tick.mid_px,
+        oracle_px: tick.oracle_px,
+    })
+    .await
+    .is_ok()
 }
 
 fn publish_health(
@@ -999,7 +1008,7 @@ fn far_trigger_sigma_from_env() -> f64 {
 fn pricing_model_from_env() -> Result<PricingModel, Box<dyn Error + Send + Sync>> {
     match env::var("ENGINE_PRICING_MODEL") {
         Ok(raw) if !raw.trim().is_empty() => Ok(PricingModel::parse(&raw).ok_or_else(|| {
-            format!("invalid ENGINE_PRICING_MODEL '{raw}': expected v1 or v2")
+            format!("invalid ENGINE_PRICING_MODEL '{raw}': expected v1, v2, or m4")
         })?),
         Ok(_) | Err(env::VarError::NotPresent) => Ok(PricingModel::V1),
         Err(env::VarError::NotUnicode(_)) => {
@@ -1205,6 +1214,8 @@ mod tests {
     fn pricing_model_and_max_multiplier_parsers_validate_inputs() {
         assert_eq!(PricingModel::parse("v1"), Some(PricingModel::V1));
         assert_eq!(PricingModel::parse("V2"), Some(PricingModel::V2));
+        assert_eq!(PricingModel::parse("m4"), Some(PricingModel::M4));
+        assert_eq!(PricingModel::parse("M4"), Some(PricingModel::M4));
         assert_eq!(PricingModel::parse("v3"), None);
         assert_eq!(parse_max_multiplier("25"), Some(25.0));
         assert_eq!(parse_max_multiplier(" 50.0 "), Some(50.0));

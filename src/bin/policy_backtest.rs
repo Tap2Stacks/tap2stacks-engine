@@ -249,7 +249,8 @@ fn parse_args() -> Args {
             }
             "--bench-only" => args.bench_only = val.parse().expect("bad --bench-only"),
             "--model" => {
-                args.model = PricingModel::parse(val).expect("bad --model (expected v1 or v2)")
+                args.model =
+                    PricingModel::parse(val).expect("bad --model (expected v1, v2, or m4)")
             }
             "--max-multiplier" => {
                 let cap: f64 = val.parse().expect("bad --max-multiplier");
@@ -272,7 +273,7 @@ fn parse_args() -> Args {
         || args.band_cents == 0
     {
         panic!(
-            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
+            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
         );
     }
     if let (Some(f), Some(t)) = (args.date_from_ms, args.date_to_excl_ms) {

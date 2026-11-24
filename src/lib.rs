@@ -3,6 +3,7 @@ pub mod calibrate;
 pub mod grid;
 pub mod horizon;
 pub mod logging;
+pub mod m4;
 pub mod price;
 pub mod protocol;
 pub mod quote;

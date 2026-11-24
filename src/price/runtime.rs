@@ -73,18 +73,12 @@ mod tests {
         let (runtime, _task) = spawn_price_pipeline(8, 4, 8);
         runtime
             .tick_tx
-            .send(PriceTick {
-                ts_ms: 1_000,
-                price: 100.0,
-            })
+            .send(PriceTick::new(1_000, 100.0))
             .await
             .unwrap();
         runtime
             .tick_tx
-            .send(PriceTick {
-                ts_ms: 2_000,
-                price: 101.0,
-            })
+            .send(PriceTick::new(2_000, 101.0))
             .await
             .unwrap();
 
