@@ -323,6 +323,8 @@ pub struct DeribitTicker {
     pub best_bid_price: Option<f64>,
     pub best_ask_price: Option<f64>,
     pub last_price: Option<f64>,
+    /// Perp 24h price change in percent (`stats.price_change`), used to derive `prev_day_px`.
+    pub price_change_pct: Option<f64>,
     pub timestamp: u64,
 }
 
@@ -334,6 +336,27 @@ impl DeribitTicker {
                 Some(0.5 * (bid + ask))
             }
             _ => None,
+        }
+    }
+
+    /// Derives the 24h reference price `last_price / (1 + stats.price_change / 100)`.
+    /// Returns `None` when `last_price` or `price_change_pct` is missing, non-finite,
+    /// `last_price <= 0`, or `price_change_pct <= -100`.
+    pub fn derived_prev_day_px(&self) -> Option<f64> {
+        let last = self.last_price?;
+        let change_pct = self.price_change_pct?;
+        if !last.is_finite() || last <= 0.0 || !change_pct.is_finite() || change_pct <= -100.0 {
+            return None;
+        }
+        let denom = 1.0 + change_pct / 100.0;
+        if !denom.is_finite() || denom <= 0.0 {
+            return None;
+        }
+        let prev = last / denom;
+        if prev.is_finite() && prev > 0.0 {
+            Some(prev)
+        } else {
+            None
         }
     }
 
@@ -397,6 +420,11 @@ struct RawPriceIndexData {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawTickerStats {
+    price_change: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawTickerData {
     instrument_name: Option<String>,
     mark_price: Option<f64>,
@@ -404,6 +432,7 @@ struct RawTickerData {
     best_bid_price: Option<f64>,
     best_ask_price: Option<f64>,
     last_price: Option<f64>,
+    stats: Option<RawTickerStats>,
     timestamp: u64,
 }
 
@@ -428,6 +457,10 @@ pub(crate) fn parse_deribit_ticker_value(
     data: serde_json::Value,
 ) -> Option<DeribitTicker> {
     let raw: RawTickerData = serde_json::from_value(data).ok()?;
+    let price_change_pct = raw
+        .stats
+        .and_then(|s| s.price_change)
+        .filter(|v| v.is_finite());
     Some(DeribitTicker {
         channel: channel.to_string(),
         instrument_name: raw.instrument_name,
@@ -436,6 +469,7 @@ pub(crate) fn parse_deribit_ticker_value(
         best_bid_price: positive_finite(raw.best_bid_price),
         best_ask_price: positive_finite(raw.best_ask_price),
         last_price: positive_finite(raw.last_price),
+        price_change_pct,
         timestamp: raw.timestamp,
     })
 }
@@ -504,7 +538,6 @@ struct DeribitStream {
     config: DeribitConfig,
     senders: HashMap<String, mpsc::Sender<PriceTick>>,
     health_tx: watch::Sender<HashMap<String, FeedHealth>>,
-    #[allow(dead_code)]
     prev_day_px: Arc<RwLock<HashMap<String, f64>>>,
 }
 
@@ -790,6 +823,14 @@ impl DeribitStream {
                 } else {
                     now_ms
                 };
+                if let (Some(index_name), Some(prev)) =
+                    (ticker.index_name(), ticker.derived_prev_day_px())
+                {
+                    self.prev_day_px
+                        .write()
+                        .expect("prev_day_px rwlock poisoned")
+                        .insert(index_name, prev);
+                }
                 let event = match ticker.index_name() {
                     Some(index_name) => DeribitSampleEvent::Ticker {
                         index_name,
@@ -929,7 +970,7 @@ mod tests {
             }))
         );
 
-        let ticker_msg = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.15,"index_price":146.12,"best_bid_price":146.10,"best_ask_price":146.20,"last_price":146.14,"timestamp":1795450000150}}}"#;
+        let ticker_msg = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":146.15,"index_price":146.12,"best_bid_price":146.10,"best_ask_price":146.20,"last_price":146.14,"stats":{"price_change":-2.5},"timestamp":1795450000150}}}"#;
         assert_eq!(
             parse_deribit_message(ticker_msg),
             Some(DeribitMessage::Ticker(DeribitTicker {
@@ -940,6 +981,7 @@ mod tests {
                 best_bid_price: Some(146.10),
                 best_ask_price: Some(146.20),
                 last_price: Some(146.14),
+                price_change_pct: Some(-2.5),
                 timestamp: 1_795_450_000_150,
             }))
         );
@@ -1164,5 +1206,70 @@ mod tests {
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].1.mid_px, None);
         assert_eq!(stale[0].1.oracle_px, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deribit_ticker_derives_prev_day_px_and_ignores_invalid_price_change() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut senders = HashMap::new();
+        senders.insert("nvda_usdc".to_string(), tx);
+        let (health_tx, _health_rx) = watch::channel(HashMap::new());
+        let prev_day_px = Arc::new(RwLock::new(HashMap::new()));
+        let stream = DeribitStream {
+            config: DeribitConfig {
+                coins: vec!["nvda_usdc".to_string()],
+                ..DeribitConfig::default()
+            },
+            senders,
+            health_tx,
+            prev_day_px: Arc::clone(&prev_day_px),
+        };
+        let mut tracker = HealthTracker::new(["nvda_usdc"], Duration::from_secs(3));
+        let mut sampler = DeribitSampler::new(["nvda_usdc"]);
+        let mut rpc_id = 1u64;
+
+        // Recorded ticker format: last_price=155.13, stats.price_change=-2.977 -> 155.13 / 0.97023 ≈ 159.89.
+        let valid_ticker = r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","mark_price":155.15,"index_price":155.12,"best_bid_price":155.10,"best_ask_price":155.16,"last_price":155.13,"stats":{"high":160.10,"low":154.00,"price_change":-2.977,"volume":1234.5},"timestamp":1795450000100}}}"#;
+        let _ = stream
+            .handle_text(valid_ticker, 1_795_450_000_120, &mut tracker, &mut sampler, &mut rpc_id)
+            .await;
+        let stored = prev_day_px.read().unwrap().get("nvda_usdc").copied().unwrap();
+        let expected = 155.13_f64 / (1.0 - 2.977_f64 / 100.0);
+        assert!((stored - expected).abs() < 1e-12);
+        assert!((stored - 159.89).abs() < 0.005);
+
+        // Missing stats, missing last_price, or price_change <= -100 must be ignored and keep last valid value.
+        for bad_ticker in [
+            r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","last_price":155.13,"stats":{"price_change":-100.0},"timestamp":1795450000200}}}"#,
+            r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","last_price":155.13,"stats":{"price_change":-120.5},"timestamp":1795450000300}}}"#,
+            r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","last_price":155.13,"timestamp":1795450000400}}}"#,
+            r#"{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.NVDA_USDC-PERPETUAL.100ms","data":{"instrument_name":"NVDA_USDC-PERPETUAL","stats":{"price_change":1.5},"timestamp":1795450000500}}}"#,
+        ] {
+            let _ = stream
+                .handle_text(bad_ticker, 1_795_450_000_600, &mut tracker, &mut sampler, &mut rpc_id)
+                .await;
+            assert_eq!(
+                prev_day_px.read().unwrap().get("nvda_usdc").copied(),
+                Some(stored)
+            );
+        }
+
+        // Direct unit check on invalid DeribitTicker values.
+        let mut t = DeribitTicker {
+            channel: "ticker.NVDA_USDC-PERPETUAL.100ms".to_string(),
+            instrument_name: Some("NVDA_USDC-PERPETUAL".to_string()),
+            mark_price: None,
+            index_price: None,
+            best_bid_price: None,
+            best_ask_price: None,
+            last_price: Some(155.13),
+            price_change_pct: Some(f64::NAN),
+            timestamp: 1,
+        };
+        assert_eq!(t.derived_prev_day_px(), None);
+        t.price_change_pct = Some(-100.0);
+        assert_eq!(t.derived_prev_day_px(), None);
+        t.price_change_pct = Some(0.0);
+        assert_eq!(t.derived_prev_day_px(), Some(155.13));
     }
 }

@@ -658,6 +658,65 @@ impl TickerV2Params {
             .map_err(|err| format!("failed to serialize v2 params: {err}"))
     }
 
+    /// Formats this parameter table as a paste-ready Rust
+    /// `pub const <TICKER>_DERIBIT_V2_PARAMS: TickerV2Params = ...;` block matching `src/v2.rs`.
+    pub fn to_rust_deribit_const(&self) -> String {
+        let sym = normalize_v2_ticker(self.ticker);
+        let mut out = String::new();
+        out.push_str(&format!(
+            "pub const {sym}_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {{\n"
+        ));
+        out.push_str(&format!("    ticker: {:?},\n", sym));
+        out.push_str(&format!("    band_cents: {},\n", self.band_cents));
+        out.push_str(&format!("    reference_price: {:?},\n", self.reference_price));
+        out.push_str(&format!("    clock_secs: {},\n", self.clock_secs));
+        out.push_str(&format!("    void_gap_ms: {},\n", self.void_gap_ms));
+        out.push_str(&format!("    book_lead_secs: {},\n", self.book_lead_secs));
+        out.push_str(&format!("    book_gap_beta: {:?},\n", self.book_gap_beta));
+        out.push_str(&format!(
+            "    book_gap_clamp_cents: {},\n",
+            self.book_gap_clamp_cents
+        ));
+        out.push_str(&format!("    book_max_age_ms: {},\n", self.book_max_age_ms));
+        out.push_str(&format!("    rms_ref_cents: {:?},\n", self.rms_ref_cents));
+        out.push_str(&format!(
+            "    thresholds_rms_cents: [{:?}, {:?}, {:?}],\n",
+            self.thresholds_rms_cents[0],
+            self.thresholds_rms_cents[1],
+            self.thresholds_rms_cents[2]
+        ));
+        out.push_str(&format!(
+            "    shock_single_step_cents: {},\n",
+            self.shock_single_step_cents
+        ));
+        out.push_str("    presets: [\n");
+        for p in &self.presets {
+            out.push_str("        RegimePreset {\n");
+            out.push_str(&format!("            q_1s: {:?},\n", p.q_1s));
+            out.push_str(&format!("            p_move: {:?},\n", p.p_move));
+            out.push_str(&format!("            mix_weight: {:?},\n", p.mix_weight));
+            out.push_str(&format!("            p1: {:?},\n", p.p1));
+            out.push_str(&format!("            p2: {:?},\n", p.p2));
+            out.push_str(&format!(
+                "            rms_median_cents: {:?},\n",
+                p.rms_median_cents
+            ));
+            out.push_str(&format!("            m_base: {:?},\n", p.m_base));
+            out.push_str("        },\n");
+        }
+        out.push_str("    ],\n");
+        out.push_str("    transition_1min: [\n");
+        for row in &self.transition_1min {
+            out.push_str(&format!(
+                "        [{:?}, {:?}, {:?}, {:?}],\n",
+                row[0], row[1], row[2], row[3]
+            ));
+        }
+        out.push_str("    ],\n");
+        out.push_str("};\n");
+        out
+    }
+
     /// Compact one-line summary for offline tool startup logs.
     pub fn one_line_summary(&self) -> String {
         format!(
@@ -2667,5 +2726,81 @@ mod tests {
         assert!(bad_clamp.validate().is_err());
 
         assert!(parse_v2_params_json("{not json").is_err());
+    }
+
+    #[test]
+    fn emit_rust_table_reproduces_compiled_nvda_and_tsla_deribit_tables() {
+        for (expected_const, params) in [
+            ("NVDA_DERIBIT_V2_PARAMS", &NVDA_DERIBIT_V2_PARAMS),
+            ("TSLA_DERIBIT_V2_PARAMS", &TSLA_DERIBIT_V2_PARAMS),
+        ] {
+            let rendered = params.to_rust_deribit_const();
+            assert!(
+                rendered.starts_with(&format!(
+                    "pub const {expected_const}: TickerV2Params = TickerV2Params {{"
+                )),
+                "unexpected header:\n{rendered}"
+            );
+            assert!(rendered.ends_with("};\n"));
+            assert!(rendered.contains(&format!("    ticker: {:?},", params.ticker)));
+            assert!(rendered.contains(&format!("    band_cents: {},", params.band_cents)));
+            assert!(rendered.contains(&format!(
+                "    reference_price: {:?},",
+                params.reference_price
+            )));
+            assert!(rendered.contains(&format!("    clock_secs: {},", params.clock_secs)));
+            assert!(rendered.contains(&format!("    void_gap_ms: {},", params.void_gap_ms)));
+            assert!(rendered.contains(&format!(
+                "    book_lead_secs: {},",
+                params.book_lead_secs
+            )));
+            assert!(rendered.contains(&format!(
+                "    book_gap_beta: {:?},",
+                params.book_gap_beta
+            )));
+            assert!(rendered.contains(&format!(
+                "    book_gap_clamp_cents: {},",
+                params.book_gap_clamp_cents
+            )));
+            assert!(rendered.contains(&format!(
+                "    book_max_age_ms: {},",
+                params.book_max_age_ms
+            )));
+            assert!(rendered.contains(&format!(
+                "    rms_ref_cents: {:?},",
+                params.rms_ref_cents
+            )));
+            assert!(rendered.contains(&format!(
+                "    thresholds_rms_cents: [{:?}, {:?}, {:?}],",
+                params.thresholds_rms_cents[0],
+                params.thresholds_rms_cents[1],
+                params.thresholds_rms_cents[2]
+            )));
+            assert!(rendered.contains(&format!(
+                "    shock_single_step_cents: {},",
+                params.shock_single_step_cents
+            )));
+            for preset in &params.presets {
+                assert!(rendered.contains(&format!("            q_1s: {:?},", preset.q_1s)));
+                assert!(rendered.contains(&format!("            p_move: {:?},", preset.p_move)));
+                assert!(rendered.contains(&format!(
+                    "            mix_weight: {:?},",
+                    preset.mix_weight
+                )));
+                assert!(rendered.contains(&format!("            p1: {:?},", preset.p1)));
+                assert!(rendered.contains(&format!("            p2: {:?},", preset.p2)));
+                assert!(rendered.contains(&format!(
+                    "            rms_median_cents: {:?},",
+                    preset.rms_median_cents
+                )));
+                assert!(rendered.contains(&format!("            m_base: {:?},", preset.m_base)));
+            }
+            for row in &params.transition_1min {
+                assert!(rendered.contains(&format!(
+                    "        [{:?}, {:?}, {:?}, {:?}],",
+                    row[0], row[1], row[2], row[3]
+                )));
+            }
+        }
     }
 }

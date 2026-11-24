@@ -79,6 +79,7 @@ struct Args {
     v2_preset: Option<Regime>,
     v2_params_file: Option<PathBuf>,
     dump_v2_params: bool,
+    emit_rust_table: bool,
     accuracy_table: bool,
 }
 
@@ -165,6 +166,7 @@ fn parse_args() -> Args {
         v2_preset: None,
         v2_params_file: None,
         dump_v2_params: false,
+        emit_rust_table: false,
         accuracy_table: false,
     };
     let raw: Vec<String> = env::args().skip(1).collect();
@@ -180,6 +182,18 @@ fn parse_args() -> Args {
                 }
             }
             args.dump_v2_params = true;
+            i += 1;
+            continue;
+        }
+        if key == "--emit-rust-table" {
+            if let Some(next) = raw.get(i + 1) {
+                if next == "true" || next == "false" {
+                    args.emit_rust_table = next == "true";
+                    i += 2;
+                    continue;
+                }
+            }
+            args.emit_rust_table = true;
             i += 1;
             continue;
         }
@@ -301,12 +315,20 @@ fn parse_args() -> Args {
         }
         return args;
     }
+    if args.emit_rust_table {
+        if args.coin.is_empty() || args.v2_params_file.is_none() {
+            panic!(
+                "usage: policy_backtest --emit-rust-table --v2-params-file <path.json> --coin <coin>"
+            );
+        }
+        return args;
+    }
     if (args.files.is_empty() && args.data_dirs.is_empty())
         || args.coin.is_empty()
         || args.band_cents == 0
     {
         panic!(
-            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--source hyperliquid|deribit] [--v2-params-file <path.json>] [--dump-v2-params] [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
+            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--source hyperliquid|deribit] [--v2-params-file <path.json>] [--dump-v2-params] [--emit-rust-table] [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
         );
     }
     if let (Some(f), Some(t)) = (args.date_from_ms, args.date_to_excl_ms) {
@@ -1655,6 +1677,38 @@ fn main() {
             std::process::exit(2);
         });
         println!("{json}");
+        return;
+    }
+    if args.emit_rust_table {
+        let path = args
+            .v2_params_file
+            .as_ref()
+            .expect("--emit-rust-table requires --v2-params-file");
+        let mut loaded = load_v2_params_file(path).unwrap_or_else(|err| {
+            eprintln!("{err}");
+            std::process::exit(2);
+        });
+        if !loaded.matches_coin(&args.coin) {
+            eprintln!(
+                "v2 params file {} has ticker '{}', which does not match --coin '{}'",
+                path.display(),
+                loaded.ticker,
+                args.coin
+            );
+            std::process::exit(2);
+        }
+        if args.band_cents > 0 && loaded.band_cents != args.band_cents {
+            eprintln!(
+                "warning: --v2-params-file {} specifies band_cents={}, differing from --band-cents={}; using --band-cents={}",
+                path.display(),
+                loaded.band_cents,
+                args.band_cents,
+                args.band_cents
+            );
+            loaded.band_cents = args.band_cents;
+        }
+        let leaked = loaded.leak_static();
+        print!("{}", leaked.to_rust_deribit_const());
         return;
     }
 
