@@ -101,6 +101,17 @@ is `X` on `[a - L, b - L)`. The touch probability is therefore the same DP:
 - run `a - t - L` seconds to the window start, not `a - t`;
 - then run the 5 window seconds as before.
 
+**Which steps the DP uses.** The index's own 1 s steps keep their direction for a few
+seconds. Its variance ratio `VR(h) = var(C_{t+h} - C_t) / (h · var(C_{t+1} - C_t))` is
+NVDA 1.35 / 1.44 / 1.46 and TSLA 1.46 / 1.56 / 1.54 at h = 5 / 10 / 30 s. An
+independent-steps model fitted to the index therefore under-states how far it travels in a
+window by about 1.5x in variance. The book price `X = C + G` has independent steps
+(VR 0.95-0.97 NVDA, 0.90-0.98 TSLA; lag-1 correlation -0.05 / -0.02, against +0.16 / +0.23
+for the index). So the step process (`q`, jump sizes) is fitted on `X`
+(`drb-tick-stats.py --series book`). Regime cut-offs, R_60 medians and transitions stay on
+the index, because that is what the engine classifies. This changes no formula; it only
+fits the same process to the series it actually describes.
+
 That is two numbers per ticker, both measured from the stream (`β∞ ≈ 1`, `L ≈ 2 s`),
 with no fitting to profit and loss. With `G = 0` and `L = 0` it is exactly the plain
 v2. Safety: use `G = 0` when the ticker is over 2 s old, and clamp `|G|` to the p99
