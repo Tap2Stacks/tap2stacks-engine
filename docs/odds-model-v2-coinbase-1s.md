@@ -99,7 +99,7 @@ is `X` on `[a - L, b - L)`. The touch probability is therefore the same DP:
 
 - start at `c0 = C_t + round(G_t)`, not at `C_t`;
 - run `a - t - L` seconds to the window start, not `a - t`;
-- then run the 5 window seconds as before.
+- then run the 5 window seconds as before (with the index's own steps, see below).
 
 **Which steps the DP uses.** The index's own 1 s steps keep their direction for a few
 seconds. Its variance ratio `VR(h) = var(C_{t+h} - C_t) / (h · var(C_{t+1} - C_t))` is
@@ -107,12 +107,39 @@ NVDA 1.35 / 1.44 / 1.46 and TSLA 1.46 / 1.56 / 1.54 at h = 5 / 10 / 30 s. An
 independent-steps model fitted to the index therefore under-states how far it travels in a
 window by about 1.5x in variance. The book price `X = C + G` has independent steps
 (VR 0.95-0.97 NVDA, 0.90-0.98 TSLA; lag-1 correlation -0.05 / -0.02, against +0.16 / +0.23
-for the index). So the step process (`q`, jump sizes) is fitted on `X`
-(`drb-tick-stats.py --series book`). Regime cut-offs, R_60 medians and transitions stay on
-the index, because that is what the engine classifies. This changes no formula; it only
-fits the same process to the series it actually describes.
+for the index).
 
-That is two numbers per ticker, both measured from the stream (`β∞ ≈ 1`, `L ≈ 2 s`),
+But inside a window the index is still the smoothed copy, and it moves less than `X`.
+Using `X` steps everywhere over-predicts rows 2-3 away in the first window by 5-11 points.
+The fix uses **two phases** of the same DP, each with steps measured on the series it
+describes:
+
+- **Until the window opens:** `X` steps (`presets`, fitted with
+  `drb-tick-stats.py --series book`). Start at `C_t + G_t`, run `a - t - L` seconds.
+- **Inside the window:** the index's own steps (`window_presets`, fitted on the index).
+
+Regime cut-offs, R_60 medians and transitions stay on the index, because that is what the
+engine classifies.
+
+Check against real touch rates (`drb-analysis/drb_model_check.py`, 6.5 h, a start every
+5 s, windows w0-w5, rows d0-d5, Monte Carlo with the fitted presets). The numbers are
+the mean |model − real| touch rate:
+
+| Model | NVDA 3c | TSLA 8c |
+|---|---:|---:|
+| A: index steps everywhere | 1.92 pp (max 3.58) | 3.30 pp (max 5.90) |
+| B: `X` steps everywhere, L = 2 | 2.78 pp (max 5.59) | 3.05 pp (max 7.49) |
+| C: two phases, L = 2 | 1.08 pp (max 2.95) | 1.40 pp (max 7.26) |
+| **C: two phases, L = 3** | **0.76 pp (max 2.60)** | **1.07 pp (max 3.07)** |
+| C: two phases, L = 4 | 1.09 pp (max 10.59) | 1.13 pp (max 3.66) |
+
+L = 3 s also matches the regression above: β reaches about 1 at h = 3 s.
+
+The early backtest confirms the direction: with index steps (A), far rows were
+under-priced at x50/x100; with `X` steps (B), the average edge rose to 16-30%.
+
+That is a few numbers per ticker, all measured from the stream (`β∞ ≈ 1`, `L = 3 s`, and
+the two step sets),
 with no fitting to profit and loss. With `G = 0` and `L = 0` it is exactly the plain
 v2. Safety: use `G = 0` when the ticker is over 2 s old, and clamp `|G|` to the p99
 of the recorded gap. Without this term, a player who watches the book (`mid_follow`
