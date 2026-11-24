@@ -274,7 +274,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| DEFAULT_HL_INFO_URL.to_string());
     let warmup_minutes = warmup_minutes_from_env();
-    let quote_windows = quote_windows_from_env();
+    let quote_windows = quote_windows_from_env()?;
+    let quote_windows_by_ticker = quote_windows_by_ticker_from_env(&tickers)?;
     let far_trigger_sigma = far_trigger_sigma_from_env();
 
     let clock = Arc::new(MonotonicWallClock::new());
@@ -335,7 +336,18 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let health_rx_clone = health_rx.clone();
         let prev_day_px_clone = Arc::clone(&prev_day_px);
         let seed_variance_prior = seed_variance_priors.get(&spec.coin).copied();
+        let ticker_quote_windows =
+            resolve_quote_windows(&spec.ticker, quote_windows, &quote_windows_by_ticker);
         let far_phase_ms = stagger_phase_ms(ticker_index, ticker_count, FAR_REFRESH_MS);
+        info!(
+            ticker = %spec.ticker,
+            coin = %spec.coin,
+            band_cents = spec.band_cents,
+            quote_windows = ticker_quote_windows,
+            far_trigger_sigma,
+            far_phase_ms,
+            "spawning ticker task"
+        );
         tokio::spawn(run_ticker_task(
             spec,
             TickerTaskInput {
@@ -346,7 +358,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 hub: hub_clone,
                 clock: clock_clone,
                 seed_variance_prior,
-                quote_windows,
+                quote_windows: ticker_quote_windows,
                 far_trigger_sigma,
                 far_phase_ms,
             },
@@ -853,17 +865,96 @@ fn parse_quote_windows(raw: &str) -> Option<usize> {
     raw.trim().parse::<usize>().ok().filter(|&n| n >= 1)
 }
 
-fn quote_windows_from_env() -> usize {
+fn quote_windows_from_env() -> Result<usize, Box<dyn Error + Send + Sync>> {
     match env::var("ENGINE_QUOTE_WINDOWS") {
-        Ok(raw) if !raw.trim().is_empty() => match parse_quote_windows(&raw) {
-            Some(value) => value,
-            None => {
-                warn!(value = %raw, "invalid ENGINE_QUOTE_WINDOWS; using default");
-                DEFAULT_WINDOWS
-            }
-        },
-        _ => DEFAULT_WINDOWS,
+        Ok(raw) if !raw.trim().is_empty() => Ok(parse_quote_windows(&raw).ok_or_else(|| {
+            format!("invalid ENGINE_QUOTE_WINDOWS '{raw}': expected integer >= 1")
+        })?),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(DEFAULT_WINDOWS),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("ENGINE_QUOTE_WINDOWS must be valid UTF-8".into())
+        }
     }
+}
+
+fn parse_quote_windows_by_ticker(
+    raw: &str,
+    tickers: &[TickerSpec],
+) -> Result<HashMap<String, usize>, Box<dyn Error + Send + Sync>> {
+    let mut overrides: HashMap<String, usize> = HashMap::new();
+    if raw.trim().is_empty() {
+        return Ok(overrides);
+    }
+    let known: HashSet<&str> = tickers.iter().map(|spec| spec.ticker.as_str()).collect();
+    let configured_list = || -> String {
+        tickers
+            .iter()
+            .map(|spec| spec.ticker.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return Err(
+                format!("invalid ENGINE_QUOTE_WINDOWS_BY_TICKER '{raw}': empty entry").into(),
+            );
+        }
+        let (ticker_part, windows_part) = trimmed.split_once('=').ok_or_else(|| {
+            format!(
+                "invalid ENGINE_QUOTE_WINDOWS_BY_TICKER entry '{trimmed}': expected TICKER=WINDOWS"
+            )
+        })?;
+        let ticker = ticker_part.trim();
+        let windows_raw = windows_part.trim();
+        if ticker.is_empty() {
+            return Err(format!(
+                "invalid ENGINE_QUOTE_WINDOWS_BY_TICKER entry '{trimmed}': empty ticker"
+            )
+            .into());
+        }
+        if !known.contains(ticker) {
+            return Err(format!(
+                "unknown ticker '{ticker}' in ENGINE_QUOTE_WINDOWS_BY_TICKER (configured tickers: {})",
+                configured_list()
+            )
+            .into());
+        }
+        let windows = parse_quote_windows(windows_raw).ok_or_else(|| {
+            format!(
+                "invalid window count '{windows_raw}' for ticker '{ticker}' in ENGINE_QUOTE_WINDOWS_BY_TICKER: expected integer >= 1"
+            )
+        })?;
+        if overrides.insert(ticker.to_string(), windows).is_some() {
+            return Err(format!(
+                "duplicate ticker '{ticker}' in ENGINE_QUOTE_WINDOWS_BY_TICKER"
+            )
+            .into());
+        }
+    }
+
+    Ok(overrides)
+}
+
+fn quote_windows_by_ticker_from_env(
+    tickers: &[TickerSpec],
+) -> Result<HashMap<String, usize>, Box<dyn Error + Send + Sync>> {
+    match env::var("ENGINE_QUOTE_WINDOWS_BY_TICKER") {
+        Ok(raw) => parse_quote_windows_by_ticker(&raw, tickers),
+        Err(env::VarError::NotPresent) => Ok(HashMap::new()),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("ENGINE_QUOTE_WINDOWS_BY_TICKER must be valid UTF-8".into())
+        }
+    }
+}
+
+fn resolve_quote_windows(
+    ticker: &str,
+    default_windows: usize,
+    overrides: &HashMap<String, usize>,
+) -> usize {
+    overrides.get(ticker).copied().unwrap_or(default_windows)
 }
 
 fn parse_trigger_sigma(raw: &str) -> Option<f64> {
@@ -990,6 +1081,63 @@ mod tests {
         assert_eq!(parse_quote_windows("0"), None);
         assert_eq!(parse_quote_windows("-1"), None);
         assert_eq!(parse_quote_windows("abc"), None);
+    }
+
+    #[test]
+    fn quote_windows_by_ticker_parses_overrides_and_falls_back_to_base() {
+        let tickers = parse_tickers(DEFAULT_TICKERS).unwrap();
+        let empty = parse_quote_windows_by_ticker("   ", &tickers).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(resolve_quote_windows("NVDA", DEFAULT_WINDOWS, &empty), 6);
+
+        let single = parse_quote_windows_by_ticker("NVDA=24", &tickers).unwrap();
+        assert_eq!(resolve_quote_windows("NVDA", DEFAULT_WINDOWS, &single), 24);
+        assert_eq!(resolve_quote_windows("TSLA", DEFAULT_WINDOWS, &single), 6);
+        assert_eq!(resolve_quote_windows("AAPL", DEFAULT_WINDOWS, &single), 6);
+        assert_eq!(resolve_quote_windows("SP500", DEFAULT_WINDOWS, &single), 6);
+
+        let multi = parse_quote_windows_by_ticker(" NVDA = 24 , TSLA = 6 ", &tickers).unwrap();
+        assert_eq!(resolve_quote_windows("NVDA", 12, &multi), 24);
+        assert_eq!(resolve_quote_windows("TSLA", 12, &multi), 6);
+        assert_eq!(resolve_quote_windows("AAPL", 12, &multi), 12);
+    }
+
+    #[test]
+    fn quote_windows_by_ticker_rejects_unknown_tickers_and_bad_values() {
+        let tickers = parse_tickers(DEFAULT_TICKERS).unwrap();
+
+        let unknown = parse_quote_windows_by_ticker("MSFT=24", &tickers)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("unknown ticker"), "got: {unknown}");
+        assert!(unknown.contains("MSFT"), "got: {unknown}");
+
+        let wrong_case = parse_quote_windows_by_ticker("nvda=24", &tickers)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_case.contains("unknown ticker"), "got: {wrong_case}");
+
+        let dup = parse_quote_windows_by_ticker("NVDA=24,NVDA=6", &tickers)
+            .unwrap_err()
+            .to_string();
+        assert!(dup.contains("duplicate"), "got: {dup}");
+
+        for bad in [
+            "NVDA:24",
+            "=24",
+            "NVDA=",
+            "NVDA=0",
+            "NVDA=-1",
+            "NVDA=abc",
+            "NVDA=24,",
+            ",NVDA=24",
+            "NVDA=24,,TSLA=6",
+        ] {
+            assert!(
+                parse_quote_windows_by_ticker(bad, &tickers).is_err(),
+                "expected error for '{bad}'"
+            );
+        }
     }
 
     #[test]

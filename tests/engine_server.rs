@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -563,4 +564,113 @@ async fn health_frame_reports_prev_day_px_from_hyperliquid() {
 
     assert_eq!(observed_prev_day_px, 154.03);
     hl_server.abort();
+}
+
+#[test]
+fn refuses_to_start_with_invalid_quote_windows_env() {
+    let cases = [
+        (
+            vec![("ENGINE_QUOTE_WINDOWS_BY_TICKER", "MSFT=24")],
+            "MSFT",
+        ),
+        (
+            vec![("ENGINE_QUOTE_WINDOWS_BY_TICKER", "NVDA=0")],
+            "ENGINE_QUOTE_WINDOWS_BY_TICKER",
+        ),
+        (
+            vec![("ENGINE_QUOTE_WINDOWS_BY_TICKER", "NVDA=abc")],
+            "ENGINE_QUOTE_WINDOWS_BY_TICKER",
+        ),
+        (vec![("ENGINE_QUOTE_WINDOWS", "0")], "ENGINE_QUOTE_WINDOWS"),
+    ];
+
+    for (envs, expected_substr) in cases {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_engine_server"));
+        cmd.env("ENGINE_TOKEN", "bad-windows-token")
+            .env("ENGINE_BIND_ADDR", free_addr())
+            .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8")
+            .env_remove("ENGINE_QUOTE_WINDOWS")
+            .env_remove("ENGINE_QUOTE_WINDOWS_BY_TICKER");
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("failed to execute engine_server");
+        assert!(
+            !output.status.success(),
+            "engine_server must refuse to start for {envs:?}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected_substr),
+            "expected stderr for {envs:?} to contain '{expected_substr}', got: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn per_ticker_quote_windows_gives_nvda_24_and_tsla_6() {
+    let addr = free_addr();
+    let token = "per-ticker-windows-token";
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_engine_server"));
+    cmd.env("ENGINE_BIND_ADDR", &addr)
+        .env("ENGINE_TOKEN", token)
+        .env("ENGINE_TICKERS", "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8")
+        .env_remove("ENGINE_QUOTE_WINDOWS")
+        .env("ENGINE_QUOTE_WINDOWS_BY_TICKER", "NVDA=24")
+        .env("ENGINE_REPLAY_FILE", "tests/fixtures/hl_sample.jsonl");
+    let _slot = idle_engine_slot();
+    let _guard = ChildGuard::spawn(cmd);
+
+    let mut ws = wait_and_connect(&addr, token).await;
+
+    let mut nvda_24: Option<StockQuote> = None;
+    let mut tsla_6: Option<StockQuote> = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(msg) = ws.next().await {
+            if let Message::Text(text) = msg.expect("ws read error") {
+                if let Ok(EngineOut::Quote(q)) = serde_json::from_str::<EngineOut>(&text) {
+                    if q.cells.is_empty() {
+                        continue;
+                    }
+                    let windows: BTreeSet<u64> =
+                        q.cells.iter().map(|cell| cell.window_start_ms).collect();
+                    match q.ticker.as_str() {
+                        "NVDA" => {
+                            assert!(
+                                windows.len() <= 24,
+                                "NVDA exceeded 24 windows: {}",
+                                windows.len()
+                            );
+                            if windows.len() == 24 && nvda_24.is_none() {
+                                nvda_24 = Some(q);
+                            }
+                        }
+                        "TSLA" => {
+                            assert!(
+                                windows.len() <= 6,
+                                "TSLA must stay at <= 6 windows, got {}",
+                                windows.len()
+                            );
+                            if windows.len() == 6 && tsla_6.is_none() {
+                                tsla_6 = Some(q);
+                            }
+                        }
+                        _ => {}
+                    }
+                    if nvda_24.is_some() && tsla_6.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("expected 24-window NVDA quote and 6-window TSLA quote within 3s");
+
+    let nvda = nvda_24.expect("missing 24-window NVDA quote");
+    let tsla = tsla_6.expect("missing 6-window TSLA quote");
+    assert_eq!(nvda.band_cents, 3);
+    assert_eq!(nvda.cells.len(), 20 * 24);
+    assert_eq!(tsla.band_cents, 8);
+    assert_eq!(tsla.cells.len(), 20 * 6);
 }
