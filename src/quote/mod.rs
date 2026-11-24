@@ -13,8 +13,8 @@ use crate::horizon::{
 use crate::price::PriceTick;
 use crate::session::is_us_regular_session;
 use crate::v2::{
-    PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, price_grid_v2, v2_m_eff,
-    v2_price_multiplier, v2_ticker_params,
+    PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, dynamic_news_preset,
+    price_grid_v2, v2_m_eff, v2_price_multiplier, v2_ticker_params,
 };
 
 pub use book::{CellKey, ExposureBook};
@@ -130,6 +130,17 @@ impl SampleJob {
                 .v2_forced_regime
                 .map(|r| v2_params.presets[r.index()].rms_median_cents)
                 .unwrap_or_else(|| self.v2_detector.last_r60().max(0.0));
+            let q60 = self
+                .base_config
+                .simulation
+                .v2_forced_regime
+                .map(|r| v2_params.presets[r.index()].q_1s)
+                .unwrap_or_else(|| self.v2_detector.last_q60());
+            let news_override = if regime == Regime::News {
+                Some(dynamic_news_preset(v2_params, r60, q60))
+            } else {
+                None
+            };
             let inferred_phase = self.v2_detector.inferred_phase(self.tick.ts_ms);
 
             let floor_sec_ms = (self.tick.ts_ms / 1_000) * 1_000;
@@ -164,6 +175,7 @@ impl SampleJob {
                 v2_params,
                 regime,
                 inferred_phase,
+                news_override,
             );
 
             let mut new_cells = Vec::with_capacity(bands.len() * quote_windows);
@@ -185,7 +197,8 @@ impl SampleJob {
                 }
             }
 
-            let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents);
+            let preset_m_base = v2_params.presets[regime.index()].m_base;
+            let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents, preset_m_base);
             let sigma_eff = (r60 / (100.0 * self.tick.price)).max(1e-8);
             let volatility = VolatilitySnapshot {
                 variance: sigma_eff * sigma_eff,

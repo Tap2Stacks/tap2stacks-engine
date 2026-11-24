@@ -27,12 +27,24 @@ pub const DETECTOR_MIN_STEPS: usize = 10;
 pub const DOWNGRADE_HOLD_SECS: u64 = 15;
 /// Hysteresis multiplier on lower thresholds when stepping down a regime.
 pub const HYSTERESIS_FACTOR: f64 = 0.85;
-/// Base QTAP house margin for v2 (`docs/odds-model-v2.md` §3).
+/// Floor for QTAP house margin in v2 (`docs/odds-model-v2.md` §3.3).
 pub const V2_M_BASE: f64 = 0.025;
 /// Dimensionless slope on `(R_60 / R_ref - 1)+` for `m_risk` (`docs/odds-model-v2.md` §3).
 pub const V2_RISK_SLOPE: f64 = 0.005;
-/// Cap on `m_risk` so `m_eff = m_base + m_risk` stays in `[2.5%, 5.0%]`.
+/// Cap on `m_risk` added on top of each preset's `m_base` (`docs/odds-model-v2.md` §3.3).
 pub const V2_M_RISK_MAX: f64 = 0.025;
+/// Pooled dimensionless 2-Geom core weight across all 170 NVDA+TSLA news mins
+/// (`m1-tick-stats.txt` lines 84 & 212: `(0.8150 + 0.7712) / 2 = 0.793`).
+pub const V2_NEWS_MIX_WEIGHT: f64 = 0.793;
+/// Pooled dimensionless 2-Geom tail-to-core mean ratio `rho = m2 / m1` across all 170
+/// NVDA+TSLA news mins (`m1-tick-stats.txt` lines 84 & 212: `(2.664 + 2.171) / 2 = 2.42`).
+pub const V2_NEWS_TAIL_RATIO: f64 = 2.42;
+/// Lower clamp for causal trailing 60s move rate `q_60` in `News` (`docs/odds-model-v2.md` §3.4).
+pub const V2_NEWS_Q_MIN: f64 = 0.12;
+/// Upper clamp for causal trailing 60s move rate `q_60` in `News` (`3 * q_60 <= 1.0`).
+pub const V2_NEWS_Q_MAX: f64 = 1.0 / 3.0;
+/// Upper RMS clamp multiplier on `R_med_news` in `dynamic_news_preset` (`docs/odds-model-v2.md` §3.4).
+pub const V2_NEWS_R_CAP_MULT: f64 = 2.5;
 /// Minimum probability denominator clamp in `M_base = (1 - m_eff) / max(P, eps)`.
 pub const V2_P_EPSILON: f64 = 1e-6;
 /// Per-3-second-tick generator weight `3 s / 60 s = 0.05` for far-horizon Markov switching.
@@ -139,6 +151,9 @@ pub struct RegimePreset {
     pub p2: f64,
     /// Median minute-level `R_60` (cents/s) observed in this regime.
     pub rms_median_cents: f64,
+    /// Data-derived per-preset base uncertainty margin `max(0.025, Q_0.75(m_solv) + 0.020)`
+    /// (`docs/odds-model-v2.md` §3.3, derived from `logs/calibration/m2-server-logs/m2-summary.txt` §1).
+    pub m_base: f64,
 }
 
 /// Complete data-derived v2 parameters for one ticker.
@@ -151,7 +166,7 @@ pub struct TickerV2Params {
     pub rms_ref_cents: f64,
     /// Empirical `[p50, p85, p99]` minute `R_60` thresholds in cents/s.
     pub thresholds_rms_cents: [f64; 3],
-    /// Single-step shock guard `ceil(3 * p99)` in integer cents.
+    /// Single-step shock guard `ceil(4 * p99)` in integer cents (`docs/odds-model-v2.md` §3.4).
     pub shock_single_step_cents: i64,
     /// Ordered `[Quiet, Normal, Volatile, News]`.
     pub presets: [RegimePreset; 4],
@@ -159,22 +174,23 @@ pub struct TickerV2Params {
     pub transition_1min: [[f64; 4]; 4],
 }
 
-/// NVDA v2 parameters derived directly from `logs/calibration/m1-tick-stats.txt`:
-/// - `reference_price = 139.65` (line 6)
-/// - `thresholds_rms_cents = [1.162, 2.412, 8.390]` (line 57)
-/// - `shock_single_step_cents = ceil(3 * 8.390) = 26`
-/// - `Quiet`: lines 59-62 (`q=0.1426`, `Geom p=0.6517`, `med_rms=0.58c`)
-/// - `Normal`: lines 66-69 (`q=0.2602`, `Geom p=0.3767`, `med_rms=1.60c`)
-/// - `Volatile`: lines 73-76 (`q=0.3017`, `Geom p=0.1850`, `med_rms=3.36c`)
-/// - `News`: lines 80-84 (`q=0.2949`, `2-Geom w=0.8150, p1=0.0643, p2=0.0242`, `med_rms=11.79c`)
-/// - `transition_1min`: lines 88-91 (Normal diagonal rounded `+0.001` so every row sums to `1.0`).
+/// NVDA v2 parameters derived directly from `logs/calibration/m1-tick-stats.txt` and M2 accuracy
+/// (`logs/calibration/m2-server-logs/m2-summary.txt` §1):
+/// - `reference_price = 139.65` (`m1-tick-stats.txt` line 6)
+/// - `thresholds_rms_cents = [1.162, 2.412, 8.390]` (`m1-tick-stats.txt` line 57)
+/// - `shock_single_step_cents = ceil(4 * 8.390) = 34` (`docs/odds-model-v2.md` §3.4)
+/// - `Quiet`: `m1` lines 59-62 (`q=0.1426`, `Geom p=0.6517`, `med_rms=0.58c`); `m_base=0.025` (`m2-summary.txt` line 7, `Q_0.75=0.00%`)
+/// - `Normal`: `m1` lines 66-69 (`q=0.2602`, `Geom p=0.3767`, `med_rms=1.60c`); `m_base=0.098` (`m2-summary.txt` line 10, `7.82%+2.0%`)
+/// - `Volatile`: `m1` lines 73-76 (`q=0.3017`, `Geom p=0.1850`, `med_rms=3.36c`); `m_base=0.134` (`m2-summary.txt` line 13, `11.39%+2.0%`)
+/// - `News`: `m1` lines 80-84 (`q=0.2949`, `2-Geom w=0.8150, p1=0.0643, p2=0.0242`, `med_rms=11.79c`); `m_base=0.263` (`m2-summary.txt` line 16, `24.31%+2.0%`)
+/// - `transition_1min`: `m1` lines 88-91 (Normal diagonal rounded `+0.001` so every row sums to `1.0`).
 pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "NVDA",
     band_cents: 3,
     reference_price: 139.65,
     rms_ref_cents: 1.60,
     thresholds_rms_cents: [1.162, 2.412, 8.390],
-    shock_single_step_cents: 26,
+    shock_single_step_cents: 34,
     presets: [
         RegimePreset {
             q_1s: 0.1426,
@@ -183,6 +199,7 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.6517,
             p2: 0.6517,
             rms_median_cents: 0.58,
+            m_base: 0.025,
         },
         RegimePreset {
             q_1s: 0.2602,
@@ -191,6 +208,7 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.3767,
             p2: 0.3767,
             rms_median_cents: 1.60,
+            m_base: 0.098,
         },
         RegimePreset {
             q_1s: 0.3017,
@@ -199,6 +217,7 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.1850,
             p2: 0.1850,
             rms_median_cents: 3.36,
+            m_base: 0.134,
         },
         RegimePreset {
             q_1s: 0.2949,
@@ -207,6 +226,7 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.0643,
             p2: 0.0242,
             rms_median_cents: 11.79,
+            m_base: 0.263,
         },
     ],
     transition_1min: [
@@ -217,22 +237,23 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
     ],
 };
 
-/// TSLA v2 parameters derived directly from `logs/calibration/m1-tick-stats.txt`:
-/// - `reference_price = 363.97` (line 134)
-/// - `thresholds_rms_cents = [1.807, 4.359, 11.505]` (line 185)
-/// - `shock_single_step_cents = ceil(3 * 11.505) = 35`
-/// - `Quiet`: lines 187-190 (`q=0.1108`, `Geom p=0.4643`, `med_rms=0.63c`)
-/// - `Normal`: lines 194-197 (`q=0.2391`, `Geom p=0.2202`, `med_rms=2.77c`)
-/// - `Volatile`: lines 201-204 (`q=0.2900`, `Geom p=0.1183`, `med_rms=5.63c`)
-/// - `News`: lines 208-212 (`q=0.3027`, `2-Geom w=0.7712, p1=0.0645, p2=0.0297`, `med_rms=14.20c`)
-/// - `transition_1min`: lines 216-219 (Quiet diagonal rounded `+0.001` so every row sums to `1.0`).
+/// TSLA v2 parameters derived directly from `logs/calibration/m1-tick-stats.txt` and M2 accuracy
+/// (`logs/calibration/m2-server-logs/m2-summary.txt` §1):
+/// - `reference_price = 363.97` (`m1-tick-stats.txt` line 134)
+/// - `thresholds_rms_cents = [1.807, 4.359, 11.505]` (`m1-tick-stats.txt` line 185)
+/// - `shock_single_step_cents = ceil(4 * 11.505) = 46` (`docs/odds-model-v2.md` §3.4)
+/// - `Quiet`: `m1` lines 187-190 (`q=0.1108`, `Geom p=0.4643`, `med_rms=0.63c`); `m_base=0.025` (`m2-summary.txt` line 41, `0.42%+2.0% -> floor`)
+/// - `Normal`: `m1` lines 194-197 (`q=0.2391`, `Geom p=0.2202`, `med_rms=2.77c`); `m_base=0.073` (`m2-summary.txt` line 44, `5.28%+2.0%`)
+/// - `Volatile`: `m1` lines 201-204 (`q=0.2900`, `Geom p=0.1183`, `med_rms=5.63c`); `m_base=0.197` (`m2-summary.txt` line 47, `17.69%+2.0%`)
+/// - `News`: `m1` lines 208-212 (`q=0.3027`, `2-Geom w=0.7712, p1=0.0645, p2=0.0297`, `med_rms=14.20c`); `m_base=0.185` (`m2-summary.txt` line 50, `16.47%+2.0%`)
+/// - `transition_1min`: `m1` lines 216-219 (Quiet diagonal rounded `+0.001` so every row sums to `1.0`).
 pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "TSLA",
     band_cents: 8,
     reference_price: 363.97,
     rms_ref_cents: 2.77,
     thresholds_rms_cents: [1.807, 4.359, 11.505],
-    shock_single_step_cents: 35,
+    shock_single_step_cents: 46,
     presets: [
         RegimePreset {
             q_1s: 0.1108,
@@ -241,6 +262,7 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.4643,
             p2: 0.4643,
             rms_median_cents: 0.63,
+            m_base: 0.025,
         },
         RegimePreset {
             q_1s: 0.2391,
@@ -249,6 +271,7 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.2202,
             p2: 0.2202,
             rms_median_cents: 2.77,
+            m_base: 0.073,
         },
         RegimePreset {
             q_1s: 0.2900,
@@ -257,6 +280,7 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.1183,
             p2: 0.1183,
             rms_median_cents: 5.63,
+            m_base: 0.197,
         },
         RegimePreset {
             q_1s: 0.3027,
@@ -265,6 +289,7 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
             p1: 0.0645,
             p2: 0.0297,
             rms_median_cents: 14.20,
+            m_base: 0.185,
         },
     ],
     transition_1min: [
@@ -298,6 +323,7 @@ pub struct RegimeDetector {
     current_regime: Regime,
     downgrade_streak_secs: u64,
     last_r60: f64,
+    last_q60: f64,
 }
 
 impl Default for RegimeDetector {
@@ -316,6 +342,7 @@ impl RegimeDetector {
             current_regime: Regime::Normal,
             downgrade_streak_secs: 0,
             last_r60: 0.0,
+            last_q60: 0.0,
         }
     }
 
@@ -325,6 +352,11 @@ impl RegimeDetector {
 
     pub fn last_r60(&self) -> f64 {
         self.last_r60
+    }
+
+    /// Trailing 60-second causal 1-second move rate `q_60 = (# non-zero steps) / (# valid steps)`.
+    pub fn last_q60(&self) -> f64 {
+        self.last_q60
     }
 
     pub fn last_change_sec(&self) -> Option<u64> {
@@ -358,6 +390,7 @@ impl RegimeDetector {
             self.last_tick_ts_ms = Some(tick.ts_ms);
             self.last_price_cents = Some(curr_cents);
             self.last_r60 = params.rms_ref_cents;
+            self.last_q60 = params.presets[Regime::Normal.index()].q_1s;
             return;
         };
 
@@ -415,17 +448,20 @@ impl RegimeDetector {
 
         let n = self.steps.len();
         if n > 0 {
-            let sum_sq: f64 = self
-                .steps
-                .iter()
-                .map(|&(_, step_dc)| {
+            let mut sum_sq = 0.0_f64;
+            let mut nz_count = 0usize;
+            for &(_, step_dc) in &self.steps {
+                if step_dc != 0 {
+                    nz_count += 1;
                     let v = step_dc as f64;
-                    v * v
-                })
-                .sum();
+                    sum_sq += v * v;
+                }
+            }
             self.last_r60 = (sum_sq / n as f64).sqrt();
+            self.last_q60 = nz_count as f64 / n as f64;
         } else {
             self.last_r60 = params.rms_ref_cents;
+            self.last_q60 = params.presets[Regime::Normal.index()].q_1s;
         }
 
         // Single-print shock guard: promote straight to News on print 1.
@@ -485,11 +521,56 @@ fn lower_threshold(regime: Regime, thresholds: &[f64; 3]) -> f64 {
     }
 }
 
-/// Computes v2 effective margin `m_eff = m_base + m_risk` in `[2.5%, 5.0%]`.
-pub fn v2_m_eff(r60: f64, rms_ref: f64) -> f64 {
+/// Builds a causally scaled `News` preset from trailing `R_60` and `q_60` using the pooled
+/// dimensionless 2-Geom shape `(w = 0.793, rho = m2 / m1 = 2.42)` across all 170 NVDA+TSLA
+/// news minutes (`docs/odds-model-v2.md` §3.4).
+///
+/// Solves the exact second-moment equation `q_eff * E[K^2] = R_eff^2` for `m1 = 1 / p1`
+/// and `m2 = rho * m1 = 1 / p2`, with `q_eff = clamp(q_60, 0.12, 1/3)` and
+/// `R_eff = clamp(R_60, theta_p99, 2.5 * R_med_news)`.
+pub fn dynamic_news_preset(params: &TickerV2Params, r60: f64, q60: f64) -> RegimePreset {
+    let base_news = params.presets[Regime::News.index()];
+    let r_clean = if r60.is_finite() {
+        r60
+    } else {
+        base_news.rms_median_cents
+    };
+    let q_clean = if q60.is_finite() { q60 } else { base_news.q_1s };
+
+    let r_min = params.thresholds_rms_cents[2];
+    let r_max = (V2_NEWS_R_CAP_MULT * base_news.rms_median_cents).max(r_min);
+    let r_eff = r_clean.clamp(r_min, r_max);
+    let q_eff = q_clean.clamp(V2_NEWS_Q_MIN, V2_NEWS_Q_MAX);
+    let p_move = (ORACLE_CLOCK_SECS as f64 * q_eff).min(1.0);
+
+    let w = V2_NEWS_MIX_WEIGHT;
+    let rho = V2_NEWS_TAIL_RATIO;
+    let a = w + (1.0 - w) * rho * rho;
+    let b = w + (1.0 - w) * rho;
+    let e_k2 = (r_eff * r_eff) / q_eff;
+    let m1 = (b + (b * b + 8.0 * a * e_k2).sqrt()) / (4.0 * a);
+
+    let p1 = (1.0 / m1.max(1.0)).clamp(1e-4, 1.0 - 1e-6);
+    let p2 = (1.0 / (rho * m1).max(1.0)).clamp(1e-4, 1.0 - 1e-6);
+
+    RegimePreset {
+        q_1s: q_eff,
+        p_move,
+        mix_weight: w,
+        p1,
+        p2,
+        rms_median_cents: r_eff,
+        m_base: base_news.m_base,
+    }
+}
+
+/// Computes v2 effective margin `m_eff = m_base + m_risk`, where `m_base` is the preset's
+/// data-derived uncertainty margin (`docs/odds-model-v2.md` §3.3) and `m_risk in [0%, 2.5%]`
+/// is the QTAP volatility risk premium.
+pub fn v2_m_eff(r60: f64, rms_ref: f64, m_base: f64) -> f64 {
     let ratio_excess = (r60 / rms_ref.max(1e-6) - 1.0).max(0.0);
     let m_risk = (V2_RISK_SLOPE * ratio_excess).clamp(0.0, V2_M_RISK_MAX);
-    V2_M_BASE + m_risk
+    (m_base + m_risk).clamp(V2_M_BASE, 0.95)
 }
 
 /// Computes v2 cell multiplier directly from `P(c)` without any calibration layers.
@@ -836,6 +917,8 @@ fn step_above_general(src: &[f64], preset: &RegimePreset, dst: &mut [f64]) {
 ///   `T_step = 0.95 * I + 0.05 * T` starting after window 5.
 /// - `inferred_phase`: if `Some(phi)`, evaluates exact conditional probability at `phi`;
 ///   if `None`, averages uniformly over `phi in {0, 1, 2}`.
+/// - `news_override`: when currently in `Regime::News`, replaces `presets[News]` with the
+///   causally scaled `dynamic_news_preset(params, r60, q60)`.
 pub fn price_grid_v2(
     spot: f64,
     bands: &[PriceBand],
@@ -843,6 +926,7 @@ pub fn price_grid_v2(
     params: &TickerV2Params,
     regime: Regime,
     inferred_phase: Option<usize>,
+    news_override: Option<RegimePreset>,
 ) -> Vec<Vec<f64>> {
     let rows = bands.len();
     let w_count = windows.len();
@@ -875,6 +959,11 @@ pub fn price_grid_v2(
         }
     }
 
+    let mut presets = params.presets;
+    if let Some(np) = news_override {
+        presets[Regime::News.index()] = np;
+    }
+
     let phase_list: &[usize] = match inferred_phase {
         Some(0) => &[0],
         Some(1) => &[1],
@@ -883,7 +972,7 @@ pub fn price_grid_v2(
     };
     let phase_weight = 1.0 / phase_list.len() as f64;
     let r0 = regime.index();
-    let preset0 = &params.presets[r0];
+    let preset0 = &presets[r0];
 
     let mut u_cur = vec![0.0_f64; n];
     let mut u_next = vec![0.0_f64; n];
@@ -947,7 +1036,7 @@ pub fn price_grid_v2(
                 while cur_s + 1 < ws {
                     cur_s += 1;
                     if (cur_s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
-                        step_far_markov(&mut u_reg, &mut u_mix, &t_step, &params.presets);
+                        step_far_markov(&mut u_reg, &mut u_mix, &t_step, &presets);
                     }
                 }
                 let in_ticks = (ws..we)
@@ -969,7 +1058,7 @@ pub fn price_grid_v2(
                                 li,
                                 ui,
                                 in_ticks,
-                                &params.presets[r],
+                                &presets[r],
                                 &mut scratch,
                             );
                         }
@@ -980,7 +1069,7 @@ pub fn price_grid_v2(
                 while cur_s + 1 < we {
                     cur_s += 1;
                     if (cur_s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
-                        step_far_markov(&mut u_reg, &mut u_mix, &t_step, &params.presets);
+                        step_far_markov(&mut u_reg, &mut u_mix, &t_step, &presets);
                     }
                 }
             }
@@ -1095,7 +1184,7 @@ mod tests {
                 start_secs: ws,
                 end_secs: we,
             }];
-            let dp = price_grid_v2(spot, &bands, &windows, params, regime, ph)[0][0];
+            let dp = price_grid_v2(spot, &bands, &windows, params, regime, ph, None)[0][0];
             let mc = brute_force_mc_cell(
                 (spot * 100.0).round() as i64,
                 (lower * 100.0).round() as i64,
@@ -1147,8 +1236,10 @@ mod tests {
                 end_secs: ((w + 2) * 5) as u32,
             })
             .collect();
-        let blended = price_grid_v2(139.99, &bands, &windows, &NVDA_V2_PARAMS, Regime::Quiet, None);
-        let static_p = price_grid_v2(139.99, &bands, &windows, &stationary, Regime::Quiet, None);
+        let blended =
+            price_grid_v2(139.99, &bands, &windows, &NVDA_V2_PARAMS, Regime::Quiet, None, None);
+        let static_p =
+            price_grid_v2(139.99, &bands, &windows, &stationary, Regime::Quiet, None, None);
 
         // Windows 0-5 MUST be identical (pure current preset).
         for w in 0..NEAR_WINDOWS {
@@ -1194,7 +1285,7 @@ mod tests {
         assert_eq!(det.inferred_phase(46_000), None);
         assert_eq!(det.current_regime(), Regime::Quiet);
 
-        // Single-print shock > 26c promotes immediately to News on print 1
+        // Single-print shock > 34c (4 * p99) promotes immediately to News on print 1
         det.on_tick(PriceTick { ts_ms: 47_000, price: 141.40 }, &NVDA_V2_PARAMS);
         assert_eq!(det.current_regime(), Regime::News);
         assert_eq!(det.inferred_phase(47_000), Some(0));
@@ -1213,10 +1304,18 @@ mod tests {
         assert!(!cfg.calibration.factors.is_empty());
         assert_eq!(cfg.pricing.off_hours_m_base, Some(0.094));
 
-        let m_eff_quiet = v2_m_eff(0.58, NVDA_V2_PARAMS.rms_ref_cents);
+        let m_eff_quiet = v2_m_eff(
+            0.58,
+            NVDA_V2_PARAMS.rms_ref_cents,
+            NVDA_V2_PARAMS.presets[Regime::Quiet.index()].m_base,
+        );
         assert!((m_eff_quiet - 0.025).abs() < 1e-12);
-        let m_eff_news = v2_m_eff(20.0, NVDA_V2_PARAMS.rms_ref_cents);
-        assert!((m_eff_news - 0.050).abs() < 1e-12);
+        let m_eff_news = v2_m_eff(
+            20.0,
+            NVDA_V2_PARAMS.rms_ref_cents,
+            NVDA_V2_PARAMS.presets[Regime::News.index()].m_base,
+        );
+        assert!((m_eff_news - 0.288).abs() < 1e-12);
 
         // Exact (1 - m_eff) / P at P = 0.015 (fair = 65x): clamped by max_multiplier
         cfg.pricing.max_multiplier = 25.0;
@@ -1225,6 +1324,156 @@ mod tests {
         assert!((v2_price_multiplier(0.015, 0.025, 0.0, 1.0, &cfg) - 50.0).abs() < 1e-12);
         cfg.pricing.max_multiplier = 100.0;
         assert!((v2_price_multiplier(0.015, 0.025, 0.0, 1.0, &cfg) - 65.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dynamic_news_preset_matches_target_second_moment_and_cadence() {
+        // Border news minute (R_60 = 9.0c, q_60 = 0.295) vs shock burst (R_60 = 39.0c, q_60 = 0.15).
+        for (params, r60, q60, expected_r_eff, expected_q_eff) in [
+            (&NVDA_V2_PARAMS, 9.0_f64, 0.295_f64, 9.0_f64, 0.295_f64),
+            (&NVDA_V2_PARAMS, 5.0_f64, 0.05_f64, 8.390_f64, V2_NEWS_Q_MIN),
+            (
+                &NVDA_V2_PARAMS,
+                39.05_f64,
+                0.15_f64,
+                2.5 * 11.79_f64,
+                0.15_f64,
+            ),
+            (&TSLA_V2_PARAMS, 14.20_f64, 0.40_f64, 14.20_f64, V2_NEWS_Q_MAX),
+        ] {
+            let np = dynamic_news_preset(params, r60, q60);
+            assert!((np.rms_median_cents - expected_r_eff).abs() < 1e-9);
+            assert!((np.q_1s - expected_q_eff).abs() < 1e-9);
+            assert!((np.p_move - (3.0 * expected_q_eff).min(1.0)).abs() < 1e-9);
+            assert!((np.mix_weight - V2_NEWS_MIX_WEIGHT).abs() < 1e-12);
+            assert!((np.m_base - params.presets[Regime::News.index()].m_base).abs() < 1e-12);
+
+            // Verify exact 2-Geom second-moment match: q_eff * E[K^2] == R_eff^2.
+            let e_k2 = np.mix_weight * (2.0 - np.p1) / (np.p1 * np.p1)
+                + (1.0 - np.mix_weight) * (2.0 - np.p2) / (np.p2 * np.p2);
+            let implied_rms = (np.q_1s * e_k2).sqrt();
+            assert!(
+                (implied_rms - expected_r_eff).abs() < 1e-6,
+                "{}: implied_rms={implied_rms:.6} != expected={expected_r_eff:.6}",
+                params.ticker
+            );
+        }
+
+        // Border-regime dynamic news (R_eff=9c, q_eff=0.25) must raise d=0 w=0 touch prob
+        // relative to static News, and the DP lift must match an independent Monte Carlo
+        // simulation of the same model inputs (R_eff, q_eff, pooled 2-Geom shape).
+        let bands = vec![PriceBand {
+            row_index: 0,
+            lower: 139.98,
+            upper: 140.01,
+        }];
+        let windows = vec![TimeWindow {
+            start_secs: 5,
+            end_secs: 10,
+        }];
+        let p_static =
+            price_grid_v2(139.99, &bands, &windows, &NVDA_V2_PARAMS, Regime::News, None, None)[0][0];
+        let np_border = dynamic_news_preset(&NVDA_V2_PARAMS, 9.0, 0.25);
+        let p_dynamic = price_grid_v2(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_V2_PARAMS,
+            Regime::News,
+            None,
+            Some(np_border),
+        )[0][0];
+        assert!(
+            p_dynamic > p_static,
+            "border dynamic news d=0 prob {p_dynamic:.4} must exceed static {p_static:.4}"
+        );
+
+        let n_paths: usize = 100_000;
+        let mc_static = brute_force_mc_cell(
+            13_999,
+            13_998,
+            14_001,
+            &NVDA_V2_PARAMS.presets[Regime::News.index()],
+            5,
+            10,
+            None,
+            n_paths,
+            101,
+        );
+        let mc_dynamic = brute_force_mc_cell(
+            13_999,
+            13_998,
+            14_001,
+            &np_border,
+            5,
+            10,
+            None,
+            n_paths,
+            102,
+        );
+        // Tolerance is 4*SE of the difference between two independent binomial MC estimators
+        // (N = 100,000 each => SE_diff ~ 0.0022, 4*SE_diff ~ 0.0089, two-sided p < 6.4e-5).
+        let se_dyn = (p_dynamic * (1.0 - p_dynamic) / n_paths as f64).sqrt();
+        let se_stat = (p_static * (1.0 - p_static) / n_paths as f64).sqrt();
+        let se_diff = (se_dyn * se_dyn + se_stat * se_stat).sqrt();
+        let dp_lift = p_dynamic - p_static;
+        let expected_lift = mc_dynamic - mc_static;
+        assert!(
+            (p_dynamic - mc_dynamic).abs() <= 4.0 * se_dyn,
+            "dynamic news DP={p_dynamic:.5} vs MC={mc_dynamic:.5} (4*se={:.5})",
+            4.0 * se_dyn
+        );
+        assert!(
+            (dp_lift - expected_lift).abs() <= 4.0 * se_diff,
+            "border dynamic news lift DP={dp_lift:+.5} vs model-input MC={expected_lift:+.5} (4*se_diff={:.5})",
+            4.0 * se_diff
+        );
+    }
+
+    #[test]
+    fn shock_trigger_requires_4x_p99_and_tracks_q60() {
+        let mut det = RegimeDetector::new();
+        let mut price = 140.00_f64;
+        // 30s of calm tape with 6 moves (1 every 5s -> q_60 = 6/30 = 0.20)
+        for sec in 0..31u64 {
+            if sec > 0 && sec % 5 == 0 {
+                price += 0.01;
+            }
+            det.on_tick(PriceTick { ts_ms: sec * 1_000, price }, &NVDA_V2_PARAMS);
+        }
+        assert!((det.last_q60() - (6.0 / 30.0)).abs() < 1e-9);
+
+        // 30c print (above old 3*p99=26c, below new 4*p99=34c) must NOT force News.
+        price += 0.30;
+        det.on_tick(PriceTick { ts_ms: 31_000, price }, &NVDA_V2_PARAMS);
+        assert_ne!(det.current_regime(), Regime::News);
+
+        // 35c print (> 4*p99=34c) promotes immediately to News on print 1.
+        price += 0.35;
+        det.on_tick(PriceTick { ts_ms: 32_000, price }, &NVDA_V2_PARAMS);
+        assert_eq!(det.current_regime(), Regime::News);
+        assert!((det.last_q60() - (8.0 / 32.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_preset_m_base_plus_m_risk_matches_m3_derivation() {
+        let nvda_expected = [0.025_f64, 0.098, 0.134, 0.263];
+        let tsla_expected = [0.025_f64, 0.073, 0.197, 0.185];
+        for (idx, (&ne, &te)) in nvda_expected.iter().zip(tsla_expected.iter()).enumerate() {
+            assert!((NVDA_V2_PARAMS.presets[idx].m_base - ne).abs() < 1e-12);
+            assert!((TSLA_V2_PARAMS.presets[idx].m_base - te).abs() < 1e-12);
+            assert!(NVDA_V2_PARAMS.presets[idx].m_base >= V2_M_BASE);
+            assert!(TSLA_V2_PARAMS.presets[idx].m_base >= V2_M_BASE);
+        }
+        // Check m_eff = m_base + m_risk at median R_60 for NVDA Volatile and TSLA Normal.
+        let nvda_vol = NVDA_V2_PARAMS.presets[Regime::Volatile.index()];
+        let m_nvda_vol = v2_m_eff(nvda_vol.rms_median_cents, NVDA_V2_PARAMS.rms_ref_cents, nvda_vol.m_base);
+        let expected_risk = (V2_RISK_SLOPE * (3.36 / 1.60 - 1.0)).clamp(0.0, V2_M_RISK_MAX);
+        assert!((m_nvda_vol - (0.134 + expected_risk)).abs() < 1e-12);
+
+        let tsla_norm = TSLA_V2_PARAMS.presets[Regime::Normal.index()];
+        let m_tsla_norm = v2_m_eff(tsla_norm.rms_median_cents, TSLA_V2_PARAMS.rms_ref_cents, tsla_norm.m_base);
+        assert!((m_tsla_norm - 0.073).abs() < 1e-12);
     }
 
     #[test]

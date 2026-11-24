@@ -241,6 +241,53 @@ Under `M = clamp((1 - m_eff) / P, 1.05, M_max)`, a cell is **fairly priced** (un
 - **Liability bound:** With `$10` standard tap size, `pool_cap = $5,000`, and `risk_budget = $50,000`, max single-tap liability is `$250` (`5%` of `pool_cap`) at `25x`, **`$500` (`10%` of `pool_cap`, `1%` of `risk_budget`) at `50x`**, and `$1,000` (`20%` of `pool_cap`) at `100x`.
 - **Recommendation (`M_max = 50x`):** Raising `25x → 50x` brings playable inner-board (`d ≤ 4`) fair pricing to **`100.0%` on NVDA `normal`** and **`92.6%` on TSLA `normal`** (and `+10–12 pp` on full-board `normal`/`volatile`), while capping single-tap liability at `10%` of `pool_cap`. Going further to `100x` adds `< 4%` inner-board coverage in `normal` (`0%` on NVDA) while doubling max tail liability per tap and doubling `chase_far` shock exposure during regime transitions. All three caps (`25x`, `50x`, `100x`) are tested side-by-side in the M2 backtest.
 
+### 3.3 M3 Uncertainty Margin per Preset: $m_{\text{base}}(\text{preset})$ from Model Error
+
+In M2, using a flat $m_{\text{base}} = 2.5\%$ cut worst-policy deficits dramatically (`NVDA 6w`: `-5.90% → -1.35%`; `TSLA 6w`: `-11.20% → -1.62%`), and `quiet` was already solvent (`+0.12%` NVDA, `+1.89%` TSLA), but `normal`, `volatile`, and `news` still leaked on `d = 0` (`closest` / `row_sweep`) whenever the preset under-predicted $\hat{P} < P_{\text{real}}$. Rather than adding per-row or per-window correction tables, M3 derives **one scalar base margin $m_{\text{base}}(\text{preset})$ per preset per ticker** directly from that preset's measured 7-day prediction error in `logs/calibration/m2-server-logs/m2-summary.txt`, with QTAP $m_{\text{risk}} \in [0\%, 2.5\%]$ still added on top.
+
+#### Derivation
+For any uncapped cell ($\hat{P} \ge (1 - m_{\text{floor}}) / M_{\max} \approx 0.039$ at $M_{\max} = 25$), quoting $M = (1 - m) / \hat{P}$ yields expected payout ratio:
+$$\mathbb{E}\!\left[\frac{\text{payout}}{\text{stake}}\right] = (1 - m)\cdot\frac{P_{\text{real}}}{\hat{P}} = (1 - m)\,(1 + e_{+}), \qquad e_{+} = \max\!\left(0,\; \frac{P_{\text{real}} - \hat{P}}{\hat{P}}\right).$$
+Therefore, the exact **one-sided breakeven solvency margin** for a cell is:
+$$m_{\text{solv}}(\text{cell}) = \max\!\left(0,\; 1 - \frac{\hat{P}}{P_{\text{real}}}\right) = \frac{e_{+}}{1 + e_{+}}.$$
+*(One-sided $m_{\text{solv}}$ is strictly sharper than symmetric $|\hat{P} - P_{\text{real}}| / \hat{P}$: cells where $\hat{P} > P_{\text{real}}$ already earn positive edge, so charging margin for over-predicted outer bands would inflate average house edge unnecessarily.)*
+
+We weight uncapped 6-window near cells (`d = 0..5`) by QTAP tap-distance density $w_d = [0.35, 0.35, 0.15, 0.08, 0.04, 0.03]$ (matching where `closest`, `three_rows`, `row_sweep`, `long_bias`, `short_bias`, and `random_near` concentrate taps) and set:
+$$m_{\text{base}}(\text{preset}) = \max\!\Big(m_{\text{floor}},\; Q_{0.75}\!\big(m_{\text{solv}}\big) + m_{\text{target}}\Big), \qquad m_{\text{floor}} = 0.025,\; m_{\text{target}} = 0.020.$$
+
+**Justification for $q = 0.75$:**
+- $q = 0.50$ fails solvency whenever `d = 0` (`35%` tap mass) under-predicts while `d ≥ 1` over-predicts ($Q_{0.50}(m_{\text{solv}}) = 0\%$, leaving `row_sweep` at `-8.8%` to `-18.6%`).
+- $q = 0.90\text{–}1.00$ is dominated by thin outer-tail cells (`d = 3, 4` near the `25x` boundary), inflating `quiet` to `> 30%`.
+- **$q = 0.75$ (upper quartile)** satisfies $1 - q = 0.25 < w_0 = 0.35$, guaranteeing coverage of systematic `d = 0` price-row error (the most adversarial QTAP policy) while ignoring `< 25%`-weight outer-tail noise. Adding $m_{\text{target}} = 2.0\%$ targets the bottom of the owner's `2–5%` net edge band above model-error breakeven.
+
+#### Derived Per-Preset $m_{\text{base}}$ (from 7-day M2 accuracy tables, `m2-summary.txt` §1)
+
+| Ticker | Preset | $Q_{0.75}(\|e\|)$ (ref.) | $Q_{0.75}(m_{\text{solv}})$ | **$m_{\text{base}}(\text{preset})$** | $+ m_{\text{risk}}$ at median $R_{60}$ | Effective $m_{\text{eff}}$ |
+|---|---|---:|---:|---:|---:|---:|
+| **NVDA** | `quiet` | `8.50%` | `0.00%` | **`2.5%`** | `+0.0%` | `2.5%` |
+| **NVDA** | `normal` | `11.80%` | `7.82%` | **`9.8%`** | `+0.0%` | `9.8%` |
+| **NVDA** | `volatile` | `12.85%` | `11.39%` | **`13.4%`** | `+0.7%` | `14.1%` |
+| **NVDA** | `news` | `32.11%` | `24.31%` | **`26.3%`** | `+2.5%` | `28.8%` |
+| **TSLA** | `quiet` | `6.80%` | `0.42%` | **`2.5%`** | `+0.0%` | `2.5%` |
+| **TSLA** | `normal` | `5.58%` | `5.28%` | **`7.3%`** | `+0.0%` | `7.3%` |
+| **TSLA** | `volatile` | `22.27%` | `17.69%` | **`19.7%`** | `+0.6%` | `20.3%` |
+| **TSLA** | `news` | `19.72%` | `16.47%` | **`18.5%`** | `+2.5%` | `21.0%` |
+
+*(No per-row or per-window tables: one scalar per preset per ticker, derived mechanically from `m2-summary.txt` §1.)*
+
+### 3.4 M3 News Preset Model Improvement (Fixing the Root Cause)
+
+In M2, `news` under-predicted `d = 0` at `w = 0` by **`-16.4 pp`** on NVDA (`pred = 0.361` vs `hit = 0.525`, `n = 40`) while over-predicting `d = 5` by **`+10.7 pp`** — the signature of a preset that is **too diffusive** for most `news`-classified minutes. Four concrete model mechanisms explain this:
+
+1. **False single-print shock triggers:** In M2, `shock_single_step_cents = 3 · θ_p99` (`26c` NVDA / `35c` TSLA) promoted isolated normal/volatile spikes into `news` (`E[K] = 20.3c`, `RMS = 16.9c`) and 15 s hysteresis trapped them there. **Fix:** raise the single-print shock trigger to **`4 · θ_p99`** (`34c` NVDA, `46c` TSLA — still catches `13:55Z 44c`, `13:56Z 143c/96c`, and `14:30Z 118c/161c` on print 1).
+2. **Oracle cadence slows during real shocks:** In `m1-tick-stats.txt` lines 95–99, NVDA `13:56–14:00Z` had 1 s move rate **`q = 0.133–0.217`** (oracle pauses 4–7 s between huge jumps), NOT `q = 0.295`. Multiplying high `p_move = 0.885` by extreme `E[K] = 20.3c` over-diffused `w = 0` paths. **Fix:** in `news`, use the causal trailing 60 s move rate `q_60` clamped to `[0.12, 0.333]` so `p_move = min(1, 3 · q_60)` reflects slower shock-burst cadence.
+3. **Pooling NVDA and TSLA `news` minutes (`85` minutes each):**
+   - **Absolute bps scale is NOT poolable:** NVDA `news` (`E[K] = 14.6 bp = 6.78` bands, driven by the Nov-23 `+13.6%` earnings shock) is **`2.7×` larger** than TSLA `news` (`5.4 bp = 2.46` bands, mostly US-open bursts).
+   - **Dimensionless 2-Geom tail shape IS poolable:** NVDA (`w = 0.815, ρ = m_2/m_1 = 2.66, sd/mean = 1.16`) and TSLA (`w = 0.771, ρ = 2.17, sd/mean = 1.08`) share the same tail shape. Pooling all `170` combined `news` minutes (`3,029` non-zero moves) gives **`w = 0.793, ρ = 2.42`**.
+4. **Live second-moment scaling to causal `R_60`:** Instead of one static `E[K] = 20.3c` for every `news` minute (whether `R_60 = 9c` or `39c`), solve the exact 2-Geom second-moment equation $q_{60}\,\mathbb{E}[K^2] = R_{\text{eff}}^2$ with $R_{\text{eff}} = \operatorname{clamp}(R_{60},\, \theta_{p99},\, 2.5\, R_{\text{med,news}})$ and $A = w + (1-w)\rho^2 = 2.005$, $B = w + (1-w)\rho = 1.294$:
+   $$m_1 = \frac{B + \sqrt{B^2 + 8 A (R_{\text{eff}}^2 / q_{60})}}{4 A}, \qquad p_1 = \frac{1}{\max(1,\, m_1)}, \qquad p_2 = \frac{1}{\max(1,\, \rho\, m_1)}.$$
+   A border `news` minute (`R_60 = 9c`) gets `E[K] ≈ 11.2c` (fixing the `-16.4 pp` overshoot), while `13:56Z` (`R_60 = 39c → 29.5c`, `q_60 = 0.15`) gets `p_move = 0.45` with heavy shock tails — no extra tuned parameters.
+
 ---
 
 ## 4. Scenario Presets & Online Regime Detection
