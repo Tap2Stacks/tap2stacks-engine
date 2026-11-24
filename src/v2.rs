@@ -46,7 +46,7 @@ pub const V2_NEWS_R_CAP_MULT: f64 = 2.5;
 /// Minimum probability denominator clamp in `M_base = (1 - m_eff) / max(P, eps)`.
 pub const V2_P_EPSILON: f64 = 1e-6;
 /// PROVISIONAL Deribit order-book lead time `L` in seconds (`docs/odds-model-v2-coinbase-1s.md` §4).
-pub const DERIBIT_BOOK_LEAD_SECS: u64 = 2;
+pub const DERIBIT_BOOK_LEAD_SECS: u64 = 3;
 /// PROVISIONAL Deribit book-gap catch-up slope `beta` on `(mid_px - oracle_px)` (`docs/odds-model-v2-coinbase-1s.md` §4).
 pub const DERIBIT_BOOK_GAP_BETA: f64 = 1.0;
 /// PROVISIONAL Deribit NVDA symmetric book-gap clamp `|G|` in cents (`docs/odds-model-v2-coinbase-1s.md` §4).
@@ -175,7 +175,7 @@ pub struct TickerV2Params {
     pub clock_secs: u64,
     /// Source settlement void gap threshold in milliseconds.
     pub void_gap_ms: u64,
-    /// Order-book lead time `L` in seconds (Hyperliquid: `0`, Deribit: `2`).
+    /// Order-book lead time `L` in seconds (Hyperliquid: `0`, Deribit: `3`).
     pub book_lead_secs: u64,
     /// Book-gap catch-up slope `beta` on `(mid_px - oracle_px)` (Hyperliquid: `0.0`, Deribit: `1.0`).
     pub book_gap_beta: f64,
@@ -189,8 +189,12 @@ pub struct TickerV2Params {
     pub thresholds_rms_cents: [f64; 3],
     /// Single-step shock guard `ceil(4 * p99)` in integer cents (`docs/odds-model-v2.md` §3.4).
     pub shock_single_step_cents: i64,
-    /// Ordered `[Quiet, Normal, Volatile, News]`.
+    /// Ordered `[Quiet, Normal, Volatile, News]`. Drives regime detection, `m_base`,
+    /// `rms` medians, and pre-window evolution steps.
     pub presets: [RegimePreset; 4],
+    /// Optional separate step presets (`q_1s`, `p_move`, `mix_weight`, `p1`, `p2`) used
+    /// strictly INSIDE each window (`None` = use `presets`).
+    pub window_presets: Option<[RegimePreset; 4]>,
     /// Empirical 4x4 1-minute regime transition matrix `T[from][to]`, row-stochastic.
     pub transition_1min: [[f64; 4]; 4],
 }
@@ -256,6 +260,7 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
             m_base: 0.263,
         },
     ],
+    window_presets: None,
     transition_1min: [
         [0.816, 0.171, 0.013, 0.000],
         [0.252, 0.645, 0.102, 0.001],
@@ -325,6 +330,7 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
             m_base: 0.185,
         },
     ],
+    window_presets: None,
     transition_1min: [
         [0.825, 0.160, 0.015, 0.000],
         [0.236, 0.620, 0.140, 0.004],
@@ -334,7 +340,8 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
 };
 
 /// PROVISIONAL NVDA Deribit v2 parameters: copies Hyperliquid NVDA preset values
-/// (with `p_move = q_1s` for `clock_secs = 1`) until lead fits presets on recorded Deribit data.
+/// (with `p_move = q_1s` for `clock_secs = 1` and PROVISIONAL `window_presets = Some(presets)`)
+/// until lead fits presets on recorded Deribit data.
 pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "NVDA",
     band_cents: 3,
@@ -386,6 +393,44 @@ pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
             m_base: 0.263,
         },
     ],
+    window_presets: Some([
+        RegimePreset {
+            q_1s: 0.1426,
+            p_move: 0.1426,
+            mix_weight: 1.0,
+            p1: 0.6517,
+            p2: 0.6517,
+            rms_median_cents: 0.58,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2602,
+            p_move: 0.2602,
+            mix_weight: 1.0,
+            p1: 0.3767,
+            p2: 0.3767,
+            rms_median_cents: 1.60,
+            m_base: 0.098,
+        },
+        RegimePreset {
+            q_1s: 0.3017,
+            p_move: 0.3017,
+            mix_weight: 1.0,
+            p1: 0.1850,
+            p2: 0.1850,
+            rms_median_cents: 3.36,
+            m_base: 0.134,
+        },
+        RegimePreset {
+            q_1s: 0.2949,
+            p_move: 0.2949,
+            mix_weight: 0.8150,
+            p1: 0.0643,
+            p2: 0.0242,
+            rms_median_cents: 11.79,
+            m_base: 0.263,
+        },
+    ]),
     transition_1min: [
         [0.816, 0.171, 0.013, 0.000],
         [0.252, 0.645, 0.102, 0.001],
@@ -395,7 +440,8 @@ pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
 };
 
 /// PROVISIONAL TSLA Deribit v2 parameters: copies Hyperliquid TSLA preset values
-/// (with `p_move = q_1s` for `clock_secs = 1`) until lead fits presets on recorded Deribit data.
+/// (with `p_move = q_1s` for `clock_secs = 1` and PROVISIONAL `window_presets = Some(presets)`)
+/// until lead fits presets on recorded Deribit data.
 pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "TSLA",
     band_cents: 8,
@@ -447,6 +493,44 @@ pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
             m_base: 0.185,
         },
     ],
+    window_presets: Some([
+        RegimePreset {
+            q_1s: 0.1108,
+            p_move: 0.1108,
+            mix_weight: 1.0,
+            p1: 0.4643,
+            p2: 0.4643,
+            rms_median_cents: 0.63,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2391,
+            p_move: 0.2391,
+            mix_weight: 1.0,
+            p1: 0.2202,
+            p2: 0.2202,
+            rms_median_cents: 2.77,
+            m_base: 0.073,
+        },
+        RegimePreset {
+            q_1s: 0.2900,
+            p_move: 0.2900,
+            mix_weight: 1.0,
+            p1: 0.1183,
+            p2: 0.1183,
+            rms_median_cents: 5.63,
+            m_base: 0.197,
+        },
+        RegimePreset {
+            q_1s: 0.3027,
+            p_move: 0.3027,
+            mix_weight: 0.7712,
+            p1: 0.0645,
+            p2: 0.0297,
+            rms_median_cents: 14.20,
+            m_base: 0.185,
+        },
+    ]),
     transition_1min: [
         [0.825, 0.160, 0.015, 0.000],
         [0.236, 0.620, 0.140, 0.004],
@@ -486,7 +570,46 @@ pub struct TickerV2ParamsJson {
     pub thresholds_rms_cents: [f64; 3],
     pub shock_single_step_cents: i64,
     pub presets: [RegimePreset; 4],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_presets: Option<[RegimePreset; 4]>,
     pub transition_1min: [[f64; 4]; 4],
+}
+
+fn validate_preset_array(label: &str, presets: &[RegimePreset; 4]) -> Result<(), String> {
+    for (idx, preset) in presets.iter().enumerate() {
+        let name = Regime::from_index(idx).as_str();
+        for (field, val) in [
+            ("q_1s", preset.q_1s),
+            ("p_move", preset.p_move),
+            ("mix_weight", preset.mix_weight),
+        ] {
+            if !val.is_finite() || !(0.0..=1.0).contains(&val) {
+                return Err(format!(
+                    "v2 params validation error: {label}[{idx}] ({name}).{field} ({val}) must be in [0, 1]"
+                ));
+            }
+        }
+        for (field, val) in [("p1", preset.p1), ("p2", preset.p2)] {
+            if !val.is_finite() || val <= 0.0 || val > 1.0 {
+                return Err(format!(
+                    "v2 params validation error: {label}[{idx}] ({name}).{field} ({val}) must be in (0, 1]"
+                ));
+            }
+        }
+        if !preset.rms_median_cents.is_finite() || preset.rms_median_cents <= 0.0 {
+            return Err(format!(
+                "v2 params validation error: {label}[{idx}] ({name}).rms_median_cents ({}) must be finite and > 0",
+                preset.rms_median_cents
+            ));
+        }
+        if !preset.m_base.is_finite() || !(0.0..1.0).contains(&preset.m_base) {
+            return Err(format!(
+                "v2 params validation error: {label}[{idx}] ({name}).m_base ({}) must be in [0, 1)",
+                preset.m_base
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl TickerV2ParamsJson {
@@ -505,6 +628,7 @@ impl TickerV2ParamsJson {
             thresholds_rms_cents: params.thresholds_rms_cents,
             shock_single_step_cents: params.shock_single_step_cents,
             presets: params.presets,
+            window_presets: params.window_presets,
             transition_1min: params.transition_1min,
         }
     }
@@ -575,38 +699,9 @@ impl TickerV2ParamsJson {
             ));
         }
 
-        for (idx, preset) in self.presets.iter().enumerate() {
-            let name = Regime::from_index(idx).as_str();
-            for (field, val) in [
-                ("q_1s", preset.q_1s),
-                ("p_move", preset.p_move),
-                ("mix_weight", preset.mix_weight),
-            ] {
-                if !val.is_finite() || !(0.0..=1.0).contains(&val) {
-                    return Err(format!(
-                        "v2 params validation error: presets[{idx}] ({name}).{field} ({val}) must be in [0, 1]"
-                    ));
-                }
-            }
-            for (field, val) in [("p1", preset.p1), ("p2", preset.p2)] {
-                if !val.is_finite() || val <= 0.0 || val > 1.0 {
-                    return Err(format!(
-                        "v2 params validation error: presets[{idx}] ({name}).{field} ({val}) must be in (0, 1]"
-                    ));
-                }
-            }
-            if !preset.rms_median_cents.is_finite() || preset.rms_median_cents <= 0.0 {
-                return Err(format!(
-                    "v2 params validation error: presets[{idx}] ({name}).rms_median_cents ({}) must be finite and > 0",
-                    preset.rms_median_cents
-                ));
-            }
-            if !preset.m_base.is_finite() || !(0.0..1.0).contains(&preset.m_base) {
-                return Err(format!(
-                    "v2 params validation error: presets[{idx}] ({name}).m_base ({}) must be in [0, 1)",
-                    preset.m_base
-                ));
-            }
+        validate_preset_array("presets", &self.presets)?;
+        if let Some(ref window_presets) = self.window_presets {
+            validate_preset_array("window_presets", window_presets)?;
         }
 
         for (r, row) in self.transition_1min.iter().enumerate() {
@@ -646,6 +741,7 @@ impl TickerV2ParamsJson {
             thresholds_rms_cents: self.thresholds_rms_cents,
             shock_single_step_cents: self.shock_single_step_cents,
             presets: self.presets,
+            window_presets: self.window_presets,
             transition_1min: self.transition_1min,
         }))
     }
@@ -661,6 +757,23 @@ impl TickerV2Params {
     /// Formats this parameter table as a paste-ready Rust
     /// `pub const <TICKER>_DERIBIT_V2_PARAMS: TickerV2Params = ...;` block matching `src/v2.rs`.
     pub fn to_rust_deribit_const(&self) -> String {
+        fn push_presets(out: &mut String, presets: &[RegimePreset; 4]) {
+            for p in presets {
+                out.push_str("        RegimePreset {\n");
+                out.push_str(&format!("            q_1s: {:?},\n", p.q_1s));
+                out.push_str(&format!("            p_move: {:?},\n", p.p_move));
+                out.push_str(&format!("            mix_weight: {:?},\n", p.mix_weight));
+                out.push_str(&format!("            p1: {:?},\n", p.p1));
+                out.push_str(&format!("            p2: {:?},\n", p.p2));
+                out.push_str(&format!(
+                    "            rms_median_cents: {:?},\n",
+                    p.rms_median_cents
+                ));
+                out.push_str(&format!("            m_base: {:?},\n", p.m_base));
+                out.push_str("        },\n");
+            }
+        }
+
         let sym = normalize_v2_ticker(self.ticker);
         let mut out = String::new();
         out.push_str(&format!(
@@ -690,21 +803,18 @@ impl TickerV2Params {
             self.shock_single_step_cents
         ));
         out.push_str("    presets: [\n");
-        for p in &self.presets {
-            out.push_str("        RegimePreset {\n");
-            out.push_str(&format!("            q_1s: {:?},\n", p.q_1s));
-            out.push_str(&format!("            p_move: {:?},\n", p.p_move));
-            out.push_str(&format!("            mix_weight: {:?},\n", p.mix_weight));
-            out.push_str(&format!("            p1: {:?},\n", p.p1));
-            out.push_str(&format!("            p2: {:?},\n", p.p2));
-            out.push_str(&format!(
-                "            rms_median_cents: {:?},\n",
-                p.rms_median_cents
-            ));
-            out.push_str(&format!("            m_base: {:?},\n", p.m_base));
-            out.push_str("        },\n");
-        }
+        push_presets(&mut out, &self.presets);
         out.push_str("    ],\n");
+        match &self.window_presets {
+            Some(wp) => {
+                out.push_str("    window_presets: Some([\n");
+                push_presets(&mut out, wp);
+                out.push_str("    ]),\n");
+            }
+            None => {
+                out.push_str("    window_presets: None,\n");
+            }
+        }
         out.push_str("    transition_1min: [\n");
         for row in &self.transition_1min {
             out.push_str(&format!(
@@ -720,7 +830,7 @@ impl TickerV2Params {
     /// Compact one-line summary for offline tool startup logs.
     pub fn one_line_summary(&self) -> String {
         format!(
-            "ticker={} band_cents={} clock={}s void_gap={}ms book_lead={}s beta={:.3} clamp={}c book_max_age={}ms rms_ref={:.3}c thresh=[{:.3},{:.3},{:.3}] shock={}c m_base=[{:.3},{:.3},{:.3},{:.3}]",
+            "ticker={} band_cents={} clock={}s void_gap={}ms book_lead={}s beta={:.3} clamp={}c book_max_age={}ms rms_ref={:.3}c thresh=[{:.3},{:.3},{:.3}] shock={}c two_phase={} m_base=[{:.3},{:.3},{:.3},{:.3}]",
             self.ticker,
             self.band_cents,
             self.clock_secs,
@@ -734,6 +844,7 @@ impl TickerV2Params {
             self.thresholds_rms_cents[1],
             self.thresholds_rms_cents[2],
             self.shock_single_step_cents,
+            self.window_presets.is_some(),
             self.presets[0].m_base,
             self.presets[1].m_base,
             self.presets[2].m_base,
@@ -1503,8 +1614,10 @@ pub fn price_grid_v2_with_book(
     }
 
     let mut presets = params.presets;
+    let mut win_presets = params.window_presets.unwrap_or(params.presets);
     if let Some(np) = news_override {
         presets[Regime::News.index()] = np;
+        win_presets[Regime::News.index()] = np;
     }
 
     let phase_range = if clock <= 1 {
@@ -1517,6 +1630,7 @@ pub fn price_grid_v2_with_book(
     let phase_weight = 1.0 / phase_range.len() as f64;
     let r0 = regime.index();
     let preset0 = &presets[r0];
+    let win_preset0 = &win_presets[r0];
 
     let mut u_cur = vec![0.0_f64; n];
     let mut u_next = vec![0.0_f64; n];
@@ -1546,7 +1660,8 @@ pub fn price_grid_v2_with_book(
             let we = ws + duration;
 
             if w_idx < NEAR_WINDOWS {
-                // Near horizon (windows 0..5): pure current preset r0.
+                // Near horizon (windows 0..5): pure current preset r0 pre-window,
+                // then win_preset0 inside the window.
                 while cur_s + 1 < ws {
                     cur_s += 1;
                     if (cur_s + clock - ph) % clock == 0 {
@@ -1558,7 +1673,8 @@ pub fn price_grid_v2_with_book(
                     .filter(|&s| (s + clock - ph) % clock == 0)
                     .count();
                 for (row, &(li, ui)) in row_bounds.iter().enumerate() {
-                    let surv = window_survival_mass(&u_cur, li, ui, in_ticks, preset0, &mut scratch);
+                    let surv =
+                        window_survival_mass(&u_cur, li, ui, in_ticks, win_preset0, &mut scratch);
                     let hit = (1.0 - surv).clamp(0.0, 1.0);
                     probs[row][w_idx] += phase_weight * hit;
                 }
@@ -1570,7 +1686,8 @@ pub fn price_grid_v2_with_book(
                     }
                 }
             } else {
-                // Far horizon (windows 6..23): Markov-modulated 4-regime DP using T_step.
+                // Far horizon (windows 6..23): Markov-modulated 4-regime DP using T_step
+                // with `presets` up to each window start and `win_presets` inside each window.
                 if !far_initialized {
                     for slice in &mut u_reg {
                         slice.fill(0.0);
@@ -1603,7 +1720,7 @@ pub fn price_grid_v2_with_book(
                                 li,
                                 ui,
                                 in_ticks,
-                                &presets[r],
+                                &win_presets[r],
                                 &mut scratch,
                             );
                         }
@@ -2191,6 +2308,7 @@ mod tests {
             m_base: 0.025,
         };
         small_params.presets[Regime::Normal.index()] = test_preset;
+        small_params.window_presets = None;
 
         let bands = vec![PriceBand {
             row_index: 0,
@@ -2543,33 +2661,34 @@ mod tests {
             }
         );
 
-        // 4. Symmetric clamp: NVDA ±20c, TSLA ±40c.
+        // 4. Symmetric clamp: NVDA ±20c, TSLA ±40c, with provisional L = DERIBIT_BOOK_LEAD_SECS (3 s).
+        assert_eq!(DERIBIT_BOOK_LEAD_SECS, 3);
         assert_eq!(
             compute_book_lead(Some(140.50), Some(140.00), Some(0), &NVDA_DERIBIT_V2_PARAMS),
             BookLeadAdjustment {
                 gap_cents: 20,
-                lead_secs: 2,
+                lead_secs: DERIBIT_BOOK_LEAD_SECS,
             }
         );
         assert_eq!(
             compute_book_lead(Some(139.50), Some(140.00), Some(0), &NVDA_DERIBIT_V2_PARAMS),
             BookLeadAdjustment {
                 gap_cents: -20,
-                lead_secs: 2,
+                lead_secs: DERIBIT_BOOK_LEAD_SECS,
             }
         );
         assert_eq!(
             compute_book_lead(Some(365.00), Some(364.00), Some(0), &TSLA_DERIBIT_V2_PARAMS),
             BookLeadAdjustment {
                 gap_cents: 40,
-                lead_secs: 2,
+                lead_secs: DERIBIT_BOOK_LEAD_SECS,
             }
         );
         assert_eq!(
             compute_book_lead(Some(363.00), Some(364.00), Some(0), &TSLA_DERIBIT_V2_PARAMS),
             BookLeadAdjustment {
                 gap_cents: -40,
-                lead_secs: 2,
+                lead_secs: DERIBIT_BOOK_LEAD_SECS,
             }
         );
     }
@@ -2725,6 +2844,34 @@ mod tests {
         bad_clamp.book_gap_clamp_cents = -1;
         assert!(bad_clamp.validate().is_err());
 
+        // window_presets uses the exact same validation rules as presets.
+        let win_mutators: [fn(&mut [RegimePreset; 4]); 7] = [
+            |wp| wp[0].q_1s = -0.01,
+            |wp| wp[1].p_move = 1.05,
+            |wp| wp[2].mix_weight = 1.1,
+            |wp| wp[0].p1 = 0.0,
+            |wp| wp[3].p2 = 1.01,
+            |wp| wp[1].rms_median_cents = 0.0,
+            |wp| wp[2].m_base = 1.0,
+        ];
+        for mutator in win_mutators {
+            let mut c = base.clone();
+            let mut wp = c.presets;
+            mutator(&mut wp);
+            c.window_presets = Some(wp);
+            assert!(
+                c.validate().unwrap_err().contains("window_presets"),
+                "expected window_presets validation error"
+            );
+        }
+
+        // Wrong-length window_presets array in JSON fails deserialization.
+        let mut raw_val: serde_json::Value =
+            serde_json::to_value(&base).expect("serialize base to Value");
+        let short_wp = raw_val["presets"].as_array().unwrap()[..3].to_vec();
+        raw_val["window_presets"] = serde_json::Value::Array(short_wp);
+        assert!(parse_v2_params_json(&raw_val.to_string()).is_err());
+
         assert!(parse_v2_params_json("{not json").is_err());
     }
 
@@ -2780,6 +2927,8 @@ mod tests {
                 "    shock_single_step_cents: {},",
                 params.shock_single_step_cents
             )));
+            assert!(rendered.contains("    window_presets: Some([\n"));
+            assert!(rendered.contains("    ]),\n"));
             for preset in &params.presets {
                 assert!(rendered.contains(&format!("            q_1s: {:?},", preset.q_1s)));
                 assert!(rendered.contains(&format!("            p_move: {:?},", preset.p_move)));
@@ -2802,5 +2951,365 @@ mod tests {
                 )));
             }
         }
+
+        // Distinct window_presets values are emitted separately from presets, and None emits `window_presets: None,`.
+        let mut custom = NVDA_DERIBIT_V2_PARAMS;
+        let mut wp = custom.presets;
+        wp[Regime::Normal.index()].p1 = 0.5123;
+        wp[Regime::Normal.index()].p2 = 0.5123;
+        custom.window_presets = Some(wp);
+        let rendered_two_phase = custom.to_rust_deribit_const();
+        let (_, wp_section) = rendered_two_phase
+            .split_once("    window_presets: Some([\n")
+            .expect("expected window_presets: Some([ section");
+        assert!(wp_section.contains("            p1: 0.5123,"));
+        assert!(wp_section.contains("            p2: 0.5123,"));
+
+        let rendered_none = NVDA_V2_PARAMS.to_rust_deribit_const();
+        assert!(rendered_none.contains("    window_presets: None,\n"));
+        assert!(!rendered_none.contains("window_presets: Some"));
+    }
+
+    #[test]
+    fn two_phase_dp_window_presets_news_override_far_windows_and_json_round_trip() {
+        // 1. Compiled table invariants: HL has None; Deribit has provisional Some(presets) and L = 3.
+        assert!(NVDA_V2_PARAMS.window_presets.is_none());
+        assert!(TSLA_V2_PARAMS.window_presets.is_none());
+        assert_eq!(
+            NVDA_DERIBIT_V2_PARAMS.window_presets,
+            Some(NVDA_DERIBIT_V2_PARAMS.presets)
+        );
+        assert_eq!(
+            TSLA_DERIBIT_V2_PARAMS.window_presets,
+            Some(TSLA_DERIBIT_V2_PARAMS.presets)
+        );
+        assert_eq!(NVDA_DERIBIT_V2_PARAMS.book_lead_secs, 3);
+        assert_eq!(TSLA_DERIBIT_V2_PARAMS.book_lead_secs, 3);
+
+        let windows: Vec<TimeWindow> = (0..10)
+            .map(|i| TimeWindow {
+                start_secs: (5 + 5 * i) as u32,
+                end_secs: (10 + 5 * i) as u32,
+            })
+            .collect();
+        let bands: Vec<PriceBand> = (-4..=4_i64)
+            .enumerate()
+            .map(|(row_index, k)| PriceBand {
+                row_index,
+                lower: (13_998 + k * 3) as f64 / 100.0,
+                upper: (14_001 + k * 3) as f64 / 100.0,
+            })
+            .collect();
+        let adj = BookLeadAdjustment {
+            gap_cents: 4,
+            lead_secs: DERIBIT_BOOK_LEAD_SECS,
+        };
+
+        // 2. window_presets = Some(presets) is bit-identical to window_presets = None across all regimes,
+        //    near & far windows, and with/without news_override.
+        let mut drb_none = NVDA_DERIBIT_V2_PARAMS;
+        drb_none.window_presets = None;
+        let dyn_news = dynamic_news_preset(&NVDA_DERIBIT_V2_PARAMS, 12.0, 0.70);
+        for regime in Regime::ALL {
+            for news_ov in [None, Some(dyn_news)] {
+                let p_some = price_grid_v2_with_book(
+                    139.99,
+                    &bands,
+                    &windows,
+                    &NVDA_DERIBIT_V2_PARAMS,
+                    regime,
+                    Some(0),
+                    news_ov,
+                    adj,
+                );
+                let p_none = price_grid_v2_with_book(
+                    139.99,
+                    &bands,
+                    &windows,
+                    &drb_none,
+                    regime,
+                    Some(0),
+                    news_ov,
+                    adj,
+                );
+                assert_eq!(
+                    p_some, p_none,
+                    "window_presets == Some(presets) must be bit-identical to None for {regime:?}"
+                );
+            }
+        }
+
+        // 3. Two-phase process with book pre-window steps and smaller index in-window steps:
+        //    verify directional physics on near & far windows AND exact agreement with two-phase MC.
+        let book_pre = RegimePreset {
+            q_1s: 0.85,
+            p_move: 0.85,
+            mix_weight: 1.0,
+            p1: 0.25,
+            p2: 0.25,
+            rms_median_cents: 3.5,
+            m_base: 0.05,
+        };
+        let index_win = RegimePreset {
+            q_1s: 0.72,
+            p_move: 0.72,
+            mix_weight: 1.0,
+            p1: 0.42,
+            p2: 0.42,
+            rms_median_cents: 2.5,
+            m_base: 0.05,
+        };
+
+        let mut all_book = NVDA_DERIBIT_V2_PARAMS;
+        all_book.presets = [book_pre; 4];
+        all_book.window_presets = None;
+
+        let mut two_phase = all_book;
+        two_phase.window_presets = Some([index_win; 4]);
+
+        let mut all_index = NVDA_DERIBIT_V2_PARAMS;
+        all_index.presets = [index_win; 4];
+        all_index.window_presets = None;
+
+        let no_gap = BookLeadAdjustment {
+            gap_cents: 0,
+            lead_secs: DERIBIT_BOOK_LEAD_SECS,
+        };
+        let p_book = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &all_book,
+            Regime::Normal,
+            Some(0),
+            None,
+            no_gap,
+        );
+        let p_two = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &two_phase,
+            Regime::Normal,
+            Some(0),
+            None,
+            no_gap,
+        );
+        let p_idx = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &all_index,
+            Regime::Normal,
+            Some(0),
+            None,
+            no_gap,
+        );
+
+        let d0 = 4usize; // [139.98, 140.01] centered on 139.99
+        let d_far_up = 8usize; // +4 rows
+        let d_far_dn = 0usize; // -4 rows
+
+        for w in [0usize, 1, 5, 7, 9] {
+            // Smaller in-window steps (two_phase vs all_book, same pre-window) strictly lower far-row touch prob
+            // and concentrate probability on d0 relative to far rows (lower p(far)/p(d0)).
+            assert!(
+                p_two[d_far_up][w] < p_book[d_far_up][w],
+                "w={w}: smaller in-window steps must lower far-up prob ({:.5} vs {:.5})",
+                p_two[d_far_up][w],
+                p_book[d_far_up][w]
+            );
+            assert!(
+                p_two[d_far_dn][w] < p_book[d_far_dn][w],
+                "w={w}: smaller in-window steps must lower far-dn prob ({:.5} vs {:.5})",
+                p_two[d_far_dn][w],
+                p_book[d_far_dn][w]
+            );
+            assert!(
+                p_two[d_far_up][w] / p_two[d0][w] < p_book[d_far_up][w] / p_book[d0][w],
+                "w={w}: smaller in-window steps must reduce far/center ratio"
+            );
+            // Smaller pre-window steps (all_index vs two_phase, same in-window) raise price-row d0 prob.
+            assert!(
+                p_idx[d0][w] > p_two[d0][w],
+                "w={w}: smaller pre-window steps must raise d0 prob ({:.5} vs {:.5})",
+                p_idx[d0][w],
+                p_two[d0][w]
+            );
+        }
+        // Comparing all_index vs all_book on near windows: smaller steps lower far row and raise price row d0.
+        assert!(p_idx[d_far_up][0] < p_book[d_far_up][0]);
+        assert!(p_idx[d0][0] > p_book[d0][0]);
+
+        // Exact two-phase Monte Carlo verification on w0 (ws=5-3=2, we=7) and w1 (ws=10-3=7, we=12) with G=+4c.
+        let p_two_gap = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows[..2],
+            &two_phase,
+            Regime::Normal,
+            Some(0),
+            None,
+            adj,
+        );
+        let n_paths: usize = 60_000;
+        let mut rng = StdRng::seed_from_u64(2026_1125);
+        for (w_idx, ws, we) in [(0usize, 2usize, 7usize), (1usize, 7usize, 12usize)] {
+            for row in [d0, d_far_up] {
+                let lc = (bands[row].lower * 100.0).round() as i64;
+                let uc = (bands[row].upper * 100.0).round() as i64;
+                let mut hits = 0usize;
+                for _ in 0..n_paths {
+                    let mut c = 13_999 + adj.gap_cents;
+                    let mut hit = false;
+                    for s in 1..we {
+                        let prev = c;
+                        let step_preset = if s < ws { &book_pre } else { &index_win };
+                        if rng.random::<f64>() < step_preset.p_move {
+                            let k = sample_geom(step_preset.p1, &mut rng);
+                            if rng.random::<bool>() {
+                                c += k;
+                            } else {
+                                c -= k;
+                            }
+                        }
+                        if s >= ws && prev.min(c) <= uc && prev.max(c) >= lc {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if hit {
+                        hits += 1;
+                    }
+                }
+                let mc = hits as f64 / n_paths as f64;
+                let dp = p_two_gap[row][w_idx];
+                let se = (dp * (1.0 - dp) / n_paths as f64).sqrt().max(0.002);
+                assert!(
+                    (dp - mc).abs() <= 4.0 * se,
+                    "two-phase MC mismatch w={w_idx} row={row}: DP={dp:.5} MC={mc:.5} (4*se={:.5})",
+                    4.0 * se
+                );
+            }
+        }
+
+        // 4. news_override applies to BOTH phases (near Regime::News ignores window_presets[News]).
+        let mut news_split = NVDA_DERIBIT_V2_PARAMS;
+        let mut wp_news = news_split.presets;
+        wp_news[Regime::News.index()].p1 = 0.50;
+        wp_news[Regime::News.index()].p2 = 0.50;
+        wp_news[Regime::News.index()].mix_weight = 1.0;
+        news_split.window_presets = Some(wp_news);
+
+        let p_news_no_ov_base = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows[..NEAR_WINDOWS],
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::News,
+            Some(0),
+            None,
+            no_gap,
+        );
+        let p_news_no_ov_split = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows[..NEAR_WINDOWS],
+            &news_split,
+            Regime::News,
+            Some(0),
+            None,
+            no_gap,
+        );
+        assert_ne!(p_news_no_ov_base, p_news_no_ov_split);
+
+        let p_news_ov_base = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows[..NEAR_WINDOWS],
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::News,
+            Some(0),
+            Some(dyn_news),
+            no_gap,
+        );
+        let p_news_ov_split = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows[..NEAR_WINDOWS],
+            &news_split,
+            Regime::News,
+            Some(0),
+            Some(dyn_news),
+            no_gap,
+        );
+        assert_eq!(
+            p_news_ov_base, p_news_ov_split,
+            "news_override must override both pre-window and in-window News presets"
+        );
+
+        // 5. Far windows (Markov regime blend) use window_presets[r] for every active regime r.
+        let mut far_split = NVDA_DERIBIT_V2_PARAMS;
+        let mut wp_far = far_split.presets;
+        // Shrink only Normal's in-window steps, starting in Quiet so Normal only appears in far windows.
+        wp_far[Regime::Normal.index()].p1 = 0.80;
+        wp_far[Regime::Normal.index()].p2 = 0.80;
+        far_split.window_presets = Some(wp_far);
+
+        let p_far_base = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &NVDA_DERIBIT_V2_PARAMS,
+            Regime::Quiet,
+            Some(0),
+            None,
+            no_gap,
+        );
+        let p_far_split = price_grid_v2_with_book(
+            139.99,
+            &bands,
+            &windows,
+            &far_split,
+            Regime::Quiet,
+            Some(0),
+            None,
+            no_gap,
+        );
+        for w in 0..NEAR_WINDOWS {
+            for r in 0..bands.len() {
+                assert_eq!(p_far_base[r][w], p_far_split[r][w]);
+            }
+        }
+        assert!(
+            p_far_split[d_far_up][9] < p_far_base[d_far_up][9],
+            "far Markov window must reflect shrunken Normal window_presets"
+        );
+
+        // 6. JSON round trip WITH distinct window_presets and WITHOUT window_presets (absent / null -> None).
+        let json_with = two_phase.to_json_pretty().unwrap();
+        assert!(json_with.contains("\"window_presets\""));
+        let parsed_with = parse_v2_params_json(&json_with).unwrap();
+        assert_eq!(parsed_with.window_presets, two_phase.window_presets);
+        let loaded_with = parsed_with.leak_static();
+        assert_eq!(loaded_with, &two_phase);
+        assert_eq!(
+            price_grid_v2_with_book(139.99, &bands, &windows, loaded_with, Regime::Normal, Some(0), None, adj),
+            price_grid_v2_with_book(139.99, &bands, &windows, &two_phase, Regime::Normal, Some(0), None, adj)
+        );
+
+        // Absent field in JSON deserializes to None (and HL dump omits the field).
+        let json_without = all_book.to_json_pretty().unwrap();
+        assert!(!json_without.contains("\"window_presets\""));
+        let parsed_without = parse_v2_params_json(&json_without).unwrap();
+        assert!(parsed_without.window_presets.is_none());
+        let loaded_without = parsed_without.leak_static();
+        assert_eq!(loaded_without, &all_book);
+
+        // Explicit `"window_presets": null` also deserializes cleanly to None.
+        let mut val_null: serde_json::Value = serde_json::from_str(&json_without).unwrap();
+        val_null["window_presets"] = serde_json::Value::Null;
+        let parsed_null = parse_v2_params_json(&val_null.to_string()).unwrap();
+        assert!(parsed_null.window_presets.is_none());
     }
 }
