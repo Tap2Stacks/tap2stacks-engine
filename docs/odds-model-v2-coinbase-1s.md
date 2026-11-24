@@ -135,6 +135,25 @@ the mean |model − real| touch rate:
 
 L = 3 s also matches the regression above: β reaches about 1 at h = 3 s.
 
+Rechecked with the live settlement rule (closed rows, so a price on the shared edge
+touches both rows, as in `st-backend/src/libs/touch.ts` and the backtest):
+
+| Model | NVDA 3c | TSLA 8c |
+|---|---|---|
+| A | 1.90 pp, signed +1.39 | 2.69 pp, signed +0.86 |
+| B (L = 3) | 2.89 pp, signed +2.89 | 3.05 pp, signed +3.05 |
+| **C (L = 3, built: cb1af48)** | **0.85 pp, signed −0.44** | **1.10 pp, signed −0.55** |
+| D = C plus in-window sign persistence (p_same 0.556 / 0.602) | 0.73 pp, signed +0.03 | 1.08 pp, signed −0.04 |
+
+The largest remaining error is the price row in later windows, under-predicted by about
+1.5-3 points. On 6.5 h this is about one standard error, because the start times overlap.
+
+**Early backtest with C (6.5 h, in-sample margins, `logs/calibration/drb-runs/early-1124c`):**
+nothing passes yet. Averages at x25 are 13-22%, driven by capped far taps. `row_sweep` is
+−12 to −15%. One day gives each style about 120 sessions, and a session's taps move
+together, so per-style edges carry about ±10 points of noise. The verdict needs the 7-day
+recording, with margins set on the first days and tested on the later ones.
+
 The early backtest confirms the direction: with index steps (A), far rows were
 under-priced at x50/x100; with `X` steps (B), the average edge rose to 16-30%.
 
