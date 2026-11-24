@@ -18,6 +18,7 @@ use st_engine::price::{
 };
 use st_engine::protocol::{EngineIn, EngineOut};
 use st_engine::quote::{CellKey, QuoteEngine, SampleResult};
+use st_engine::v2::PricingModel;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at};
@@ -277,6 +278,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let quote_windows = quote_windows_from_env()?;
     let quote_windows_by_ticker = quote_windows_by_ticker_from_env(&tickers)?;
     let far_trigger_sigma = far_trigger_sigma_from_env();
+    let pricing_model = pricing_model_from_env()?;
+    let max_multiplier = max_multiplier_from_env()?;
 
     let clock = Arc::new(MonotonicWallClock::new());
     let hub = Arc::new(ClientHub::new());
@@ -344,6 +347,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             coin = %spec.coin,
             band_cents = spec.band_cents,
             quote_windows = ticker_quote_windows,
+            pricing_model = pricing_model.as_str(),
+            max_multiplier = ?max_multiplier,
             far_trigger_sigma,
             far_phase_ms,
             "spawning ticker task"
@@ -361,6 +366,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 quote_windows: ticker_quote_windows,
                 far_trigger_sigma,
                 far_phase_ms,
+                pricing_model,
+                max_multiplier,
             },
         ));
     }
@@ -445,6 +452,8 @@ struct TickerTaskInput {
     quote_windows: usize,
     far_trigger_sigma: f64,
     far_phase_ms: u64,
+    pricing_model: PricingModel,
+    max_multiplier: Option<f64>,
 }
 
 async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
@@ -459,6 +468,8 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         quote_windows,
         far_trigger_sigma,
         far_phase_ms,
+        pricing_model,
+        max_multiplier,
     } = input;
     let (price_runtime, _price_worker_handle) = spawn_price_pipeline(
         MAX_COMPLETED_BARS,
@@ -466,13 +477,20 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         TICK_CHANNEL_CAPACITY,
     );
     let mut grid_rx = price_runtime.grid_rx;
-    let mut quote_engine = if quote_windows == DEFAULT_WINDOWS {
+    let mut quote_engine = if quote_windows == DEFAULT_WINDOWS
+        && pricing_model == PricingModel::V1
+        && max_multiplier.is_none()
+    {
         QuoteEngine::new(spec.ticker.clone(), spec.band_cents)
     } else {
         let mut cfg = stock_grid_config_for_ticker(&spec.ticker, spec.band_cents, Vec::new());
         cfg.simulation.quote_window_count = quote_windows;
         cfg.simulation.far_trigger_sigma = far_trigger_sigma;
         cfg.simulation.far_phase_ms = far_phase_ms;
+        cfg.simulation.pricing_model = pricing_model;
+        if let Some(cap) = max_multiplier {
+            cfg.pricing.max_multiplier = cap;
+        }
         QuoteEngine::with_config(spec.ticker.clone(), spec.band_cents, cfg)
     };
     quote_engine.set_seed_variance_prior(seed_variance_prior);
@@ -506,6 +524,7 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
                 if !tick.price.is_finite() || tick.price <= 0.0 {
                     continue;
                 }
+                quote_engine.observe_tick(tick);
 
                 hub.publish(&EngineOut::Sample {
                     ticker: spec.ticker.clone(),
@@ -977,6 +996,37 @@ fn far_trigger_sigma_from_env() -> f64 {
     }
 }
 
+fn pricing_model_from_env() -> Result<PricingModel, Box<dyn Error + Send + Sync>> {
+    match env::var("ENGINE_PRICING_MODEL") {
+        Ok(raw) if !raw.trim().is_empty() => Ok(PricingModel::parse(&raw).ok_or_else(|| {
+            format!("invalid ENGINE_PRICING_MODEL '{raw}': expected v1 or v2")
+        })?),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(PricingModel::V1),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("ENGINE_PRICING_MODEL must be valid UTF-8".into())
+        }
+    }
+}
+
+fn parse_max_multiplier(raw: &str) -> Option<f64> {
+    raw.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 1.05)
+}
+
+fn max_multiplier_from_env() -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    match env::var("ENGINE_MAX_MULTIPLIER") {
+        Ok(raw) if !raw.trim().is_empty() => Ok(Some(parse_max_multiplier(&raw).ok_or_else(|| {
+            format!("invalid ENGINE_MAX_MULTIPLIER '{raw}': expected number >= 1.05")
+        })?)),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("ENGINE_MAX_MULTIPLIER must be valid UTF-8".into())
+        }
+    }
+}
+
 fn parse_tickers(raw: &str) -> Result<Vec<TickerSpec>, Box<dyn Error + Send + Sync>> {
     let mut specs = Vec::new();
     let mut seen_tickers = HashSet::new();
@@ -1149,5 +1199,18 @@ mod tests {
         assert_eq!(parse_trigger_sigma("-2"), None);
         assert_eq!(parse_trigger_sigma("NaN"), None);
         assert_eq!(parse_trigger_sigma("inf"), None);
+    }
+
+    #[test]
+    fn pricing_model_and_max_multiplier_parsers_validate_inputs() {
+        assert_eq!(PricingModel::parse("v1"), Some(PricingModel::V1));
+        assert_eq!(PricingModel::parse("V2"), Some(PricingModel::V2));
+        assert_eq!(PricingModel::parse("v3"), None);
+        assert_eq!(parse_max_multiplier("25"), Some(25.0));
+        assert_eq!(parse_max_multiplier(" 50.0 "), Some(50.0));
+        assert_eq!(parse_max_multiplier("100"), Some(100.0));
+        assert_eq!(parse_max_multiplier("1.04"), None);
+        assert_eq!(parse_max_multiplier("0"), None);
+        assert_eq!(parse_max_multiplier("NaN"), None);
     }
 }

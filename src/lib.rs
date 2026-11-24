@@ -8,3 +8,4 @@ pub mod protocol;
 pub mod quote;
 pub mod session;
 pub mod stress;
+pub mod v2;

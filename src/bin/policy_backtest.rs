@@ -19,6 +19,7 @@ use st_engine::stress::{
     normal_session_starts, parse_period, parse_utc, price_at_or_before, quoted_sigma_at,
     realized_step_sigma, stake_stats, tripwire_k, worst_edge_minute, worst_minute,
 };
+use st_engine::v2::{PricingModel, Regime};
 
 const STAKE: f64 = 10.0;
 const BURST_MS: u64 = 30_000;
@@ -61,6 +62,10 @@ struct Args {
     reprice_from: Option<u64>,
     reprice_to: Option<u64>,
     bench_only: bool,
+    model: PricingModel,
+    max_multiplier: Option<f64>,
+    v2_preset: Option<Regime>,
+    accuracy_table: bool,
 }
 
 fn parse_args() -> Args {
@@ -95,6 +100,10 @@ fn parse_args() -> Args {
         reprice_from: None,
         reprice_to: None,
         bench_only: false,
+        model: PricingModel::V1,
+        max_multiplier: None,
+        v2_preset: None,
+        accuracy_table: false,
     };
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -173,6 +182,21 @@ fn parse_args() -> Args {
                 args.reprice_to = Some(parse_utc(val).unwrap_or_else(|err| panic!("{err}")))
             }
             "--bench-only" => args.bench_only = val.parse().expect("bad --bench-only"),
+            "--model" => {
+                args.model = PricingModel::parse(val).expect("bad --model (expected v1 or v2)")
+            }
+            "--max-multiplier" => {
+                let cap: f64 = val.parse().expect("bad --max-multiplier");
+                assert!(cap.is_finite() && cap >= 1.05, "--max-multiplier must be >= 1.05");
+                args.max_multiplier = Some(cap);
+            }
+            "--v2-preset" => {
+                args.v2_preset =
+                    Some(Regime::parse(val).expect("bad --v2-preset (quiet|normal|volatile|news)"))
+            }
+            "--accuracy-table" => {
+                args.accuracy_table = val.parse().expect("bad --accuracy-table")
+            }
             _ => panic!("unknown arg {key}"),
         }
         i += 2;
@@ -230,6 +254,11 @@ fn apply(cfg: &mut GridConfig, args: &Args) {
     }
     if let Some(far_phase_ms) = args.far_phase_ms {
         cfg.simulation.far_phase_ms = far_phase_ms;
+    }
+    cfg.simulation.pricing_model = args.model;
+    cfg.simulation.v2_forced_regime = args.v2_preset;
+    if let Some(max_mult) = args.max_multiplier {
+        cfg.pricing.max_multiplier = max_mult;
     }
     if let Some(ref path) = args.factors_file {
         let text = fs::read_to_string(path)
@@ -698,6 +727,81 @@ fn precompute_legacy_board_starts(ticks: &[PriceTick], args: &Args) -> (Vec<Vec<
     (per_policy, all)
 }
 
+fn print_regime_policy_line(regime: Regime, name: &str, acc: &Acc) {
+    if acc.taps == 0 {
+        return;
+    }
+    let edge_pct = if acc.volume > 0.0 {
+        (acc.volume - acc.payout) / acc.volume * 100.0
+    } else {
+        0.0
+    };
+    let cap_pct = acc.cap25_taps as f64 / acc.taps as f64 * 100.0;
+    let avg_mult = acc.mult_sum / acc.taps as f64;
+    println!(
+        "REGIME_POLICY regime={} name={name} taps={} hits={} volume={:.2} payout={:.2} edge_pct={edge_pct:.2} cap_taps={} cap_pct={cap_pct:.2} avg_mult={avg_mult:.2}",
+        regime.as_str(),
+        acc.taps,
+        acc.hits,
+        acc.volume,
+        acc.payout,
+        acc.cap25_taps
+    );
+}
+
+fn print_accuracy_table(report: &CalibrationReport) {
+    // Accumulate non-warmup predicted vs realized touch by (regime, window_label, dist_bucket).
+    let mut stats: BTreeMap<(usize, &'static str, usize), (usize, f64, usize)> = BTreeMap::new();
+    for sample in &report.samples {
+        if sample.is_warmup {
+            continue;
+        }
+        let Some(regime) = sample.regime else {
+            continue;
+        };
+        let dist = sample.dist_bucket.min(5);
+        let r_idx = regime.index();
+        let hit_u = usize::from(sample.hit);
+
+        let band_label = if sample.window_index < NEAR_WINDOWS {
+            "near"
+        } else {
+            "far"
+        };
+        let entry = stats.entry((r_idx, band_label, dist)).or_insert((0, 0.0, 0));
+        entry.0 += 1;
+        entry.1 += sample.predicted;
+        entry.2 += hit_u;
+
+        let exact_label = match sample.window_index {
+            0 => Some("w0"),
+            2 => Some("w2"),
+            5 => Some("w5"),
+            11 => Some("w11"),
+            23 => Some("w23"),
+            _ => None,
+        };
+        if let Some(wl) = exact_label {
+            let e2 = stats.entry((r_idx, wl, dist)).or_insert((0, 0.0, 0));
+            e2.0 += 1;
+            e2.1 += sample.predicted;
+            e2.2 += hit_u;
+        }
+    }
+    for ((r_idx, wl, dist), (n, pred_sum, hits)) in stats {
+        if n == 0 {
+            continue;
+        }
+        let pred = pred_sum / n as f64;
+        let hit = hits as f64 / n as f64;
+        let err_pp = (pred - hit) * 100.0;
+        println!(
+            "ACCURACY_REGIME regime={} w={wl} dist={dist} n={n} pred={pred:.4} hit={hit:.4} err_pp={err_pp:+.2}",
+            Regime::from_index(r_idx).as_str()
+        );
+    }
+}
+
 fn run_legacy_board(
     args: &Args,
     cfg: &GridConfig,
@@ -712,6 +816,13 @@ fn run_legacy_board(
     let max_m = cfg.pricing.max_multiplier;
     let mut by_quote = taps.to_vec();
     by_quote.sort_by_key(|tap| (tap.quote_ts_ms, tap.window_index, tap.dist));
+
+    let mut quote_regime: HashMap<u64, Regime> = HashMap::new();
+    for sample in &report.samples {
+        if let Some(regime) = sample.regime {
+            quote_regime.entry(sample.quote_ts_ms).or_insert(regime);
+        }
+    }
 
     print_board_cap25(&by_quote, max_m);
 
@@ -730,6 +841,7 @@ fn run_legacy_board(
         let mut all_acc = Acc::default();
         let mut near_acc = Acc::default();
         let mut far_acc = Acc::default();
+        let mut by_regime: [Acc; 4] = Default::default();
 
         let starts = &per_policy_starts[policy_index];
         for &start in starts {
@@ -754,6 +866,9 @@ fn run_legacy_board(
                     add_fill(&mut near_acc, &tap, max_m, tap.quote_ts_ms);
                 } else {
                     add_fill(&mut far_acc, &tap, max_m, tap.quote_ts_ms);
+                }
+                if let Some(&regime) = quote_regime.get(&tap.quote_ts_ms) {
+                    add_fill(&mut by_regime[regime.index()], &tap, max_m, tap.quote_ts_ms);
                 }
                 add_fill(
                     &mut window_bands[window_band_index(tap.window_index)],
@@ -795,6 +910,9 @@ fn run_legacy_board(
         print_horizon_policy_line(policy, "all", &all_acc);
         print_horizon_policy_line(policy, "near", &near_acc);
         print_horizon_policy_line(policy, "far", &far_acc);
+        for regime in Regime::ALL {
+            print_regime_policy_line(regime, policy, &by_regime[regime.index()]);
+        }
         if *policy == "random_near" {
             for (dist, (vol, pay, n)) in by_dist.iter().enumerate() {
                 if *n == 0 {
@@ -1335,11 +1453,16 @@ fn main() {
     let report = run_calibration(&ticks, &opts);
     let taps = build_taps(&report, &ticks);
     println!(
-        "ticker={ticker} band={} windows={} cur_shift={cur_shift} adj_shift={adj_shift} samples={}",
+        "ticker={ticker} model={} band={} windows={} max_mult={:.1} cur_shift={cur_shift} adj_shift={adj_shift} samples={}",
+        cfg.simulation.pricing_model.as_str(),
         args.band_cents,
         cfg.simulation.quote_window_count,
+        cfg.pricing.max_multiplier,
         taps.len()
     );
+    if args.accuracy_table {
+        print_accuracy_table(&report);
+    }
     if is_event {
         let quotes = quotes_from(&report);
         run_event(

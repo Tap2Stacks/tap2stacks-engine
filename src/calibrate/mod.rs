@@ -7,6 +7,7 @@ use crate::grid::GridConfig;
 use crate::horizon::{RepriceStats, row_dist_bucket};
 use crate::price::{PriceCache, PriceTick};
 use crate::quote::{QuoteEngine, StockCell};
+use crate::v2::{Regime, RegimeDetector, TickerV2Params, v2_ticker_params};
 
 use eval::{VOID_GAP_MS, collect_gaps_over_3s, window_hit_bands, window_is_void};
 pub use stats::{
@@ -73,6 +74,7 @@ pub struct CalibrationSample {
     pub spot: f64,
     pub sigma: f64,
     pub sigma_raw: f64,
+    pub regime: Option<Regime>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -191,6 +193,7 @@ pub fn run_calibration(ticks: &[PriceTick], opts: &CalibrateOptions) -> Calibrat
 struct EngineReplayState {
     cache: PriceCache,
     engine: QuoteEngine,
+    causal_detector: Option<(RegimeDetector, &'static TickerV2Params)>,
     feed_start_ms: u64,
     last_tick: Option<PriceTick>,
     last_quoted_tick_ts: Option<u64>,
@@ -205,6 +208,8 @@ impl EngineReplayState {
                 opts.band_cents,
                 opts.base_config.clone(),
             ),
+            causal_detector: v2_ticker_params(&opts.ticker)
+                .map(|params| (RegimeDetector::new(), params)),
             feed_start_ms: first_ts,
             last_tick: None,
             last_quoted_tick_ts: None,
@@ -230,11 +235,17 @@ impl EngineReplayState {
                         opts.band_cents,
                         opts.base_config.clone(),
                     );
+                    self.causal_detector = v2_ticker_params(&opts.ticker)
+                        .map(|params| (RegimeDetector::new(), params));
                     self.feed_start_ms = tick.ts_ms;
                     self.last_quoted_tick_ts = None;
                 }
             }
             let _ = self.cache.apply_tick(tick);
+            self.engine.observe_tick(tick);
+            if let Some((ref mut detector, params)) = self.causal_detector {
+                detector.on_tick(tick, params);
+            }
             self.last_tick = Some(tick);
             if opts.reprice_every_tick
                 && opts.reprice_from_ms.is_none_or(|from| tick.ts_ms >= from)
@@ -279,6 +290,10 @@ fn evaluate_window(
     let volatility = state.engine.volatility();
     let sigma = volatility.map(|snap| snap.sigma).unwrap_or(0.0);
     let sigma_raw = volatility.map(|snap| snap.sigma_raw).unwrap_or(0.0);
+    let regime = state
+        .causal_detector
+        .as_ref()
+        .map(|(detector, _)| detector.current_regime());
     let spot_cents = (quote.spot * 100.0).round() as i64;
     let dist_max = opts.base_config.pricing.calibration_dist_max;
 
@@ -324,6 +339,7 @@ fn evaluate_window(
                 spot: quote.spot,
                 sigma,
                 sigma_raw,
+                regime,
             });
         }
         return true;
@@ -385,6 +401,7 @@ fn evaluate_window(
                 spot: quote.spot,
                 sigma,
                 sigma_raw,
+                regime,
             });
         }
     }

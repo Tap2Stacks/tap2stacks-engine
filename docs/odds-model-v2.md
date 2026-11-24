@@ -1,7 +1,16 @@
 # Odds Model v2 — Mathematical Specification
 
-**Status:** Maths-only proposal (no Rust changes). Prepared for review with the owner before implementation.  
+**Status:** Implemented as opt-in config (`PricingModel::V2` in `src/v2.rs`, `ENGINE_PRICING_MODEL=v2`, `ENGINE_MAX_MULTIPLIER`). Model v1 (`PricingModel::V1`, 6 windows, `25x` cap) remains the default until the owner approves v2 after reviewing the M2 validation run.  
 **References:** QTAP paper (`3_proposed.tex`, `4_experimental.tex`), current engine spec (`MATH_MODEL.md`), empirical dataset `logs/calibration/m1-tick-stats.txt` (7 recorded days, `2026-11-17` through `2026-11-23`, Hyperliquid `xyz:NVDA` and `xyz:TSLA`).
+
+## the owner's Design Decisions (Locked for M2)
+
+1. **Multiplier cap (`M_max`) — raise the cap, configurable, derived below (`50x` recommended; `25x / 50x / 100x` compared in M2 backtest):** Derived in §3.2 from playable inner-board fair-pricing coverage (`≥ 92%` in `normal`, `100%` in `volatile`/`news`) bounded by `10%` of `pool_cap` (`$500` max liability per `$10` tap).
+2. **Oracle clock phase (`φ`) — infer causally from last observed price change:** Use `φ = ((t_last mod 3) + 3 - (t_now mod 3)) mod 3` whenever a non-zero price change was observed within the last `60 s` without an intervening `> 3 s` feed gap; otherwise fall back to the uniform average over `φ ∈ {0, 1, 2}` (restart, cold start, or post-gap).
+3. **Direction symmetry — symmetric `±1` steps first:** Keep `P(+K) = P(-K) = 0.5`; evaluate the `momentum` policy on the 7-day backtest before considering any sign-persistence parameter.
+4. **Regime switching — far windows (`6–23`) only:** Windows `0–5` (`5–35 s`) evolve strictly in the current detected preset `r_0`; windows `6–23` (`35–125 s`) evolve under the measured 1-minute regime transition matrix `T` via per-3-second-tick generator `T_step = 0.95 I + 0.05 T`.
+5. **Exact 1-D DP (`O(S)` Geometric IIR):** Implemented directly in `src/v2.rs` (`half_width = 450` cents, `901` states, exact 1-tick & 2-tick print-crossing survival, `< 0.6 ms` per 24-window quote, zero MC noise).
+6. **Ticker coverage:** `NVDA` and `TSLA` have data-derived presets from `logs/calibration/m1-tick-stats.txt`; `AAPL` and `SP500` have `0` recorded ticks today and automatically remain on model v1 until sufficient data accrues.
 
 ---
 
@@ -214,6 +223,24 @@ $$m_{\text{eff}} = m_{\text{base}} + m_{\text{risk}}, \qquad m_{\text{risk}} = \
 - **$c_r = 0.005$, $m_{\text{risk,max}} = 0.025$** — dimensionless volatility risk premium, keeping $m_{\text{eff}} \in [2.5\%, 5.0\%]$. *(Fixes a unit bug in v1 `src/grid/pricing.rs:20`, where `a_sigma * sigma * (sigma/sigma_ref - 1)` multiplied by `sigma ≈ 2e-4`, collapsing `m_risk` to `~0.01%` even in extreme shocks.)*
 - **Price-level scaling $f(P)$:** Because v2 simulates directly in integer cents matching the fixed cent band width $B$, price-level geometry is exact at the calibration price. If a ticker's spot price $P$ drifts materially from its preset reference $P_{\text{ref}}$ (e.g. `|P / P_ref - 1| > 15%`), scale the jump-size mean linearly with $P / P_{\text{ref}}$ (`p_g' = 1 / (1 + (1/p_g - 1) · P / P_ref)`) rather than applying an ad-hoc `sigma_scale`.
 
+### 3.2 Multiplier Cap Derivation (`25x` vs `50x` vs `100x`)
+
+Under `M = clamp((1 - m_eff) / P, 1.05, M_max)`, a cell is **fairly priced** (uncapped) iff `P >= (1 - m_eff) / M_max`. Evaluating the exact v2 DP across the 20-row × 6-window visible board and the playable inner 9 rows (`d ≤ 4`, where `closest`, `three_rows`, `row_sweep`, `long_bias`, `short_bias`, and ~75% of `random_near` tap):
+
+| Ticker & Regime | 20-Row Fair Share (`25x / 50x / 100x`) | Inner `d ≤ 4` Fair Share (`25x / 50x / 100x`) |
+|---|---:|---:|
+| NVDA `quiet` (3c) | `25.8% / 29.2% / 32.5%` | `57.4% / 64.8% / 72.2%` |
+| NVDA `normal` (3c) | `52.5% / 62.5% / 70.8%` | `96.3% / 100.0% / 100.0%` |
+| NVDA `volatile` (3c) | `95.8% / 99.2% / 100.0%` | `100.0% / 100.0% / 100.0%` |
+| NVDA `news` (3c) | `100.0% / 100.0% / 100.0%` | `100.0% / 100.0% / 100.0%` |
+| TSLA `quiet` (8c) | `15.0% / 15.0% / 18.3%` | `33.3% / 33.3% / 40.7%` |
+| TSLA `normal` (8c) | `36.7% / 43.3% / 48.3%` | `81.5% / 92.6% / 96.3%` |
+| TSLA `volatile` (8c) | `66.7% / 78.3% / 86.7%` | `100.0% / 100.0% / 100.0%` |
+| TSLA `news` (8c) | `100.0% / 100.0% / 100.0%` | `100.0% / 100.0% / 100.0%` |
+
+- **Liability bound:** With `$10` standard tap size, `pool_cap = $5,000`, and `risk_budget = $50,000`, max single-tap liability is `$250` (`5%` of `pool_cap`) at `25x`, **`$500` (`10%` of `pool_cap`, `1%` of `risk_budget`) at `50x`**, and `$1,000` (`20%` of `pool_cap`) at `100x`.
+- **Recommendation (`M_max = 50x`):** Raising `25x → 50x` brings playable inner-board (`d ≤ 4`) fair pricing to **`100.0%` on NVDA `normal`** and **`92.6%` on TSLA `normal`** (and `+10–12 pp` on full-board `normal`/`volatile`), while capping single-tap liability at `10%` of `pool_cap`. Going further to `100x` adds `< 4%` inner-board coverage in `normal` (`0%` on NVDA) while doubling max tail liability per tap and doubling `chase_far` shock exposure during regime transitions. All three caps (`25x`, `50x`, `100x`) are tested side-by-side in the M2 backtest.
+
 ---
 
 ## 4. Scenario Presets & Online Regime Detection
@@ -231,9 +258,13 @@ Across the `8,491` valid minutes of 7-day data, the minute-level realized 1-seco
 
 *(For new tickers like `AAPL` and `SP500` once `/opt/.../hl-ticks-extra` accrues ≥3 days, compute their exact `p50 / p85 / p99` `R_60` cutoffs and MLE preset parameters from their own ticks using the identical formula.)*
 
-### 4.2 Full Data-Derived Preset Parameter Tables
+### 4.2 Full Data-Derived Preset Parameter Tables (with Provenance)
 
-Every parameter below is the direct MLE on that regime's 1-second tape (`logs/calibration/m1-tick-stats.txt`), with $R_{\text{ref}} = \text{median } R_{60}$ of `normal` (`1.60c` NVDA, `2.77c` TSLA):
+Every parameter below is a direct MLE from `logs/calibration/m1-tick-stats.txt` (no manual tuning), with $R_{\text{ref}} = \text{median } R_{60}$ of `normal` (`1.60c` NVDA, `2.77c` TSLA):
+
+- **NVDA provenance (`logs/calibration/m1-tick-stats.txt`):** `P_ref = $139.65` (line 6), `thresholds = [1.162, 2.412, 8.390]` (line 57), `shock_single_step = ceil(3 × 8.390) = 26c`, `quiet` (lines 59–62), `normal` (lines 66–69), `volatile` (lines 73–76), `news` (lines 80–84), `transition_1min` (lines 88–91, Normal diagonal `+0.001` so every row sums to `1.000`).
+- **TSLA provenance (`logs/calibration/m1-tick-stats.txt`):** `P_ref = $363.97` (line 134), `thresholds = [1.807, 4.359, 11.505]` (line 185), `shock_single_step = ceil(3 × 11.505) = 35c`, `quiet` (lines 187–190), `normal` (lines 194–197), `volatile` (lines 201–204), `news` (lines 208–212), `transition_1min` (lines 216–219, Quiet diagonal `+0.001` so every row sums to `1.000`).
+- **AAPL / SP500:** `0` recorded ticks in the 7-day dataset; `v2_ticker_params` returns `None` and both tickers remain on v1 until ≥3 days accrue in `hl-ticks-extra`.
 
 #### NVDA (`B = 3c`, `P_ref = $140`, `R_ref = 1.60c`)
 

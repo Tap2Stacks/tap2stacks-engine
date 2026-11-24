@@ -8,6 +8,7 @@ use st_engine::horizon::{DEFAULT_TRIGGER_SIGMA, FAR_REFRESH_MS, stagger_phase_ms
 use st_engine::price::{PriceCache, PriceTick, read_hl_jsonl};
 use st_engine::quote::QuoteEngine;
 use st_engine::stress::parse_utc;
+use st_engine::v2::PricingModel;
 
 const MAX_COMPLETED_BARS: usize = 600;
 const GRID_LOOKBACK_BARS: usize = 180;
@@ -30,6 +31,8 @@ struct Args {
     far_refresh_ms: u64,
     stagger: bool,
     seed: u64,
+    model: PricingModel,
+    max_multiplier: Option<f64>,
 }
 
 fn parse_args() -> Args {
@@ -42,6 +45,8 @@ fn parse_args() -> Args {
     let mut far_refresh_ms = FAR_REFRESH_MS;
     let mut stagger = true;
     let mut seed = 42u64;
+    let mut model = PricingModel::V1;
+    let mut max_multiplier: Option<f64> = None;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0usize;
@@ -60,13 +65,17 @@ fn parse_args() -> Args {
             "--far-refresh-ms" => far_refresh_ms = val.parse().expect("bad --far-refresh-ms"),
             "--stagger" => stagger = val.parse().expect("bad --stagger"),
             "--seed" => seed = val.parse().expect("bad --seed"),
+            "--model" => model = PricingModel::parse(val).expect("bad --model (expected v1 or v2)"),
+            "--max-multiplier" => {
+                max_multiplier = Some(val.parse().expect("bad --max-multiplier"))
+            }
             _ => panic!("unknown arg {key}"),
         }
         i += 2;
     }
     if file.as_os_str().is_empty() || from_ms == 0 || to_ms <= from_ms {
         panic!(
-            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42]"
+            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2] [--max-multiplier 50]"
         );
     }
     Args {
@@ -79,6 +88,8 @@ fn parse_args() -> Args {
         far_refresh_ms,
         stagger,
         seed,
+        model,
+        max_multiplier,
     }
 }
 
@@ -180,15 +191,20 @@ fn main() {
         cfg.simulation.mc_n_min = args.mc_n;
         cfg.simulation.mc_n_max = args.mc_n;
         cfg.simulation.seed = Some(args.seed + idx as u64);
+        cfg.simulation.pricing_model = args.model;
+        if let Some(cap) = args.max_multiplier {
+            cfg.pricing.max_multiplier = cap;
+        }
 
+        let mut engine = QuoteEngine::with_config(def.ticker.clone(), def.band_cents, cfg);
         let mut cache = PriceCache::new(MAX_COMPLETED_BARS);
         let mut tick_idx = 0usize;
         while tick_idx < ticks.len() && ticks[tick_idx].ts_ms < args.from_ms {
             let _ = cache.apply_tick(ticks[tick_idx]);
+            engine.observe_tick(ticks[tick_idx]);
             tick_idx += 1;
         }
 
-        let engine = QuoteEngine::with_config(def.ticker.clone(), def.band_cents, cfg);
         states.push(TickerState {
             ticker: def.ticker.clone(),
             ticks,
@@ -215,6 +231,7 @@ fn main() {
             while state.tick_idx < state.ticks.len() && state.ticks[state.tick_idx].ts_ms < next_ms {
                 let tick = state.ticks[state.tick_idx];
                 let _ = state.cache.apply_tick(tick);
+                state.engine.observe_tick(tick);
                 latest_tick = Some(tick);
                 state.tick_idx += 1;
             }

@@ -12,6 +12,10 @@ use crate::horizon::{
 };
 use crate::price::PriceTick;
 use crate::session::is_us_regular_session;
+use crate::v2::{
+    PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, price_grid_v2, v2_m_eff,
+    v2_price_multiplier, v2_ticker_params,
+};
 
 pub use book::{CellKey, ExposureBook};
 
@@ -70,6 +74,8 @@ pub struct SampleJob {
     far_cache_end_window_ms: Option<u64>,
     last_full_price: f64,
     last_full_sigma: f64,
+    v2_params: Option<&'static TickerV2Params>,
+    v2_detector: RegimeDetector,
 }
 
 /// Computed Monte Carlo sample update ready to apply to `QuoteEngine`.
@@ -88,11 +94,13 @@ pub struct SampleResult {
     far_start: u64,
     far_end: u64,
     elapsed_ns: u128,
+    v2_m_eff: Option<f64>,
+    v2_regime: Option<Regime>,
 }
 
 impl SampleJob {
-    /// Executes the Monte Carlo simulation for this sample without touching `QuoteEngine`.
-    pub fn run(self) -> Option<SampleResult> {
+    /// Executes the Monte Carlo (v1) or exact DP (v2) simulation for this sample without touching `QuoteEngine`.
+    pub fn run(mut self) -> Option<SampleResult> {
         let started = std::time::Instant::now();
         let quote_windows = self.base_config.simulation.quote_window_count.max(1);
         let far_refresh_ms = self.base_config.simulation.far_refresh_ms;
@@ -108,6 +116,109 @@ impl SampleJob {
             .map(|window| window.0)
             .unwrap_or(u64::MAX);
         let far_end = full_windows.last().map(|window| window.0).unwrap_or(0);
+
+        if let Some(v2_params) = self.v2_params {
+            self.v2_detector.on_tick(self.tick, v2_params);
+            let regime = self
+                .base_config
+                .simulation
+                .v2_forced_regime
+                .unwrap_or_else(|| self.v2_detector.current_regime());
+            let r60 = self
+                .base_config
+                .simulation
+                .v2_forced_regime
+                .map(|r| v2_params.presets[r.index()].rms_median_cents)
+                .unwrap_or_else(|| self.v2_detector.last_r60().max(0.0));
+            let inferred_phase = self.v2_detector.inferred_phase(self.tick.ts_ms);
+
+            let floor_sec_ms = (self.tick.ts_ms / 1_000) * 1_000;
+            let relative_windows: Vec<TimeWindow> = full_windows
+                .iter()
+                .map(|&(start_ms, _)| {
+                    let start_secs = ((start_ms - floor_sec_ms) / 1_000) as u32;
+                    TimeWindow {
+                        start_secs,
+                        end_secs: start_secs + WINDOW_WIDTH_SECS,
+                    }
+                })
+                .collect();
+
+            let mut config = self.base_config.clone();
+            config.spec.band_width = self.band_cents as f64 / 100.0;
+            config.spec.windows = relative_windows;
+            if config.validate().is_err() {
+                return None;
+            }
+
+            let bands = build_cent_bands(
+                self.tick.price,
+                config.spec.rows,
+                config.spec.center_row,
+                self.band_cents,
+            );
+            let probs = price_grid_v2(
+                self.tick.price,
+                &bands,
+                &config.spec.windows,
+                v2_params,
+                regime,
+                inferred_phase,
+            );
+
+            let mut new_cells = Vec::with_capacity(bands.len() * quote_windows);
+            for (row_index, band) in bands.iter().enumerate() {
+                let lower_cents = (band.lower * 100.0).round() as i64;
+                let upper_cents = (band.upper * 100.0).round() as i64;
+                for (window_index, &(window_start_ms, window_end_ms)) in
+                    full_windows.iter().enumerate()
+                {
+                    new_cells.push(CachedCell {
+                        key: CellKey {
+                            window_start_ms,
+                            lower_cents,
+                        },
+                        window_end_ms,
+                        upper_cents,
+                        hit_probability: probs[row_index][window_index],
+                    });
+                }
+            }
+
+            let m_eff = v2_m_eff(r60, v2_params.rms_ref_cents);
+            let sigma_eff = (r60 / (100.0 * self.tick.price)).max(1e-8);
+            let volatility = VolatilitySnapshot {
+                variance: sigma_eff * sigma_eff,
+                sigma_raw: sigma_eff,
+                sigma: sigma_eff,
+                jump_intensity: 0.0,
+                jump_flag: false,
+            };
+
+            return Some(SampleResult {
+                tick: self.tick,
+                config,
+                volatility,
+                new_cells,
+                far_cache_update: None,
+                safety_update: Some((
+                    Vec::new(),
+                    CachedSafety {
+                        value: 1.0,
+                        computed_at_ms: self.tick.ts_ms,
+                    },
+                )),
+                quote_windows,
+                full: true,
+                move_due: false,
+                cadence_due: false,
+                far_start,
+                far_end,
+                elapsed_ns: started.elapsed().as_nanos(),
+                v2_m_eff: Some(m_eff),
+                v2_regime: Some(regime),
+            });
+        }
 
         let far_covered = self
             .far_cache_end_window_ms
@@ -313,6 +424,8 @@ impl SampleJob {
             far_start,
             far_end,
             elapsed_ns: started.elapsed().as_nanos(),
+            v2_m_eff: None,
+            v2_regime: None,
         })
     }
 }
@@ -358,6 +471,10 @@ pub struct QuoteEngine {
     last_full_price: f64,
     last_full_sigma: f64,
     stats: RepriceStats,
+    v2_params: Option<&'static TickerV2Params>,
+    v2_detector: RegimeDetector,
+    v2_last_m_eff: f64,
+    v2_last_regime: Option<Regime>,
 }
 
 impl QuoteEngine {
@@ -369,6 +486,11 @@ impl QuoteEngine {
 
     /// Creates a `QuoteEngine` using an explicit `GridConfig` template (for calibration/tuning).
     pub fn with_config(ticker: String, band_cents: u32, base_config: GridConfig) -> Self {
+        let v2_params = if base_config.simulation.pricing_model == PricingModel::V2 {
+            v2_ticker_params(&ticker)
+        } else {
+            None
+        };
         Self {
             ticker,
             band_cents,
@@ -387,7 +509,29 @@ impl QuoteEngine {
             last_full_price: 0.0,
             last_full_sigma: 0.0,
             stats: RepriceStats::default(),
+            v2_params,
+            v2_detector: RegimeDetector::new(),
+            v2_last_m_eff: V2_M_BASE,
+            v2_last_regime: None,
         }
+    }
+
+    /// Feeds a raw tick to the causal v2 regime/phase tracker (no-op on v1).
+    pub fn observe_tick(&mut self, tick: PriceTick) {
+        if let Some(params) = self.v2_params {
+            self.v2_detector.on_tick(tick, params);
+        }
+    }
+
+    /// Returns `true` when odds model v2 is active for this ticker.
+    pub fn is_v2_active(&self) -> bool {
+        self.v2_params.is_some()
+    }
+
+    /// Returns the latest v2 regime if v2 is active for this ticker.
+    pub fn current_v2_regime(&self) -> Option<Regime> {
+        self.v2_last_regime
+            .or_else(|| self.v2_params.map(|_| self.v2_detector.current_regime()))
     }
 
     /// Sets a measured variance used instead of `sigma_ref²` as the cold-start prior.
@@ -421,11 +565,17 @@ impl QuoteEngine {
             far_cache_end_window_ms: self.far_cache_end_window_ms,
             last_full_price: self.last_full_price,
             last_full_sigma: self.last_full_sigma,
+            v2_params: self.v2_params,
+            v2_detector: self.v2_detector.clone(),
         })
     }
 
     /// Applies the output of `SampleJob::run` back into this engine's quote cache.
     pub fn apply_sample_result(&mut self, result: SampleResult) {
+        if let Some(m_eff) = result.v2_m_eff {
+            self.v2_last_m_eff = m_eff;
+        }
+        self.v2_last_regime = result.v2_regime;
         if let Some((payouts, safety)) = result.safety_update {
             self.cached_scenario_payouts = payouts;
             self.cached_k_safety = Some(safety);
@@ -470,8 +620,9 @@ impl QuoteEngine {
         self.stats.sample_ns += result.elapsed_ns;
     }
 
-    /// Runs Monte Carlo for a new price sample and caches per-cell probabilities and scenario payouts.
+    /// Runs Monte Carlo (v1) or exact DP (v2) for a new price sample and caches per-cell probabilities.
     pub fn on_sample(&mut self, tick: PriceTick, history: &[OhlcBar]) {
+        self.observe_tick(tick);
         if let Some(job) = self.prepare_sample_job(tick, history.to_vec()) {
             if let Some(result) = job.run() {
                 self.apply_sample_result(result);
@@ -520,16 +671,26 @@ impl QuoteEngine {
                 continue;
             }
             let liability = self.exposure.get(&cell.key);
-            let m_base =
-                effective_m_base(&self.config, is_us_regular_session(cell.key.window_start_ms));
-            let multiplier = price_multiplier_with_margin(
-                cell.hit_probability,
-                volatility,
-                liability,
-                k_safety,
-                m_base,
-                &self.config,
-            );
+            let multiplier = if self.v2_params.is_some() {
+                v2_price_multiplier(
+                    cell.hit_probability,
+                    self.v2_last_m_eff,
+                    liability,
+                    k_safety,
+                    &self.config,
+                )
+            } else {
+                let m_base =
+                    effective_m_base(&self.config, is_us_regular_session(cell.key.window_start_ms));
+                price_multiplier_with_margin(
+                    cell.hit_probability,
+                    volatility,
+                    liability,
+                    k_safety,
+                    m_base,
+                    &self.config,
+                )
+            };
             cells.push(StockCell {
                 window_start_ms: cell.key.window_start_ms,
                 window_end_ms: cell.window_end_ms,
@@ -1080,5 +1241,55 @@ mod tests {
         assert_eq!(stats.near_reprices, 0);
         assert_eq!(stats.trigger_reprices, 0);
         assert_eq!(engine.price(ts + 1_000).cells.len(), 20 * 6);
+    }
+
+    #[test]
+    fn v2_quote_engine_ignores_v1_calibration_layers_and_respects_cap() {
+        let mut cfg_clean = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg_clean.simulation.pricing_model = PricingModel::V2;
+        cfg_clean.simulation.quote_window_count = 24;
+        cfg_clean.pricing.max_multiplier = 50.0;
+        cfg_clean.calibration.factors.clear();
+        cfg_clean.pricing.off_hours_m_base = None;
+        cfg_clean.pricing.current_row_logit_shift = 0.0;
+
+        let mut cfg_dirty = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        cfg_dirty.simulation.pricing_model = PricingModel::V2;
+        cfg_dirty.simulation.quote_window_count = 24;
+        cfg_dirty.pricing.max_multiplier = 50.0;
+        cfg_dirty.pricing.p_raw_gamma = 2.0;
+        cfg_dirty.pricing.current_row_logit_shift = 0.8;
+        cfg_dirty.pricing.off_hours_m_base = Some(0.25);
+
+        let mut e_clean = QuoteEngine::with_config("NVDA".to_string(), 3, cfg_clean);
+        let mut e_dirty = QuoteEngine::with_config("NVDA".to_string(), 3, cfg_dirty);
+        assert!(e_clean.is_v2_active());
+        assert!(e_dirty.is_v2_active());
+
+        // Off-hours timestamp (03:00 UTC) so off_hours_m_base would apply if v1 ran.
+        let ts = 1_795_057_200_000_u64;
+        let spot = 139.99;
+        let hist = sample_history(spot);
+        e_clean.on_sample(PriceTick { ts_ms: ts, price: spot }, &hist);
+        e_dirty.on_sample(PriceTick { ts_ms: ts, price: spot }, &hist);
+
+        let q_clean = e_clean.price(ts);
+        let q_dirty = e_dirty.price(ts);
+        assert_eq!(q_clean.cells.len(), 20 * 24);
+        assert_eq!(q_clean, q_dirty);
+        assert!(q_clean.cells.iter().any(|c| c.multiplier > 25.0 && c.multiplier <= 50.0));
+    }
+
+    #[test]
+    fn v2_falls_back_to_v1_for_tickers_without_recorded_data() {
+        for ticker in ["AAPL", "SP500"] {
+            let mut cfg = stock_grid_config_for_ticker(ticker, 8, Vec::new());
+            cfg.simulation.pricing_model = PricingModel::V2;
+            let engine = QuoteEngine::with_config(ticker.to_string(), 8, cfg);
+            assert!(
+                !engine.is_v2_active(),
+                "{ticker} has no recorded tick history and must stay on v1"
+            );
+        }
     }
 }
