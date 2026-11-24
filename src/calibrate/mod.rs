@@ -7,9 +7,9 @@ use crate::grid::GridConfig;
 use crate::horizon::{RepriceStats, row_dist_bucket};
 use crate::price::{PriceCache, PriceTick};
 use crate::quote::{QuoteEngine, StockCell};
-use crate::v2::{Regime, RegimeDetector, TickerV2Params, v2_ticker_params};
+use crate::v2::{Regime, RegimeDetector, TickerV2Params, v2_ticker_params_for_source};
 
-use eval::{VOID_GAP_MS, collect_gaps_over_3s, window_hit_bands, window_is_void};
+use eval::{collect_gaps_over, window_hit_bands_with_gap, window_is_void_with_gap};
 pub use stats::{
     Bucket, TailBucket, brier_score, implied_house_edge, is_us_regular_session_utc,
     reliability_table, tail_reliability_table,
@@ -94,7 +94,8 @@ pub fn run_calibration(ticks: &[PriceTick], opts: &CalibrateOptions) -> Calibrat
     if ticks.len() < 2 {
         return report;
     }
-    report.gaps_over_3s = collect_gaps_over_3s(ticks);
+    let void_gap_ms = opts.base_config.simulation.price_source.timing().void_gap_ms;
+    report.gaps_over_3s = collect_gaps_over(ticks, void_gap_ms);
 
     let first_ts = ticks[0].ts_ms;
     let last_ts = ticks[ticks.len() - 1].ts_ms;
@@ -114,10 +115,10 @@ pub fn run_calibration(ticks: &[PriceTick], opts: &CalibrateOptions) -> Calibrat
         let window_end_ms = window_start_ms + WINDOW_WIDTH_MS;
         let stale = state
             .last_tick
-            .is_some_and(|tick| quote_ts_ms.saturating_sub(tick.ts_ms) > VOID_GAP_MS);
+            .is_some_and(|tick| quote_ts_ms.saturating_sub(tick.ts_ms) > void_gap_ms);
         let window0_void = !stale
             && state.last_tick.is_some()
-            && window_is_void(ticks, tick_idx, window_start_ms, window_end_ms);
+            && window_is_void_with_gap(ticks, tick_idx, window_start_ms, window_end_ms, void_gap_ms);
 
         if stale {
             report.stale_quote_skips += 1;
@@ -209,8 +210,11 @@ impl EngineReplayState {
                 opts.band_cents,
                 opts.base_config.clone(),
             ),
-            causal_detector: v2_ticker_params(&opts.ticker)
-                .map(|params| (RegimeDetector::new(), params)),
+            causal_detector: v2_ticker_params_for_source(
+                &opts.ticker,
+                opts.base_config.simulation.price_source,
+            )
+            .map(|params| (RegimeDetector::new(), params)),
             feed_start_ms: first_ts,
             last_tick: None,
             last_quoted_tick_ts: None,
@@ -236,8 +240,11 @@ impl EngineReplayState {
                         opts.band_cents,
                         opts.base_config.clone(),
                     );
-                    self.causal_detector = v2_ticker_params(&opts.ticker)
-                        .map(|params| (RegimeDetector::new(), params));
+                    self.causal_detector = v2_ticker_params_for_source(
+                        &opts.ticker,
+                        opts.base_config.simulation.price_source,
+                    )
+                    .map(|params| (RegimeDetector::new(), params));
                     self.feed_start_ms = tick.ts_ms;
                     self.last_quoted_tick_ts = None;
                 }
@@ -302,6 +309,7 @@ fn evaluate_window(
     let center_lower_cents = anchor_cents - (band_c / 2);
     let dist_max = opts.base_config.pricing.calibration_dist_max;
 
+    let void_gap_ms = opts.base_config.simulation.price_source.timing().void_gap_ms;
     if !opts.all_windows {
         let window_cells: Vec<StockCell> = quote
             .cells
@@ -316,7 +324,14 @@ fn evaluate_window(
             .iter()
             .map(|cell| (cell.lower_cents, cell.upper_cents))
             .collect();
-        let hits = window_hit_bands(ticks, tick_idx, window_start_ms, window_end_ms, &bands_cents);
+        let hits = window_hit_bands_with_gap(
+            ticks,
+            tick_idx,
+            window_start_ms,
+            window_end_ms,
+            &bands_cents,
+            void_gap_ms,
+        );
         let is_warmup = window_start_ms.saturating_sub(state.feed_start_ms) < opts.warmup_ms;
         let is_us_session = crate::session::is_us_regular_session(window_start_ms);
 
@@ -372,14 +387,17 @@ fn evaluate_window(
         if window_index == 0 && window0_void {
             continue;
         }
-        if window_index > 0 && window_is_void(ticks, tick_idx, w_start, w_end) {
+        if window_index > 0
+            && window_is_void_with_gap(ticks, tick_idx, w_start, w_end, void_gap_ms)
+        {
             continue;
         }
         let bands_cents: Vec<(i64, i64)> = window_cells
             .iter()
             .map(|cell| (cell.lower_cents, cell.upper_cents))
             .collect();
-        let hits = window_hit_bands(ticks, tick_idx, w_start, w_end, &bands_cents);
+        let hits =
+            window_hit_bands_with_gap(ticks, tick_idx, w_start, w_end, &bands_cents, void_gap_ms);
         let is_us_session = crate::session::is_us_regular_session(w_start);
         if window_index == 0 {
             report.evaluated_windows += 1;
@@ -458,6 +476,14 @@ mod tests {
         assert_eq!(hits, vec![true, false]);
         assert!(window_is_void(&ticks, 0, 15_000, 20_000));
         assert_eq!(VOID_GAP_MS, 3_000);
+
+        // Verify custom void_gap_ms overrides the 3s HL default for both void checks and segment hits.
+        assert!(window_is_void_with_gap(&ticks, 0, 10_000, 15_000, 1_500));
+        assert!(!window_is_void_with_gap(&ticks, 0, 15_000, 20_000, 4_000));
+        // Segment 9500 -> 10500 (1000ms) crosses [15752, 15755]; with void_gap_ms=500ms, segment is broken.
+        let hits_tight =
+            window_hit_bands_with_gap(&ticks, 0, 10_000, 15_000, &[(15752, 15755)], 500);
+        assert_eq!(hits_tight, vec![false]);
     }
 
     #[test]

@@ -339,6 +339,7 @@ fn apply(cfg: &mut GridConfig, args: &Args) {
         cfg.simulation.far_phase_ms = far_phase_ms;
     }
     cfg.simulation.pricing_model = args.model;
+    cfg.simulation.price_source = args.source;
     cfg.simulation.v2_forced_regime = args.v2_preset;
     if let Some(max_mult) = args.max_multiplier {
         cfg.pricing.max_multiplier = max_mult;

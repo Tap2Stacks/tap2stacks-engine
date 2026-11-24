@@ -205,6 +205,7 @@ fn main() {
         cfg.simulation.mc_n_max = args.mc_n;
         cfg.simulation.seed = Some(args.seed + idx as u64);
         cfg.simulation.pricing_model = args.model;
+        cfg.simulation.price_source = args.source;
         if let Some(cap) = args.max_multiplier {
             cfg.pricing.max_multiplier = cap;
         }

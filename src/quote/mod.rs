@@ -11,11 +11,11 @@ use crate::horizon::{
     NEAR_WINDOWS, RepriceStats, cadence_slot_due, move_trigger_due_sigma,
 };
 use crate::m4::{MarkFormulaTracker, TickerM4Params, m4_ticker_params, price_grid_m4};
-use crate::price::PriceTick;
+use crate::price::{PriceSource, PriceTick};
 use crate::session::is_us_regular_session;
 use crate::v2::{
     PricingModel, Regime, RegimeDetector, TickerV2Params, V2_M_BASE, dynamic_news_preset,
-    price_grid_v2, v2_m_eff, v2_price_multiplier, v2_ticker_params,
+    price_grid_v2, v2_m_eff, v2_price_multiplier, v2_ticker_params_for_source,
 };
 
 pub use book::{CellKey, ExposureBook};
@@ -133,7 +133,9 @@ impl SampleJob {
                 .v2_forced_regime
                 .map(|r| v2_params.presets[r.index()].rms_median_cents)
                 .unwrap_or_else(|| self.v2_detector.last_r60().max(0.0));
-            let inferred_phase = self.v2_detector.inferred_phase(self.tick.ts_ms);
+            let inferred_phase = self
+                .v2_detector
+                .inferred_phase(self.tick.ts_ms, v2_params.clock_secs);
 
             let floor_sec_ms = (self.tick.ts_ms / 1_000) * 1_000;
             let relative_windows: Vec<TimeWindow> = full_windows
@@ -532,8 +534,14 @@ impl QuoteEngine {
     pub fn with_config(ticker: String, band_cents: u32, base_config: GridConfig) -> Self {
         let (v2_params, m4_params) = match base_config.simulation.pricing_model {
             PricingModel::V1 => (None, None),
-            PricingModel::V2 => (v2_ticker_params(&ticker), None),
-            PricingModel::M4 => match (v2_ticker_params(&ticker), m4_ticker_params(&ticker)) {
+            PricingModel::V2 => (
+                v2_ticker_params_for_source(&ticker, base_config.simulation.price_source),
+                None,
+            ),
+            PricingModel::M4 => match (
+                v2_ticker_params_for_source(&ticker, PriceSource::Hyperliquid),
+                m4_ticker_params(&ticker),
+            ) {
                 (Some(v2), Some(m4)) => (Some(v2), Some(m4)),
                 _ => (None, None),
             },

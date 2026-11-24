@@ -11,12 +11,8 @@ use std::collections::VecDeque;
 
 use crate::grid::{compute_k_skew, GridConfig, PriceBand, TimeWindow};
 use crate::horizon::NEAR_WINDOWS;
-use crate::price::PriceTick;
+use crate::price::{PriceSource, PriceTick};
 
-/// Oracle mark-price refresh period in seconds (`m1-tick-stats.txt` lines 47-50, 175-178).
-pub const ORACLE_CLOCK_SECS: u64 = 3;
-/// Settlement void gap threshold in milliseconds (`src/calibrate/eval.rs:3`).
-pub const VOID_GAP_MS: u64 = 3_000;
 /// Maximum age (seconds) of the last observed non-zero price change for phase inference.
 pub const PHASE_MAX_AGE_SECS: u64 = 60;
 /// Rolling window (seconds) for the causal realized RMS detector `R_60`.
@@ -41,14 +37,10 @@ pub const V2_NEWS_MIX_WEIGHT: f64 = 0.793;
 pub const V2_NEWS_TAIL_RATIO: f64 = 2.42;
 /// Lower clamp for causal trailing 60s move rate `q_60` in `News` (`docs/odds-model-v2.md` §3.4).
 pub const V2_NEWS_Q_MIN: f64 = 0.12;
-/// Upper clamp for causal trailing 60s move rate `q_60` in `News` (`3 * q_60 <= 1.0`).
-pub const V2_NEWS_Q_MAX: f64 = 1.0 / 3.0;
 /// Upper RMS clamp multiplier on `R_med_news` in `dynamic_news_preset` (`docs/odds-model-v2.md` §3.4).
 pub const V2_NEWS_R_CAP_MULT: f64 = 2.5;
 /// Minimum probability denominator clamp in `M_base = (1 - m_eff) / max(P, eps)`.
 pub const V2_P_EPSILON: f64 = 1e-6;
-/// Per-3-second-tick generator weight `3 s / 60 s = 0.05` for far-horizon Markov switching.
-const FAR_MARKOV_STEP_WEIGHT: f64 = 3.0 / 60.0;
 /// Half-width of the integer-cent DP lattice (`[-450c, +450c]`, `901` states).
 const DP_HALF_WIDTH: usize = 450;
 
@@ -144,7 +136,7 @@ impl Regime {
 pub struct RegimePreset {
     /// Empirical unconditional 1-second move probability `q = P(ΔC != 0)`.
     pub q_1s: f64,
-    /// Per-3-second oracle clock move probability `p_move = min(1, 3 * q_1s)`.
+    /// Per-clock-tick move probability `p_move = min(1, clock_secs * q_1s)`.
     pub p_move: f64,
     /// Weight on component 1 (`1.0` for single-Geometric regimes; `< 1.0` for `News`).
     pub mix_weight: f64,
@@ -159,12 +151,16 @@ pub struct RegimePreset {
     pub m_base: f64,
 }
 
-/// Complete data-derived v2 parameters for one ticker.
+/// Complete data-derived v2 parameters for one ticker on a specific `PriceSource`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TickerV2Params {
     pub ticker: &'static str,
     pub band_cents: u32,
     pub reference_price: f64,
+    /// Source update clock period in seconds (Hyperliquid: 3, Deribit: 1).
+    pub clock_secs: u64,
+    /// Source settlement void gap threshold in milliseconds.
+    pub void_gap_ms: u64,
     /// Median `R_60` of the `Normal` regime (used as `R_ref` in `m_risk`).
     pub rms_ref_cents: f64,
     /// Empirical `[p50, p85, p99]` minute `R_60` thresholds in cents/s.
@@ -191,6 +187,8 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "NVDA",
     band_cents: 3,
     reference_price: 139.65,
+    clock_secs: PriceSource::Hyperliquid.timing().clock_secs,
+    void_gap_ms: PriceSource::Hyperliquid.timing().void_gap_ms,
     rms_ref_cents: 1.60,
     thresholds_rms_cents: [1.162, 2.412, 8.390],
     shock_single_step_cents: 34,
@@ -254,6 +252,8 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "TSLA",
     band_cents: 8,
     reference_price: 363.97,
+    clock_secs: PriceSource::Hyperliquid.timing().clock_secs,
+    void_gap_ms: PriceSource::Hyperliquid.timing().void_gap_ms,
     rms_ref_cents: 2.77,
     thresholds_rms_cents: [1.807, 4.359, 11.505],
     shock_single_step_cents: 46,
@@ -303,17 +303,146 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
     ],
 };
 
-/// Returns data-derived v2 parameters for tickers with recorded history (`NVDA`, `TSLA`).
+/// PROVISIONAL NVDA Deribit v2 parameters: copies Hyperliquid NVDA preset values
+/// (with `p_move = q_1s` for `clock_secs = 1`) until lead fits presets on recorded Deribit data.
+pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
+    ticker: "NVDA",
+    band_cents: 3,
+    reference_price: 139.65,
+    clock_secs: PriceSource::Deribit.timing().clock_secs,
+    void_gap_ms: PriceSource::Deribit.timing().void_gap_ms,
+    rms_ref_cents: 1.60,
+    thresholds_rms_cents: [1.162, 2.412, 8.390],
+    shock_single_step_cents: 34,
+    presets: [
+        RegimePreset {
+            q_1s: 0.1426,
+            p_move: 0.1426,
+            mix_weight: 1.0,
+            p1: 0.6517,
+            p2: 0.6517,
+            rms_median_cents: 0.58,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2602,
+            p_move: 0.2602,
+            mix_weight: 1.0,
+            p1: 0.3767,
+            p2: 0.3767,
+            rms_median_cents: 1.60,
+            m_base: 0.098,
+        },
+        RegimePreset {
+            q_1s: 0.3017,
+            p_move: 0.3017,
+            mix_weight: 1.0,
+            p1: 0.1850,
+            p2: 0.1850,
+            rms_median_cents: 3.36,
+            m_base: 0.134,
+        },
+        RegimePreset {
+            q_1s: 0.2949,
+            p_move: 0.2949,
+            mix_weight: 0.8150,
+            p1: 0.0643,
+            p2: 0.0242,
+            rms_median_cents: 11.79,
+            m_base: 0.263,
+        },
+    ],
+    transition_1min: [
+        [0.816, 0.171, 0.013, 0.000],
+        [0.252, 0.645, 0.102, 0.001],
+        [0.029, 0.273, 0.674, 0.024],
+        [0.000, 0.012, 0.353, 0.635],
+    ],
+};
+
+/// PROVISIONAL TSLA Deribit v2 parameters: copies Hyperliquid TSLA preset values
+/// (with `p_move = q_1s` for `clock_secs = 1`) until lead fits presets on recorded Deribit data.
+pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
+    ticker: "TSLA",
+    band_cents: 8,
+    reference_price: 363.97,
+    clock_secs: PriceSource::Deribit.timing().clock_secs,
+    void_gap_ms: PriceSource::Deribit.timing().void_gap_ms,
+    rms_ref_cents: 2.77,
+    thresholds_rms_cents: [1.807, 4.359, 11.505],
+    shock_single_step_cents: 46,
+    presets: [
+        RegimePreset {
+            q_1s: 0.1108,
+            p_move: 0.1108,
+            mix_weight: 1.0,
+            p1: 0.4643,
+            p2: 0.4643,
+            rms_median_cents: 0.63,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2391,
+            p_move: 0.2391,
+            mix_weight: 1.0,
+            p1: 0.2202,
+            p2: 0.2202,
+            rms_median_cents: 2.77,
+            m_base: 0.073,
+        },
+        RegimePreset {
+            q_1s: 0.2900,
+            p_move: 0.2900,
+            mix_weight: 1.0,
+            p1: 0.1183,
+            p2: 0.1183,
+            rms_median_cents: 5.63,
+            m_base: 0.197,
+        },
+        RegimePreset {
+            q_1s: 0.3027,
+            p_move: 0.3027,
+            mix_weight: 0.7712,
+            p1: 0.0645,
+            p2: 0.0297,
+            rms_median_cents: 14.20,
+            m_base: 0.185,
+        },
+    ],
+    transition_1min: [
+        [0.825, 0.160, 0.015, 0.000],
+        [0.236, 0.620, 0.140, 0.004],
+        [0.041, 0.366, 0.567, 0.026],
+        [0.012, 0.094, 0.412, 0.482],
+    ],
+};
+
+/// Returns source-specific v2 parameters for tickers with configured tables (`NVDA`, `TSLA`).
+/// Tickers without v2 parameters (`AAPL`, `SP500`) return `None` and stay on model v1.
+pub fn v2_ticker_params_for_source(
+    ticker: &str,
+    source: PriceSource,
+) -> Option<&'static TickerV2Params> {
+    let trimmed = ticker.trim();
+    let stripped = trimmed
+        .strip_prefix("deribit_price_index.")
+        .unwrap_or(trimmed);
+    let base = stripped.split(':').next_back().unwrap_or(stripped);
+    let lower = base.to_ascii_lowercase();
+    let symbol = lower.strip_suffix("_usdc").unwrap_or(&lower);
+    match (source, symbol) {
+        (PriceSource::Hyperliquid, "nvda") => Some(&NVDA_V2_PARAMS),
+        (PriceSource::Hyperliquid, "tsla") => Some(&TSLA_V2_PARAMS),
+        (PriceSource::Deribit, "nvda") => Some(&NVDA_DERIBIT_V2_PARAMS),
+        (PriceSource::Deribit, "tsla") => Some(&TSLA_DERIBIT_V2_PARAMS),
+        _ => None,
+    }
+}
+
+/// Returns Hyperliquid v2 parameters for tickers with recorded history (`NVDA`, `TSLA`).
 /// Tickers without sufficient tick data (`AAPL`, `SP500`) return `None` and stay on model v1.
 pub fn v2_ticker_params(ticker: &str) -> Option<&'static TickerV2Params> {
-    let symbol = ticker.split(':').next_back().unwrap_or(ticker);
-    if symbol.eq_ignore_ascii_case("NVDA") {
-        Some(&NVDA_V2_PARAMS)
-    } else if symbol.eq_ignore_ascii_case("TSLA") {
-        Some(&TSLA_V2_PARAMS)
-    } else {
-        None
-    }
+    v2_ticker_params_for_source(ticker, PriceSource::Hyperliquid)
 }
 
 /// Strictly causal online regime detector and 3-second oracle phase tracker.
@@ -366,17 +495,24 @@ impl RegimeDetector {
         self.last_change_sec
     }
 
-    /// Infers oracle phase `phi in {0, 1, 2}` relative to `quote_ts_ms` from the last
-    /// observed non-zero price change. Returns `None` if unknown (restart, gap > 3s, or
-    /// > 60s since last move), causing the DP to average uniformly over `{0, 1, 2}`.
-    pub fn inferred_phase(&self, quote_ts_ms: u64) -> Option<usize> {
+    /// Infers clock phase `phi in 0..clock_secs` relative to `quote_ts_ms` from the last
+    /// observed non-zero price change.
+    ///
+    /// At `clock_secs <= 1` (e.g. Deribit 1-second index), phase is always `Some(0)`.
+    /// At `clock_secs > 1` (e.g. Hyperliquid 3-second oracle), returns `None` if unknown
+    /// (restart, gap > `void_gap_ms`, or > 60s since last move), causing the DP to average
+    /// uniformly over `0..clock_secs`.
+    pub fn inferred_phase(&self, quote_ts_ms: u64, clock_secs: u64) -> Option<usize> {
+        let clock = clock_secs.max(1);
+        if clock == 1 {
+            return Some(0);
+        }
         let t_last = self.last_change_sec?;
         let t_now = quote_ts_ms / 1_000;
         if t_now < t_last || t_now.saturating_sub(t_last) > PHASE_MAX_AGE_SECS {
             return None;
         }
-        let phi = ((t_last % ORACLE_CLOCK_SECS) + ORACLE_CLOCK_SECS - (t_now % ORACLE_CLOCK_SECS))
-            % ORACLE_CLOCK_SECS;
+        let phi = ((t_last % clock) + clock - (t_now % clock)) % clock;
         Some(phi as usize)
     }
 
@@ -408,9 +544,9 @@ impl RegimeDetector {
         self.last_tick_ts_ms = Some(tick.ts_ms);
         self.last_price_cents = Some(curr_cents);
 
-        // A > 3 s feed gap voids overlapping windows, invalidates oracle phase tracking,
-        // and must NOT be counted as a 1-second price jump in R_60.
-        if dt_ms > VOID_GAP_MS {
+        // A gap exceeding the source's `void_gap_ms` voids overlapping windows, invalidates
+        // phase tracking, and must NOT be counted as a 1-second price jump in R_60.
+        if dt_ms > params.void_gap_ms {
             self.last_change_sec = None;
             self.downgrade_streak_secs = 0;
             return;
@@ -540,11 +676,13 @@ pub fn dynamic_news_preset(params: &TickerV2Params, r60: f64, q60: f64) -> Regim
     };
     let q_clean = if q60.is_finite() { q60 } else { base_news.q_1s };
 
+    let clock = params.clock_secs.max(1) as f64;
+    let q_max = 1.0 / clock;
     let r_min = params.thresholds_rms_cents[2];
     let r_max = (V2_NEWS_R_CAP_MULT * base_news.rms_median_cents).max(r_min);
     let r_eff = r_clean.clamp(r_min, r_max);
-    let q_eff = q_clean.clamp(V2_NEWS_Q_MIN, V2_NEWS_Q_MAX);
-    let p_move = (ORACLE_CLOCK_SECS as f64 * q_eff).min(1.0);
+    let q_eff = q_clean.clamp(V2_NEWS_Q_MIN, q_max);
+    let p_move = (clock * q_eff).min(1.0);
 
     let w = V2_NEWS_MIX_WEIGHT;
     let rho = V2_NEWS_TAIL_RATIO;
@@ -827,7 +965,7 @@ fn window_survival_mass(
                 + survive_2ticks_above(u, u_idx, preset, scratch)
         }
         _ => {
-            // General fallback for windows wider than 5s (not used by standard 5s grid).
+            // General path for windows with >= 3 ticks (e.g. 5s window at 1s clock).
             let mut cur_below = u[..l_idx].to_vec();
             let mut cur_above = if u_idx + 1 < n {
                 u[(u_idx + 1)..n].to_vec()
@@ -952,13 +1090,17 @@ pub fn price_grid_v2(
         })
         .collect();
 
-    // Per-3s-tick Markov transition matrix for far windows (6..23): T_step = 0.95 I + 0.05 T.
+    let clock = params.clock_secs.max(1) as usize;
+    let far_markov_step_weight = clock as f64 / 60.0;
+
+    // Per-clock-tick Markov transition matrix for far windows (6..23):
+    // T_step = (1 - clock/60) * I + (clock/60) * T.
     let mut t_step = [[0.0_f64; 4]; 4];
     for r in 0..4 {
         for c in 0..4 {
             let eye = if r == c { 1.0 } else { 0.0 };
-            t_step[r][c] =
-                (1.0 - FAR_MARKOV_STEP_WEIGHT) * eye + FAR_MARKOV_STEP_WEIGHT * params.transition_1min[r][c];
+            t_step[r][c] = (1.0 - far_markov_step_weight) * eye
+                + far_markov_step_weight * params.transition_1min[r][c];
         }
     }
 
@@ -967,13 +1109,14 @@ pub fn price_grid_v2(
         presets[Regime::News.index()] = np;
     }
 
-    let phase_list: &[usize] = match inferred_phase {
-        Some(0) => &[0],
-        Some(1) => &[1],
-        Some(2) => &[2],
-        _ => &[0, 1, 2],
+    let phase_range = if clock <= 1 {
+        0..1
+    } else if let Some(p) = inferred_phase.filter(|&p| p < clock) {
+        p..(p + 1)
+    } else {
+        0..clock
     };
-    let phase_weight = 1.0 / phase_list.len() as f64;
+    let phase_weight = 1.0 / phase_range.len() as f64;
     let r0 = regime.index();
     let preset0 = &presets[r0];
 
@@ -993,7 +1136,7 @@ pub fn price_grid_v2(
         Vec::new()
     };
 
-    for &ph in phase_list {
+    for ph in phase_range {
         u_cur.fill(0.0);
         u_cur[half] = 1.0;
         let mut cur_s: usize = 0;
@@ -1007,13 +1150,13 @@ pub fn price_grid_v2(
                 // Near horizon (windows 0..5): pure current preset r0.
                 while cur_s + 1 < ws {
                     cur_s += 1;
-                    if (cur_s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
+                    if (cur_s + clock - ph) % clock == 0 {
                         full_step_clamped(&u_cur, preset0, &mut u_next);
                         std::mem::swap(&mut u_cur, &mut u_next);
                     }
                 }
                 let in_ticks = (ws..we)
-                    .filter(|&s| (s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0)
+                    .filter(|&s| (s + clock - ph) % clock == 0)
                     .count();
                 for (row, &(li, ui)) in row_bounds.iter().enumerate() {
                     let surv = window_survival_mass(&u_cur, li, ui, in_ticks, preset0, &mut scratch);
@@ -1022,7 +1165,7 @@ pub fn price_grid_v2(
                 }
                 while cur_s + 1 < we {
                     cur_s += 1;
-                    if (cur_s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
+                    if (cur_s + clock - ph) % clock == 0 {
                         full_step_clamped(&u_cur, preset0, &mut u_next);
                         std::mem::swap(&mut u_cur, &mut u_next);
                     }
@@ -1038,12 +1181,12 @@ pub fn price_grid_v2(
                 }
                 while cur_s + 1 < ws {
                     cur_s += 1;
-                    if (cur_s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
+                    if (cur_s + clock - ph) % clock == 0 {
                         step_far_markov(&mut u_reg, &mut u_mix, &t_step, &presets);
                     }
                 }
                 let in_ticks = (ws..we)
-                    .filter(|&s| (s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0)
+                    .filter(|&s| (s + clock - ph) % clock == 0)
                     .count();
                 // Pre-check active regime slices (mass > 1e-12) to skip zero-mass work.
                 let active: [bool; 4] = [
@@ -1071,7 +1214,7 @@ pub fn price_grid_v2(
                 }
                 while cur_s + 1 < we {
                     cur_s += 1;
-                    if (cur_s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
+                    if (cur_s + clock - ph) % clock == 0 {
                         step_far_markov(&mut u_reg, &mut u_mix, &t_step, &presets);
                     }
                 }
@@ -1121,7 +1264,7 @@ mod tests {
         1 + (u.ln() / (1.0 - p).ln()).floor() as i64
     }
 
-    fn brute_force_mc_cell(
+    fn brute_force_mc_cell_clock(
         spot_c: i64,
         lc: i64,
         uc: i64,
@@ -1129,18 +1272,24 @@ mod tests {
         w_start: usize,
         w_end: usize,
         phase: Option<usize>,
+        clock_secs: usize,
         n_paths: usize,
         seed: u64,
     ) -> f64 {
+        let clock = clock_secs.max(1);
         let mut rng = StdRng::seed_from_u64(seed);
         let mut hits = 0usize;
         for _ in 0..n_paths {
             let mut c = spot_c;
-            let ph = phase.unwrap_or_else(|| rng.random_range(0..3));
+            let ph = if clock == 1 {
+                0
+            } else {
+                phase.unwrap_or_else(|| rng.random_range(0..clock))
+            };
             let mut hit = false;
             for s in 1..w_end {
                 let prev = c;
-                if (s + 3 - ph) % 3 == 0 && rng.random::<f64>() < preset.p_move {
+                if (s + clock - ph) % clock == 0 && rng.random::<f64>() < preset.p_move {
                     let pu = if preset.mix_weight >= 1.0 || rng.random::<f64>() < preset.mix_weight {
                         preset.p1
                     } else {
@@ -1167,6 +1316,20 @@ mod tests {
             }
         }
         hits as f64 / n_paths as f64
+    }
+
+    fn brute_force_mc_cell(
+        spot_c: i64,
+        lc: i64,
+        uc: i64,
+        preset: &RegimePreset,
+        w_start: usize,
+        w_end: usize,
+        phase: Option<usize>,
+        n_paths: usize,
+        seed: u64,
+    ) -> f64 {
+        brute_force_mc_cell_clock(spot_c, lc, uc, preset, w_start, w_end, phase, 3, n_paths, seed)
     }
 
     #[test]
@@ -1267,7 +1430,7 @@ mod tests {
     fn regime_detector_tracks_phase_escalation_shock_hysteresis_and_gaps() {
         let mut det = RegimeDetector::new();
         assert_eq!(det.current_regime(), Regime::Normal);
-        assert_eq!(det.inferred_phase(100_000), None);
+        assert_eq!(det.inferred_phase(100_000, 3), None);
 
         // Quiet tape: 1c move every 9s -> low R_60, holds below 0.85 * 1.162 = 0.988 for 15s -> Quiet
         let mut price = 140.00_f64;
@@ -1279,19 +1442,19 @@ mod tests {
         }
         assert_eq!(det.current_regime(), Regime::Quiet);
         // Last change was at sec=22 -> at quote_ts=40s, phi = ((22%3)+3-(40%3))%3 = (1+3-1)%3 = 0
-        assert_eq!(det.inferred_phase(40_000), Some(0));
-        assert_eq!(det.inferred_phase(41_000), Some(2));
-        assert_eq!(det.inferred_phase(42_000), Some(1));
+        assert_eq!(det.inferred_phase(40_000, 3), Some(0));
+        assert_eq!(det.inferred_phase(41_000, 3), Some(2));
+        assert_eq!(det.inferred_phase(42_000, 3), Some(1));
 
         // > 3s gap resets phase to None and does NOT trigger a bogus shock
         det.on_tick(PriceTick { ts_ms: 46_000, price: 141.00, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
-        assert_eq!(det.inferred_phase(46_000), None);
+        assert_eq!(det.inferred_phase(46_000, 3), None);
         assert_eq!(det.current_regime(), Regime::Quiet);
 
         // Single-print shock > 34c (4 * p99) promotes immediately to News on print 1
         det.on_tick(PriceTick { ts_ms: 47_000, price: 141.40, mid_px: None, oracle_px: None }, &NVDA_V2_PARAMS);
         assert_eq!(det.current_regime(), Regime::News);
-        assert_eq!(det.inferred_phase(47_000), Some(0));
+        assert_eq!(det.inferred_phase(47_000, 3), Some(0));
 
         // Downgrade hysteresis: stays News during < 15s of calm before stepping down one level
         for sec in 48..120u64 {
@@ -1342,12 +1505,14 @@ mod tests {
                 2.5 * 11.79_f64,
                 0.15_f64,
             ),
-            (&TSLA_V2_PARAMS, 14.20_f64, 0.40_f64, 14.20_f64, V2_NEWS_Q_MAX),
+            (&TSLA_V2_PARAMS, 14.20_f64, 0.40_f64, 14.20_f64, 1.0 / 3.0_f64),
         ] {
             let np = dynamic_news_preset(params, r60, q60);
             assert!((np.rms_median_cents - expected_r_eff).abs() < 1e-9);
             assert!((np.q_1s - expected_q_eff).abs() < 1e-9);
-            assert!((np.p_move - (3.0 * expected_q_eff).min(1.0)).abs() < 1e-9);
+            assert!(
+                (np.p_move - (params.clock_secs as f64 * expected_q_eff).min(1.0)).abs() < 1e-9
+            );
             assert!((np.mix_weight - V2_NEWS_MIX_WEIGHT).abs() < 1e-12);
             assert!((np.m_base - params.presets[Regime::News.index()].m_base).abs() < 1e-12);
 
@@ -1485,5 +1650,290 @@ mod tests {
         assert!(v2_ticker_params("xyz:TSLA").is_some());
         assert!(v2_ticker_params("AAPL").is_none());
         assert!(v2_ticker_params("SP500").is_none());
+
+        let nvda_drb = v2_ticker_params_for_source("nvda_usdc", PriceSource::Deribit).unwrap();
+        assert_eq!(nvda_drb.clock_secs, PriceSource::Deribit.timing().clock_secs);
+        assert_eq!(nvda_drb.void_gap_ms, PriceSource::Deribit.timing().void_gap_ms);
+        assert_eq!(nvda_drb.clock_secs, 1);
+
+        let tsla_drb =
+            v2_ticker_params_for_source("deribit_price_index.tsla_usdc", PriceSource::Deribit)
+                .unwrap();
+        assert_eq!(tsla_drb.clock_secs, 1);
+        assert!(v2_ticker_params_for_source("AAPL", PriceSource::Deribit).is_none());
+    }
+
+    #[test]
+    fn hl_v2_quotes_match_pre_change_golden_values_exactly() {
+        let windows: Vec<TimeWindow> = (0..8)
+            .map(|i| TimeWindow {
+                start_secs: (5 + 5 * i) as u32,
+                end_secs: (10 + 5 * i) as u32,
+            })
+            .collect();
+        let nvda_bands = vec![
+            PriceBand { row_index: 0, lower: 139.98, upper: 140.01 },
+            PriceBand { row_index: 1, lower: 140.01, upper: 140.04 },
+            PriceBand { row_index: 2, lower: 140.04, upper: 140.07 },
+        ];
+        let tsla_bands = vec![
+            PriceBand { row_index: 0, lower: 364.00, upper: 364.08 },
+            PriceBand { row_index: 1, lower: 364.08, upper: 364.16 },
+        ];
+
+        // Exact pre-change IEEE-754 golden values for HL 3-second clock (w0, w5 near; w7 far Markov).
+        let nvda_norm_p = price_grid_v2(
+            139.99,
+            &nvda_bands,
+            &windows,
+            &NVDA_V2_PARAMS,
+            Regime::Normal,
+            Some(1),
+            None,
+        );
+        let expected_nvda_norm: [(usize, usize, f64); 9] = [
+            (0, 0, 0.540648486121589_f64),
+            (0, 5, 0.309469830578935_f64),
+            (0, 7, 0.273439432171434_f64),
+            (1, 0, 0.369177874392759_f64),
+            (1, 5, 0.289560126875915_f64),
+            (1, 7, 0.259785505679971_f64),
+            (2, 0, 0.176760143990714_f64),
+            (2, 5, 0.245739437260077_f64),
+            (2, 7, 0.228784446826315_f64),
+        ];
+        for (r, w, exp) in expected_nvda_norm {
+            assert!(
+                (nvda_norm_p[r][w] - exp).abs() < 1e-12,
+                "HL NVDA Normal r={r} w={w}: got {:.15}, expected {exp:.15}",
+                nvda_norm_p[r][w]
+            );
+        }
+
+        let cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        let m_eff = v2_m_eff(
+            NVDA_V2_PARAMS.rms_ref_cents,
+            NVDA_V2_PARAMS.rms_ref_cents,
+            NVDA_V2_PARAMS.presets[Regime::Normal.index()].m_base,
+        );
+        let expected_mults = [
+            (0usize, 1.668366828270643_f64),
+            (1usize, 2.443266681362342_f64),
+            (2usize, 5.102960314670179_f64),
+        ];
+        for (r, exp_m) in expected_mults {
+            let mult = v2_price_multiplier(nvda_norm_p[r][0], m_eff, 0.0, 1.0, &cfg);
+            assert!(
+                (mult - exp_m).abs() < 1e-12,
+                "HL NVDA Normal mult r={r}: got {mult:.15}, expected {exp_m:.15}"
+            );
+        }
+
+        let nvda_vol_p = price_grid_v2(
+            139.99,
+            &nvda_bands,
+            &windows,
+            &NVDA_V2_PARAMS,
+            Regime::Volatile,
+            None,
+            None,
+        );
+        for (r, w, exp) in [
+            (0usize, 0usize, 0.506299154013340_f64),
+            (0, 5, 0.204724985253390_f64),
+            (0, 7, 0.176081838822454_f64),
+            (1, 0, 0.437092246605829_f64),
+            (2, 7, 0.170157160303662_f64),
+        ] {
+            assert!(
+                (nvda_vol_p[r][w] - exp).abs() < 1e-12,
+                "HL NVDA Volatile r={r} w={w}: got {:.15}, expected {exp:.15}",
+                nvda_vol_p[r][w]
+            );
+        }
+
+        let tsla_norm_p = price_grid_v2(
+            364.04,
+            &tsla_bands,
+            &windows,
+            &TSLA_V2_PARAMS,
+            Regime::Normal,
+            Some(0),
+            None,
+        );
+        for (r, w, exp) in [
+            (0usize, 0usize, 0.820118831252116_f64),
+            (0, 5, 0.370816985963493_f64),
+            (0, 7, 0.263920747522168_f64),
+            (1, 0, 0.374736187297921_f64),
+            (1, 7, 0.238398992289137_f64),
+        ] {
+            assert!(
+                (tsla_norm_p[r][w] - exp).abs() < 1e-12,
+                "HL TSLA Normal r={r} w={w}: got {:.15}, expected {exp:.15}",
+                tsla_norm_p[r][w]
+            );
+        }
+    }
+
+    #[test]
+    fn clock_1_dp_matches_brute_force_enumeration_and_mc() {
+        // 1. Exact brute-force enumeration on a small 3-tick clock-1 case (ws=2, we=4):
+        //    s=1 pre-tick, s=2 & s=3 in-window ticks, single-Geom(p1=0.85), p_move=0.40.
+        //    Truncating at K=11 leaves tail mass (1 - 0.85)^11 < 9e-10 per step.
+        let mut small_params = NVDA_DERIBIT_V2_PARAMS;
+        let test_preset = RegimePreset {
+            q_1s: 0.40,
+            p_move: 0.40,
+            mix_weight: 1.0,
+            p1: 0.85,
+            p2: 0.85,
+            rms_median_cents: 1.0,
+            m_base: 0.025,
+        };
+        small_params.presets[Regime::Normal.index()] = test_preset;
+
+        let bands = vec![PriceBand {
+            row_index: 0,
+            lower: 140.01,
+            upper: 140.03,
+        }];
+        let windows = vec![TimeWindow {
+            start_secs: 2,
+            end_secs: 4,
+        }];
+        let dp_small = price_grid_v2(
+            140.00,
+            &bands,
+            &windows,
+            &small_params,
+            Regime::Normal,
+            Some(0),
+            None,
+        )[0][0];
+
+        let mut steps: Vec<(i64, f64)> = vec![(0, 1.0 - test_preset.p_move)];
+        for k in 1..=11_i64 {
+            let pk = 0.5
+                * test_preset.p_move
+                * test_preset.p1
+                * (1.0 - test_preset.p1).powi((k - 1) as i32);
+            steps.push((k, pk));
+            steps.push((-k, pk));
+        }
+        let mut exact_hit = 0.0_f64;
+        for &(d1, w1) in &steps {
+            let x1 = d1;
+            for &(d2, w2) in &steps {
+                let x2 = x1 + d2;
+                if x1.min(x2) <= 3 && x1.max(x2) >= 1 {
+                    exact_hit += w1 * w2;
+                    continue;
+                }
+                for &(d3, w3) in &steps {
+                    let x3 = x2 + d3;
+                    if x2.min(x3) <= 3 && x2.max(x3) >= 1 {
+                        exact_hit += w1 * w2 * w3;
+                    }
+                }
+            }
+        }
+        assert!(
+            (dp_small - exact_hit).abs() < 1e-6,
+            "clock-1 DP={dp_small:.12} != brute-force enumeration={exact_hit:.12}"
+        );
+
+        // 2. Standard 5-second window [5, 10) (in_ticks=5) at clock=1 vs MC across Normal & News.
+        for (label, regime, lower, upper) in [
+            ("DRB_NVDA_normal_d0_w0", Regime::Normal, 139.98_f64, 140.01_f64),
+            ("DRB_NVDA_normal_d1_w0", Regime::Normal, 140.01_f64, 140.04_f64),
+            ("DRB_NVDA_news_d2_w0", Regime::News, 140.04_f64, 140.07_f64),
+        ] {
+            let b = vec![PriceBand {
+                row_index: 0,
+                lower,
+                upper,
+            }];
+            let w = vec![TimeWindow {
+                start_secs: 5,
+                end_secs: 10,
+            }];
+            let dp = price_grid_v2(
+                139.99,
+                &b,
+                &w,
+                &NVDA_DERIBIT_V2_PARAMS,
+                regime,
+                None,
+                None,
+            )[0][0];
+            let mc = brute_force_mc_cell_clock(
+                13_999,
+                (lower * 100.0).round() as i64,
+                (upper * 100.0).round() as i64,
+                &NVDA_DERIBIT_V2_PARAMS.presets[regime.index()],
+                5,
+                10,
+                Some(0),
+                1,
+                60_000,
+                99,
+            );
+            let se = (dp * (1.0 - dp) / 60_000.0).sqrt().max(0.002);
+            assert!(
+                (dp - mc).abs() <= 4.0 * se,
+                "{label}: DP={dp:.5} MC={mc:.5} diff={:+.5} (4*se={:.5})",
+                dp - mc,
+                4.0 * se
+            );
+        }
+
+        // 3. dynamic_news_preset at clock=1 allows q_eff up to 1.0 (not clamped at 1/3).
+        let np_drb = dynamic_news_preset(&NVDA_DERIBIT_V2_PARAMS, 12.0, 0.65);
+        assert!((np_drb.q_1s - 0.65).abs() < 1e-9);
+        assert!((np_drb.p_move - 0.65).abs() < 1e-9);
+        let e_k2 = np_drb.mix_weight * (2.0 - np_drb.p1) / (np_drb.p1 * np_drb.p1)
+            + (1.0 - np_drb.mix_weight) * (2.0 - np_drb.p2) / (np_drb.p2 * np_drb.p2);
+        assert!(((np_drb.q_1s * e_k2).sqrt() - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn phase_is_always_zero_at_clock_1() {
+        let mut det = RegimeDetector::new();
+        // Cold start (no move observed yet): clock 1 still yields phase 0.
+        assert_eq!(det.inferred_phase(100_000, 1), Some(0));
+
+        det.on_tick(PriceTick::new(10_000, 140.00), &NVDA_DERIBIT_V2_PARAMS);
+        det.on_tick(PriceTick::new(11_000, 140.02), &NVDA_DERIBIT_V2_PARAMS);
+        for sec in 11..15_u64 {
+            assert_eq!(det.inferred_phase(sec * 1_000, 1), Some(0));
+        }
+
+        // After > 60s silence or > void_gap_ms gap, clock 1 still yields phase 0.
+        assert_eq!(det.inferred_phase(200_000, 1), Some(0));
+        det.on_tick(PriceTick::new(205_000, 140.10), &NVDA_DERIBIT_V2_PARAMS);
+        assert_eq!(det.inferred_phase(205_000, 1), Some(0));
+    }
+
+    #[test]
+    fn regime_detector_void_gap_uses_source_params() {
+        let mut tight_params = NVDA_V2_PARAMS;
+        tight_params.void_gap_ms = 1_500;
+
+        let mut det_tight = RegimeDetector::new();
+        let mut det_hl = RegimeDetector::new();
+
+        for (det, params) in [(&mut det_tight, &tight_params), (&mut det_hl, &NVDA_V2_PARAMS)] {
+            det.on_tick(PriceTick::new(10_000, 140.00), params);
+            det.on_tick(PriceTick::new(11_000, 140.01), params);
+            // 2_000 ms gap with a 50c shock: > 1_500 ms (voided on tight), <= 3_000 ms (accepted on HL).
+            det.on_tick(PriceTick::new(13_000, 140.51), params);
+        }
+
+        assert_eq!(det_tight.inferred_phase(13_000, 3), None);
+        assert_eq!(det_tight.current_regime(), Regime::Normal);
+
+        assert_eq!(det_hl.inferred_phase(13_000, 3), Some(0));
+        assert_eq!(det_hl.current_regime(), Regime::News);
     }
 }

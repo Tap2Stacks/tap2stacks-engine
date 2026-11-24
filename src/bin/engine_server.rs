@@ -33,7 +33,6 @@ const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
 const DEFAULT_TICKERS: &str = "NVDA=xyz:NVDA:3,TSLA=xyz:TSLA:8,AAPL=xyz:AAPL:8,SP500=xyz:SP500:150";
 const DEFAULT_HL_INFO_URL: &str = "https://api.hyperliquid.xyz/info";
 const DEFAULT_HL_WARMUP_MINUTES: u64 = 180;
-const STALE_AFTER: Duration = Duration::from_secs(3);
 const HL_HEALTH_INTERVAL: Duration = Duration::from_millis(500);
 const QUOTE_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_BROADCAST_INTERVAL: Duration = Duration::from_secs(1);
@@ -327,7 +326,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
                 let mut hl_config = HyperliquidConfig {
                     coins: tickers.iter().map(|t| t.coin.clone()).collect(),
-                    stale_after: STALE_AFTER,
+                    stale_after: PriceSource::Hyperliquid.timing().stale_after,
                     health_interval: HL_HEALTH_INTERVAL,
                     ..HyperliquidConfig::default()
                 };
@@ -345,7 +344,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             PriceSource::Deribit => {
                 let mut drb_config = DeribitConfig {
                     coins: tickers.iter().map(|t| t.coin.clone()).collect(),
-                    stale_after: STALE_AFTER,
+                    stale_after: PriceSource::Deribit.timing().stale_after,
                     health_interval: HL_HEALTH_INTERVAL,
                     ..DeribitConfig::default()
                 };
@@ -404,6 +403,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 far_trigger_sigma,
                 far_phase_ms,
                 pricing_model,
+                price_source,
                 max_multiplier,
             },
         ));
@@ -490,6 +490,7 @@ struct TickerTaskInput {
     far_trigger_sigma: f64,
     far_phase_ms: u64,
     pricing_model: PricingModel,
+    price_source: PriceSource,
     max_multiplier: Option<f64>,
 }
 
@@ -506,6 +507,7 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         far_trigger_sigma,
         far_phase_ms,
         pricing_model,
+        price_source,
         max_multiplier,
     } = input;
     let (price_runtime, _price_worker_handle) = spawn_price_pipeline(
@@ -516,6 +518,7 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
     let mut grid_rx = price_runtime.grid_rx;
     let mut quote_engine = if quote_windows == DEFAULT_WINDOWS
         && pricing_model == PricingModel::V1
+        && price_source == PriceSource::Hyperliquid
         && max_multiplier.is_none()
     {
         QuoteEngine::new(spec.ticker.clone(), spec.band_cents)
@@ -525,6 +528,7 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
         cfg.simulation.far_trigger_sigma = far_trigger_sigma;
         cfg.simulation.far_phase_ms = far_phase_ms;
         cfg.simulation.pricing_model = pricing_model;
+        cfg.simulation.price_source = price_source;
         if let Some(cap) = max_multiplier {
             cfg.pricing.max_multiplier = cap;
         }
@@ -536,7 +540,7 @@ async fn run_ticker_task(spec: TickerSpec, input: TickerTaskInput) {
     let mut mc_busy = false;
     let mut queued_mc: Option<(PriceTick, Vec<OhlcBar>)> = None;
 
-    let stale_after_ms = STALE_AFTER.as_millis() as u64;
+    let stale_after_ms = price_source.timing().stale_after.as_millis() as u64;
     let mut quote_tick = interval_at(Instant::now() + QUOTE_INTERVAL, QUOTE_INTERVAL);
     quote_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -684,7 +688,10 @@ fn spawn_replay_stream(
     clock: Arc<MonotonicWallClock>,
 ) -> Result<watch::Receiver<HashMap<String, FeedHealth>>, Box<dyn Error + Send + Sync>> {
     let coins: Vec<String> = tickers.iter().map(|t| t.coin.clone()).collect();
-    let tracker = Arc::new(Mutex::new(HealthTracker::new(coins, STALE_AFTER)));
+    let tracker = Arc::new(Mutex::new(HealthTracker::new(
+        coins,
+        price_source.timing().stale_after,
+    )));
     let initial_health = tracker
         .lock()
         .expect("replay health mutex poisoned")
@@ -1306,5 +1313,19 @@ mod tests {
         assert_eq!(drb[1].ticker, "TSLA");
         assert_eq!(drb[1].coin, "tsla_usdc");
         assert_eq!(drb[1].band_cents, 8);
+
+        // Stale checks and default configs derive stale_after from PriceSource::timing().
+        assert_eq!(
+            HyperliquidConfig::default().stale_after,
+            PriceSource::Hyperliquid.timing().stale_after
+        );
+        assert_eq!(
+            DeribitConfig::default().stale_after,
+            PriceSource::Deribit.timing().stale_after
+        );
+        let stale_ms = PriceSource::Deribit.timing().stale_after.as_millis() as u64;
+        let fresh = FeedHealth::default();
+        assert!(!is_ticker_stale(fresh, Some(10_000), 10_000 + stale_ms, stale_ms));
+        assert!(is_ticker_stale(fresh, Some(10_000), 10_000 + stale_ms + 1, stale_ms));
     }
 }

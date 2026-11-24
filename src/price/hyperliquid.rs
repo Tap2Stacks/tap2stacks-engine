@@ -10,7 +10,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-use super::types::PriceTick;
+use super::types::{PriceSource, PriceTick};
 
 const PING_PAYLOAD: &str = r#"{"method":"ping"}"#;
 
@@ -35,7 +35,7 @@ impl Default for HyperliquidConfig {
                 "xyz:AAPL".to_string(),
                 "xyz:SP500".to_string(),
             ],
-            stale_after: Duration::from_secs(3),
+            stale_after: PriceSource::Hyperliquid.timing().stale_after,
             health_interval: Duration::from_millis(500),
             ping_interval: Duration::from_secs(30),
             reconnect_base_delay: Duration::from_secs(1),

@@ -13,8 +13,9 @@ pub use binance::{
 };
 pub use cache::PriceCache;
 pub use deribit::{
-    DEFAULT_DERIBIT_WS_URL, DeribitConfig, DeribitMessage, DeribitPriceIndex, DeribitStreamHandle,
-    DeribitTicker, deribit_index_channel, deribit_index_name, deribit_ticker_channel,
+    DEFAULT_DERIBIT_WS_URL, DERIBIT_CARRY_INTERVAL_MS, DeribitConfig, DeribitMessage,
+    DeribitPriceIndex, DeribitSampleEvent, DeribitSampler, DeribitStreamHandle, DeribitTicker,
+    deribit_index_channel, deribit_index_name, deribit_ticker_channel, deribit_ticker_index_name,
     deribit_ticker_symbol, parse_deribit_message, spawn_deribit_stream,
 };
 pub use hyperliquid::{
@@ -27,7 +28,9 @@ pub use replay::{
 };
 pub use runtime::{PriceRuntime, PriceWorker, spawn_price_pipeline};
 pub use types::{
-    GridMarketSnapshot, HlTick, PriceError, PriceSnapshot, PriceSource, PriceTick, StreamHealth,
+    DERIBIT_CLOCK_SECS, DERIBIT_STALE_AFTER_SECS, DERIBIT_VOID_GAP_MS, GridMarketSnapshot,
+    HL_CLOCK_SECS, HL_STALE_AFTER_SECS, HL_VOID_GAP_MS, HlTick, PriceError, PriceSnapshot,
+    PriceSource, PriceTick, SourceTiming, StreamHealth,
 };
 pub use warmup::{
     CandleWarmup, HlCandle, WarmupError, estimate_candle_warmup, fetch_candle_warmup,

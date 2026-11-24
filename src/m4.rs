@@ -20,8 +20,9 @@ use std::f64::consts::TAU;
 
 use crate::grid::{PriceBand, TimeWindow};
 use crate::price::PriceTick;
-use crate::v2::ORACLE_CLOCK_SECS;
 
+/// Local Hyperliquid 3-second oracle-update clock pinned for M4 (trade.xyz mark formula only).
+const HL_ORACLE_CLOCK_SECS: u64 = 3;
 /// Continuous-time EMA time constant in seconds for the trade.xyz basis EMA `E`.
 pub const MARK_EMA_TAU_SECS: f64 = 150.0;
 /// Data gap threshold (milliseconds) above which `MarkFormulaTracker` resets `E` and `dB`.
@@ -30,7 +31,7 @@ pub const MARK_TRACKER_RESET_GAP_MS: u64 = 30_000;
 /// an observed `oraclePx`/`markPx` change (prevents sub-second duplicate frames from zeroing `dB`).
 const UPDATE_MIN_INTERVAL_MS: u64 = 2_000;
 /// Maximum elapsed time (ms) before sampling `B` on the 3-second oracle clock even if `O`/`X` stay flat.
-const UPDATE_MAX_INTERVAL_MS: u64 = ORACLE_CLOCK_SECS * 1_000;
+const UPDATE_MAX_INTERVAL_MS: u64 = HL_ORACLE_CLOCK_SECS * 1_000;
 
 /// Exact branchless median of three finite floats.
 #[inline]
@@ -479,7 +480,7 @@ pub fn price_grid_m4(
         .collect();
     let ladder = uniform_band_ladder(&row_bounds);
 
-    let alpha_3s = 1.0 - (-(ORACLE_CLOCK_SECS as f64) / MARK_EMA_TAU_SECS).exp();
+    let alpha_3s = 1.0 - (-(HL_ORACLE_CLOCK_SECS as f64) / MARK_EMA_TAU_SECS).exp();
     let inv_ln_1mp = if params.geom_p < 1.0 && params.geom_p > 0.0 {
         1.0 / (1.0 - params.geom_p).ln()
     } else {
@@ -504,7 +505,7 @@ pub fn price_grid_m4(
                 let we = w.end_secs as usize;
                 let pre = if ws > cursor {
                     let c = (cursor..ws)
-                        .filter(|&s| (s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0)
+                        .filter(|&s| (s + HL_ORACLE_CLOCK_SECS as usize - ph) % HL_ORACLE_CLOCK_SECS as usize == 0)
                         .count();
                     cursor = ws;
                     c
@@ -513,7 +514,7 @@ pub fn price_grid_m4(
                 };
                 let inside = if we > cursor {
                     let c = (cursor..we)
-                        .filter(|&s| (s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0)
+                        .filter(|&s| (s + HL_ORACLE_CLOCK_SECS as usize - ph) % HL_ORACLE_CLOCK_SECS as usize == 0)
                         .count();
                     cursor = we;
                     c
@@ -668,7 +669,7 @@ pub fn price_grid_m4(
         let mut x = state.mark_cents;
         x_path[0] = x;
         for s in 1..max_end {
-            if (s + ORACLE_CLOCK_SECS as usize - ph) % ORACLE_CLOCK_SECS as usize == 0 {
+            if (s + HL_ORACLE_CLOCK_SECS as usize - ph) % HL_ORACLE_CLOCK_SECS as usize == 0 {
                 step_mark_formula(
                     &mut o,
                     &mut b,

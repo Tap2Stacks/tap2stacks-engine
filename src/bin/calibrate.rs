@@ -12,11 +12,12 @@ use st_engine::horizon::{
     CAP25_EPS, MIN_CALIBRATION_COUNT, NEAR_WINDOWS, apply_factor_table, factor_from_counts,
     parse_factor_table,
 };
-use st_engine::price::{PriceTick, read_hl_jsonl};
+use st_engine::price::{PriceSource, PriceTick, deribit_ticker_symbol, read_ticks_for_source};
 
 struct CliArgs {
     files: Vec<PathBuf>,
     coin: String,
+    source: PriceSource,
     band_cents: u32,
     distance_factors: [Option<f64>; 6],
     sigma_scale: Option<f64>,
@@ -48,6 +49,7 @@ impl Default for CliArgs {
         Self {
             files: Vec::new(),
             coin: String::new(),
+            source: PriceSource::Hyperliquid,
             band_cents: 0,
             distance_factors: [None; 6],
             sigma_scale: None,
@@ -80,6 +82,10 @@ fn apply_arg(out: &mut CliArgs, key: &str, val: &str) -> Result<(), String> {
     match key {
         "--file" => out.files.push(PathBuf::from(val)),
         "--coin" => out.coin = val.to_string(),
+        "--source" => {
+            out.source = PriceSource::parse(val)
+                .ok_or_else(|| "bad --source (expected hyperliquid or deribit)".to_string())?;
+        }
         "--band-cents" => out.band_cents = val.parse().map_err(|_| "bad --band-cents")?,
         "--distance-factor-1"
         | "--distance-factor-2"
@@ -164,12 +170,16 @@ fn parse_args() -> Result<CliArgs, String> {
         i += 2;
     }
     if out.files.is_empty() || out.coin.is_empty() || out.band_cents == 0 {
-        return Err("usage: calibrate --file <jsonl> --coin <coin> --band-cents <n>".into());
+        return Err(
+            "usage: calibrate --file <jsonl> --coin <coin> --band-cents <n> [--source hyperliquid|deribit]"
+                .into(),
+        );
     }
     Ok(out)
 }
 
 fn apply_overrides(cfg: &mut GridConfig, cli: &CliArgs) -> Result<(), String> {
+    cfg.simulation.price_source = cli.source;
     if let Some(windows) = cli.windows {
         cfg.simulation.quote_window_count = windows;
     }
@@ -255,7 +265,7 @@ fn apply_overrides(cfg: &mut GridConfig, cli: &CliArgs) -> Result<(), String> {
 fn load_ticks(cli: &CliArgs) -> Vec<PriceTick> {
     let mut ticks = Vec::new();
     for path in &cli.files {
-        let mut part = read_hl_jsonl(path, &cli.coin).unwrap_or_else(|e| {
+        let mut part = read_ticks_for_source(path, &cli.coin, cli.source).unwrap_or_else(|e| {
             eprintln!("failed reading {}: {e}", path.display());
             std::process::exit(1);
         });
@@ -564,12 +574,15 @@ fn main() {
         std::process::exit(2);
     });
     let ticks = load_ticks(&cli);
-    let ticker = cli
-        .coin
-        .split(':')
-        .next_back()
-        .unwrap_or(&cli.coin)
-        .to_string();
+    let ticker = match cli.source {
+        PriceSource::Deribit => deribit_ticker_symbol(&cli.coin),
+        PriceSource::Hyperliquid => cli
+            .coin
+            .split(':')
+            .next_back()
+            .unwrap_or(&cli.coin)
+            .to_string(),
+    };
     let mut cfg = stock_grid_config_for_ticker(&ticker, cli.band_cents, Vec::new());
     if let Err(err) = apply_overrides(&mut cfg, &cli) {
         eprintln!("{err}");
@@ -624,5 +637,17 @@ mod tests {
         assert!(cli.dump_counts);
         assert!(apply_arg(&mut cli, "--windows", "0").is_err());
         assert!(apply_arg(&mut cli, "--quote-step-secs", "0").is_err());
+    }
+
+    #[test]
+    fn source_flag_defaults_to_hyperliquid_and_accepts_deribit() {
+        let mut cli = CliArgs::default();
+        assert_eq!(cli.source, PriceSource::Hyperliquid);
+        apply_arg(&mut cli, "--source", "deribit").unwrap();
+        assert_eq!(cli.source, PriceSource::Deribit);
+        assert!(apply_arg(&mut cli, "--source", "unknown").is_err());
+        let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+        apply_overrides(&mut cfg, &cli).unwrap();
+        assert_eq!(cfg.simulation.price_source, PriceSource::Deribit);
     }
 }

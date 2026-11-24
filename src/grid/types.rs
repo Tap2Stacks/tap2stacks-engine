@@ -276,6 +276,7 @@ pub struct SimulationConfig {
     pub far_phase_ms: u64,
     pub pricing_model: crate::v2::PricingModel,
     pub v2_forced_regime: Option<crate::v2::Regime>,
+    pub price_source: crate::price::PriceSource,
 }
 
 impl Default for SimulationConfig {
@@ -301,6 +302,7 @@ impl Default for SimulationConfig {
             far_phase_ms: 0,
             pricing_model: crate::v2::PricingModel::V1,
             v2_forced_regime: None,
+            price_source: crate::price::PriceSource::Hyperliquid,
         }
     }
 }

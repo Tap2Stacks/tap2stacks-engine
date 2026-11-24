@@ -1,4 +1,28 @@
+use std::time::Duration;
+
 use crate::grid::OhlcBar;
+
+/// Hyperliquid trade.xyz oracle update period (seconds).
+pub const HL_CLOCK_SECS: u64 = 3;
+/// Hyperliquid settlement void gap threshold (milliseconds).
+pub const HL_VOID_GAP_MS: u64 = 3_000;
+/// Hyperliquid feed staleness threshold (seconds).
+pub const HL_STALE_AFTER_SECS: u64 = 3;
+
+/// Deribit perp-index update period (seconds).
+pub const DERIBIT_CLOCK_SECS: u64 = 1;
+/// PROVISIONAL Deribit settlement void gap threshold (milliseconds); lead tunes from recorded data.
+pub const DERIBIT_VOID_GAP_MS: u64 = 3_000;
+/// PROVISIONAL Deribit feed staleness threshold (seconds); lead tunes from recorded data.
+pub const DERIBIT_STALE_AFTER_SECS: u64 = 3;
+
+/// Timing parameters for a given upstream price source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceTiming {
+    pub clock_secs: u64,
+    pub void_gap_ms: u64,
+    pub stale_after: Duration,
+}
 
 /// Selects the upstream market-data price source (`hyperliquid` default, or `deribit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -21,6 +45,21 @@ impl PriceSource {
         match self {
             Self::Hyperliquid => "hyperliquid",
             Self::Deribit => "deribit",
+        }
+    }
+
+    pub const fn timing(self) -> SourceTiming {
+        match self {
+            Self::Hyperliquid => SourceTiming {
+                clock_secs: HL_CLOCK_SECS,
+                void_gap_ms: HL_VOID_GAP_MS,
+                stale_after: Duration::from_secs(HL_STALE_AFTER_SECS),
+            },
+            Self::Deribit => SourceTiming {
+                clock_secs: DERIBIT_CLOCK_SECS,
+                void_gap_ms: DERIBIT_VOID_GAP_MS,
+                stale_after: Duration::from_secs(DERIBIT_STALE_AFTER_SECS),
+            },
         }
     }
 }
