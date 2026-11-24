@@ -11,15 +11,19 @@ use st_engine::horizon::{
     CAP25_EPS, ExposureInterval, NEAR_WINDOWS, RepriceStats, apply_factor_table,
     compute_outstanding_exposure, parse_factor_table,
 };
-use st_engine::price::{PriceTick, read_hl_jsonl};
+use st_engine::price::{HlTick, PriceTick, read_hl_jsonl_ctx};
 use st_engine::stress::{
     CellTap, POLICIES, QUOTE_LEAD_MS, SHOCK_HORIZONS_MS, SIGMA_LAG_OFFSETS_MS, WINDOW_MS,
     WindowQuote, audit_feed_gaps, bucket_quote, choose_taps, dense_session_starts, format_utc,
-    hour_starts, log_move, max_gap_overlapping, merge_starts, minute_starts, move_sign,
-    normal_session_starts, parse_period, parse_utc, price_at_or_before, quoted_sigma_at,
-    realized_step_sigma, stake_stats, tripwire_k, worst_edge_minute, worst_minute,
+    hour_starts, log_move, max_gap_overlapping, merge_starts, mid_gap_cents_at, mid_side_label,
+    minute_starts, move_sign, normal_session_starts, parse_period, parse_utc, price_at_or_before,
+    quoted_sigma_at, realized_step_sigma, stake_stats, tripwire_k, worst_edge_minute, worst_minute,
 };
-use st_engine::v2::{PricingModel, Regime};
+use st_engine::v2::{PricingModel, Regime, V2_M_BASE};
+
+const DAY_MS: u64 = 86_400_000;
+const M3_DIST_WEIGHTS: [f64; 6] = [0.35, 0.35, 0.15, 0.08, 0.04, 0.03];
+const M3_MARGIN_TARGET: f64 = 0.020;
 
 const STAKE: f64 = 10.0;
 const BURST_MS: u64 = 30_000;
@@ -33,6 +37,7 @@ const NEWS_MIN_1356_TO_MS: u64 = 1_795_442_220_000; // 2026-11-23T13:57:00Z
 
 struct Args {
     files: Vec<PathBuf>,
+    data_dirs: Vec<PathBuf>,
     coin: String,
     band_cents: u32,
     m_base: Option<f64>,
@@ -45,6 +50,8 @@ struct Args {
     seed: u64,
     from_utc: Option<u64>,
     to_utc: Option<u64>,
+    date_from_ms: Option<u64>,
+    date_to_excl_ms: Option<u64>,
     dense_from: Option<u64>,
     dense_to: Option<u64>,
     dense_step_ms: u64,
@@ -68,9 +75,52 @@ struct Args {
     accuracy_table: bool,
 }
 
+fn parse_date_utc(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() == 10 {
+        parse_utc(&format!("{trimmed}T00:00:00Z"))
+    } else {
+        Err(format!("bad date '{raw}': expected YYYY-MM-DD"))
+    }
+}
+
+fn parse_date_range(raw: &str) -> Result<(u64, u64), String> {
+    let trimmed = raw.trim();
+    let (start_s, end_s) = trimmed
+        .split_once("..")
+        .ok_or_else(|| format!("bad --date-range '{raw}': expected YYYY-MM-DD..YYYY-MM-DD"))?;
+    let from_ms = parse_date_utc(start_s)?;
+    let to_start_ms = parse_date_utc(end_s)?;
+    if to_start_ms < from_ms {
+        return Err(format!(
+            "bad --date-range '{raw}': end date precedes start date"
+        ));
+    }
+    Ok((from_ms, to_start_ms.saturating_add(DAY_MS)))
+}
+
+fn filename_date_ms(path: &std::path::Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let bytes = name.as_bytes();
+    if bytes.len() < 10 {
+        return None;
+    }
+    for start in 0..=(bytes.len() - 10) {
+        let sub = &name[start..start + 10];
+        let b = sub.as_bytes();
+        if b[4] == b'-' && b[7] == b'-' {
+            if let Ok(ms) = parse_date_utc(sub) {
+                return Some(ms);
+            }
+        }
+    }
+    None
+}
+
 fn parse_args() -> Args {
     let mut args = Args {
         files: Vec::new(),
+        data_dirs: Vec::new(),
         coin: String::new(),
         band_cents: 0,
         m_base: None,
@@ -83,6 +133,8 @@ fn parse_args() -> Args {
         seed: 42,
         from_utc: None,
         to_utc: None,
+        date_from_ms: None,
+        date_to_excl_ms: None,
         dense_from: None,
         dense_to: None,
         dense_step_ms: 10_000,
@@ -114,6 +166,7 @@ fn parse_args() -> Args {
             .unwrap_or_else(|| panic!("missing value for {key}"));
         match key {
             "--file" => args.files.push(PathBuf::from(val)),
+            "--data-dir" => args.data_dirs.push(PathBuf::from(val)),
             "--coin" => args.coin = val.to_string(),
             "--band-cents" => args.band_cents = val.parse().expect("bad --band-cents"),
             "--m-base" => args.m_base = Some(val.parse().expect("bad --m-base")),
@@ -134,6 +187,19 @@ fn parse_args() -> Args {
                 args.from_utc = Some(parse_utc(val).unwrap_or_else(|err| panic!("{err}")))
             }
             "--to-utc" => args.to_utc = Some(parse_utc(val).unwrap_or_else(|err| panic!("{err}"))),
+            "--from-date" => {
+                args.date_from_ms = Some(parse_date_utc(val).unwrap_or_else(|err| panic!("{err}")))
+            }
+            "--to-date" => {
+                let start = parse_date_utc(val).unwrap_or_else(|err| panic!("{err}"));
+                args.date_to_excl_ms = Some(start.saturating_add(DAY_MS));
+            }
+            "--date-range" => {
+                let (from_ms, to_excl_ms) =
+                    parse_date_range(val).unwrap_or_else(|err| panic!("{err}"));
+                args.date_from_ms = Some(from_ms);
+                args.date_to_excl_ms = Some(to_excl_ms);
+            }
             "--dense-from-utc" => {
                 args.dense_from = Some(parse_utc(val).unwrap_or_else(|err| panic!("{err}")))
             }
@@ -201,10 +267,18 @@ fn parse_args() -> Args {
         }
         i += 2;
     }
-    if args.files.is_empty() || args.coin.is_empty() || args.band_cents == 0 {
+    if (args.files.is_empty() && args.data_dirs.is_empty())
+        || args.coin.is_empty()
+        || args.band_cents == 0
+    {
         panic!(
-            "usage: policy_backtest --file <jsonl> --coin <coin> --band-cents <n> [--windows <n>] [--factors-file <path>] [--far-refresh-ms <ms>] [--mc-n <n>] [--tick-reprice true] [--reprice-from-utc <ts> --reprice-to-utc <ts>] [--bench-only true] [--from-utc <ts>] [--to-utc <ts>] [--dense-from-utc <ts> --dense-to-utc <ts>] [--minute-from-utc <ts> --minute-to-utc <ts>] [--shock-utc <ts>] [--period name,start,end] [--sessions 0]"
+            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
         );
+    }
+    if let (Some(f), Some(t)) = (args.date_from_ms, args.date_to_excl_ms) {
+        if t <= f {
+            panic!("--to-date must be on or after --from-date");
+        }
     }
     if args.dense_from.is_some() != args.dense_to.is_some() {
         panic!("--dense-from-utc and --dense-to-utc must be set together");
@@ -271,11 +345,38 @@ fn apply(cfg: &mut GridConfig, args: &Args) {
     cfg.simulation.seed = Some(args.seed);
 }
 
-fn load_ticks(args: &Args) -> Vec<PriceTick> {
+fn load_hl_ticks(args: &Args) -> Vec<HlTick> {
+    let mut paths = args.files.clone();
+    for dir in &args.data_dirs {
+        let mut dir_paths: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("failed reading dir {}: {err}", dir.display()))
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+            .collect();
+        dir_paths.sort();
+        for path in dir_paths {
+            if let Some(day_ms) = filename_date_ms(&path) {
+                let day_end_ms = day_ms.saturating_add(DAY_MS);
+                if args.date_from_ms.is_some_and(|from| day_end_ms <= from) {
+                    continue;
+                }
+                if args.date_to_excl_ms.is_some_and(|to| day_ms >= to) {
+                    continue;
+                }
+            }
+            paths.push(path);
+        }
+    }
     let mut ticks = Vec::new();
-    for path in &args.files {
-        let mut part = read_hl_jsonl(path, &args.coin).unwrap_or_else(|err| panic!("{err}"));
+    for path in &paths {
+        let mut part = read_hl_jsonl_ctx(path, &args.coin).unwrap_or_else(|err| panic!("{err}"));
         ticks.append(&mut part);
+    }
+    if let Some(from_ms) = args.date_from_ms {
+        ticks.retain(|tick| tick.ts_ms >= from_ms);
+    }
+    if let Some(to_excl_ms) = args.date_to_excl_ms {
+        ticks.retain(|tick| tick.ts_ms < to_excl_ms);
     }
     ticks.sort_by_key(|tick| tick.ts_ms);
     ticks
@@ -338,7 +439,7 @@ fn quotes_from(report: &CalibrationReport) -> Vec<WindowQuote> {
     by_quote.into_values().collect()
 }
 
-fn build_taps(report: &CalibrationReport, ticks: &[PriceTick]) -> Vec<CellTap> {
+fn build_taps(report: &CalibrationReport, ticks: &[PriceTick], hl_ticks: &[HlTick]) -> Vec<CellTap> {
     let mut taps = Vec::new();
     for sample in &report.samples {
         if sample.is_warmup {
@@ -354,6 +455,7 @@ fn build_taps(report: &CalibrationReport, ticks: &[PriceTick]) -> Vec<CellTap> {
             hit: sample.hit,
             us: sample.is_us_session,
             move_sign: move_sign(ticks, sample.quote_ts_ms, 10_000),
+            mid_gap_cents: mid_gap_cents_at(hl_ticks, sample.quote_ts_ms),
             sigma: sample.sigma,
             sigma_raw: sample.sigma_raw,
         });
@@ -715,7 +817,9 @@ fn precompute_legacy_board_starts(ticks: &[PriceTick], args: &Args) -> (Vec<Vec<
         let mut rng = StdRng::seed_from_u64(args.seed + policy_index as u64);
         let mut starts = Vec::new();
         let mut start = first_non_warmup.saturating_add(WATCH_MS);
-        while starts.len() < args.sessions && start.saturating_add(BURST_MS) < last_ts {
+        while (args.sessions == 0 || starts.len() < args.sessions)
+            && start.saturating_add(BURST_MS) < last_ts
+        {
             starts.push(start);
             all.push(start);
             start = start.saturating_add(rng.random_range(RETURN_MIN_MS..RETURN_MAX_MS));
@@ -749,8 +853,59 @@ fn print_regime_policy_line(regime: Regime, name: &str, acc: &Acc) {
     );
 }
 
-fn print_accuracy_table(report: &CalibrationReport) {
-    // Accumulate non-warmup predicted vs realized touch by (regime, window_label, dist_bucket).
+type SideAccuracyMap = BTreeMap<(usize, &'static str, &'static str, usize), (usize, f64, usize)>;
+
+fn accumulate_side_accuracy(report: &CalibrationReport, hl_ticks: &[HlTick]) -> SideAccuracyMap {
+    let mut side_stats: SideAccuracyMap = BTreeMap::new();
+    for sample in &report.samples {
+        if sample.is_warmup {
+            continue;
+        }
+        let Some(regime) = sample.regime else {
+            continue;
+        };
+        let gap = mid_gap_cents_at(hl_ticks, sample.quote_ts_ms);
+        let Some(side) = mid_side_label(sample.row_offset, gap) else {
+            continue;
+        };
+        let dist = sample.dist_bucket.min(5);
+        let r_idx = regime.index();
+        let hit_u = usize::from(sample.hit);
+        let band_label = if sample.window_index < NEAR_WINDOWS {
+            "near"
+        } else {
+            "far"
+        };
+        let se = side_stats
+            .entry((r_idx, band_label, side, dist))
+            .or_insert((0, 0.0, 0));
+        se.0 += 1;
+        se.1 += sample.predicted;
+        se.2 += hit_u;
+
+        let exact_label = match sample.window_index {
+            0 => Some("w0"),
+            2 => Some("w2"),
+            5 => Some("w5"),
+            11 => Some("w11"),
+            23 => Some("w23"),
+            _ => None,
+        };
+        if let Some(wl) = exact_label {
+            let se2 = side_stats
+                .entry((r_idx, wl, side, dist))
+                .or_insert((0, 0.0, 0));
+            se2.0 += 1;
+            se2.1 += sample.predicted;
+            se2.2 += hit_u;
+        }
+    }
+    side_stats
+}
+
+fn print_accuracy_table(report: &CalibrationReport, hl_ticks: &[HlTick]) {
+    // Accumulate non-warmup predicted vs realized touch by (regime, window_label, dist_bucket),
+    // and split by side relative to the Hyperliquid midPx - markPx gap (mid_side / other_side / center).
     let mut stats: BTreeMap<(usize, &'static str, usize), (usize, f64, usize)> = BTreeMap::new();
     for sample in &report.samples {
         if sample.is_warmup {
@@ -798,6 +953,97 @@ fn print_accuracy_table(report: &CalibrationReport) {
         println!(
             "ACCURACY_REGIME regime={} w={wl} dist={dist} n={n} pred={pred:.4} hit={hit:.4} err_pp={err_pp:+.2}",
             Regime::from_index(r_idx).as_str()
+        );
+    }
+    let side_stats = accumulate_side_accuracy(report, hl_ticks);
+    for ((r_idx, wl, side, dist), (n, pred_sum, hits)) in side_stats {
+        if n == 0 {
+            continue;
+        }
+        let pred = pred_sum / n as f64;
+        let hit = hits as f64 / n as f64;
+        let err_pp = (pred - hit) * 100.0;
+        println!(
+            "ACCURACY_SIDE regime={} w={wl} side={side} dist={dist} n={n} pred={pred:.4} hit={hit:.4} err_pp={err_pp:+.2}",
+            Regime::from_index(r_idx).as_str()
+        );
+    }
+}
+
+/// Computes weighted `Q_0.75(m_solv)` over uncapped near cells (`d = 0..5`) using the M3
+/// tap-density weights `[0.35, 0.35, 0.15, 0.08, 0.04, 0.03]` (`docs/odds-model-v2.md` §3.3).
+/// Returns `(q75_m_solv, uncapped_count, per_dist_m_solv)`.
+fn weighted_q75_m_solv(
+    dist_stats: &[(usize, f64, usize); 6],
+    max_multiplier: f64,
+) -> (f64, usize, [f64; 6]) {
+    let p_uncap = (1.0 - V2_M_BASE) / max_multiplier.max(1.05);
+    let mut per_dist = [0.0_f64; 6];
+    let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(6);
+    for (d, &(n, pred_sum, hits)) in dist_stats.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let pred = pred_sum / n as f64;
+        let hit = hits as f64 / n as f64;
+        let m_solv = if hit > 0.0 {
+            (1.0 - pred / hit).max(0.0)
+        } else {
+            0.0
+        };
+        per_dist[d] = m_solv;
+        if pred >= p_uncap {
+            pairs.push((m_solv, M3_DIST_WEIGHTS[d]));
+        }
+    }
+    if pairs.is_empty() {
+        return (0.0, 0, per_dist);
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total_w: f64 = pairs.iter().map(|&(_, w)| w).sum();
+    let target = 0.75 * total_w;
+    let mut cum = 0.0_f64;
+    let mut q75 = pairs.last().map(|&(m, _)| m).unwrap_or(0.0);
+    for &(m, w) in &pairs {
+        cum += w;
+        if cum >= target {
+            q75 = m;
+            break;
+        }
+    }
+    (q75, pairs.len(), per_dist)
+}
+
+fn print_solvency_summary(report: &CalibrationReport, max_multiplier: f64) {
+    let mut by_regime = [[(0usize, 0.0_f64, 0usize); 6]; 4];
+    for sample in &report.samples {
+        if sample.is_warmup || sample.window_index >= NEAR_WINDOWS {
+            continue;
+        }
+        let Some(regime) = sample.regime else {
+            continue;
+        };
+        let d = sample.dist_bucket.min(5);
+        let entry = &mut by_regime[regime.index()][d];
+        entry.0 += 1;
+        entry.1 += sample.predicted;
+        entry.2 += usize::from(sample.hit);
+    }
+    for regime in Regime::ALL {
+        let stats = &by_regime[regime.index()];
+        let near_n: usize = stats.iter().map(|&(n, _, _)| n).sum();
+        if near_n == 0 {
+            continue;
+        }
+        let (q75, uncapped_d, per_d) = weighted_q75_m_solv(stats, max_multiplier);
+        let suggested = (q75 + M3_MARGIN_TARGET).max(V2_M_BASE);
+        println!(
+            "SOLVENCY_REGIME regime={} near_n={near_n} uncapped_d={uncapped_d} q75_m_solv_pct={:.2} suggested_m_base_pct={:.2} d0_m_solv_pct={:.2} d1_m_solv_pct={:.2}",
+            regime.as_str(),
+            q75 * 100.0,
+            suggested * 100.0,
+            per_d[0] * 100.0,
+            per_d[1] * 100.0
         );
     }
 }
@@ -1369,7 +1615,8 @@ fn main() {
     apply(&mut cfg, &args);
     let cur_shift = cfg.pricing.current_row_logit_shift;
     let adj_shift = cfg.pricing.adjacent_row_logit_shift;
-    let mut ticks = load_ticks(&args);
+    let hl_ticks = load_hl_ticks(&args);
+    let mut ticks: Vec<PriceTick> = hl_ticks.iter().map(|t| t.to_price_tick()).collect();
 
     let mut opts = CalibrateOptions::standard(ticker.clone(), args.band_cents, cfg.clone());
     opts.reprice_every_tick = args.tick_reprice;
@@ -1451,7 +1698,7 @@ fn main() {
     }
 
     let report = run_calibration(&ticks, &opts);
-    let taps = build_taps(&report, &ticks);
+    let taps = build_taps(&report, &ticks, &hl_ticks);
     println!(
         "ticker={ticker} model={} band={} windows={} max_mult={:.1} cur_shift={cur_shift} adj_shift={adj_shift} samples={}",
         cfg.simulation.pricing_model.as_str(),
@@ -1461,8 +1708,9 @@ fn main() {
         taps.len()
     );
     if args.accuracy_table {
-        print_accuracy_table(&report);
+        print_accuracy_table(&report, &hl_ticks);
     }
+    print_solvency_summary(&report, cfg.pricing.max_multiplier);
     if is_event {
         let quotes = quotes_from(&report);
         run_event(
@@ -1478,5 +1726,125 @@ fn main() {
         run_legacy_board(&args, &cfg, &taps, &per_policy_starts, &report);
     } else {
         run_legacy(&args, &cfg, &taps, &report);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_range_parses_inclusive_days_and_rejects_inverted() {
+        let (from_ms, to_excl_ms) = parse_date_range("2026-11-22..2026-11-24").unwrap();
+        assert_eq!(from_ms, parse_utc("2026-11-22T00:00:00Z").unwrap());
+        assert_eq!(to_excl_ms, parse_utc("2026-11-25T00:00:00Z").unwrap());
+        assert_eq!(to_excl_ms - from_ms, 3 * DAY_MS);
+
+        let (s1, e1) = parse_date_range("2026-11-18..2026-11-18").unwrap();
+        assert_eq!(e1 - s1, DAY_MS);
+
+        assert!(parse_date_range("2026-11-24..2026-11-22").is_err());
+        assert!(parse_date_range("2026-11-22").is_err());
+        assert_eq!(
+            filename_date_ms(std::path::Path::new("/data/e10-2026-11-23.jsonl")),
+            Some(parse_utc("2026-11-23T00:00:00Z").unwrap())
+        );
+    }
+
+    #[test]
+    fn weighted_q75_m_solv_reproduces_m3_rule() {
+        // NVDA normal near from m2-summary.txt line 10: d0 hit=0.442 pred=0.407 -> m_solv=7.92%;
+        // d1..d4 pred>=hit (m_solv=0); d5 pred=0.020 < 0.039 (capped at 25x).
+        let stats = [
+            (1000, 407.0, 442),
+            (1000, 355.0, 354),
+            (1000, 255.0, 225),
+            (1000, 163.0, 131),
+            (1000, 97.0, 76),
+            (1000, 20.0, 18),
+        ];
+        let (q75, uncapped_d, per_d) = weighted_q75_m_solv(&stats, 25.0);
+        assert_eq!(uncapped_d, 5);
+        let expected_d0 = 1.0 - 407.0 / 442.0;
+        assert!((per_d[0] - expected_d0).abs() < 1e-12);
+        assert!((q75 - expected_d0).abs() < 1e-12);
+        let suggested = (q75 + M3_MARGIN_TARGET).max(V2_M_BASE);
+        assert!((suggested - (expected_d0 + 0.020)).abs() < 1e-12);
+
+        // When all uncapped buckets over-predict, q75 = 0 and suggested hits the 2.5% floor.
+        let over = [
+            (1000, 633.0, 626),
+            (1000, 380.0, 348),
+            (1000, 120.0, 119),
+            (1000, 45.0, 44),
+            (1000, 20.0, 20),
+            (1000, 4.0, 4),
+        ];
+        let (q75_q, _, _) = weighted_q75_m_solv(&over, 25.0);
+        assert_eq!(q75_q, 0.0);
+        assert!(((q75_q + M3_MARGIN_TARGET).max(V2_M_BASE) - 0.025).abs() < 1e-12);
+    }
+
+    #[test]
+    fn side_accuracy_splits_mid_side_vs_other_side_per_regime_and_distance() {
+        use st_engine::calibrate::CalibrationSample;
+
+        let hl_ticks = vec![
+            // Positive mid gap (+3c): +row is mid_side, -row is other_side
+            HlTick {
+                ts_ms: 10_000,
+                price: 145.98,
+                mid_px: Some(146.01),
+                oracle_px: Some(145.90),
+            },
+            // Negative mid gap (-2c): -row is mid_side, +row is other_side
+            HlTick {
+                ts_ms: 20_000,
+                price: 146.00,
+                mid_px: Some(145.98),
+                oracle_px: Some(145.95),
+            },
+            // Missing mid: excluded from side split
+            HlTick {
+                ts_ms: 30_000,
+                price: 146.00,
+                mid_px: None,
+                oracle_px: None,
+            },
+        ];
+        let mut report = CalibrationReport::default();
+        let mk = |ts: u64, row_offset: i64, pred: f64, hit: bool| CalibrationSample {
+            quote_ts_ms: ts,
+            window_index: 0,
+            dist_bucket: row_offset.unsigned_abs() as usize,
+            predicted: pred,
+            hit,
+            regime: Some(Regime::Normal),
+            row_offset,
+            ..CalibrationSample::default()
+        };
+        report.samples = vec![
+            mk(10_000, 1, 0.40, true),   // mid_side hit
+            mk(10_000, -1, 0.40, false), // other_side miss
+            mk(10_000, 0, 0.65, true),   // center hit
+            mk(20_000, -1, 0.42, true),  // mid_side hit
+            mk(20_000, 1, 0.42, false),  // other_side miss
+            mk(30_000, 1, 0.40, true),   // no mid -> excluded
+        ];
+        let stats = accumulate_side_accuracy(&report, &hl_ticks);
+        let r = Regime::Normal.index();
+        let (n_mid, pred_mid, hit_mid) = stats[&(r, "near", "mid_side", 1)];
+        assert_eq!(n_mid, 2);
+        assert!((pred_mid / 2.0 - 0.41).abs() < 1e-12);
+        assert_eq!(hit_mid, 2);
+
+        let (n_oth, pred_oth, hit_oth) = stats[&(r, "near", "other_side", 1)];
+        assert_eq!(n_oth, 2);
+        assert!((pred_oth / 2.0 - 0.41).abs() < 1e-12);
+        assert_eq!(hit_oth, 0);
+
+        let (n_ctr, _, hit_ctr) = stats[&(r, "near", "center", 0)];
+        assert_eq!(n_ctr, 1);
+        assert_eq!(hit_ctr, 1);
     }
 }

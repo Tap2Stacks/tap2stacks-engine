@@ -6,6 +6,25 @@ pub struct PriceTick {
     pub price: f64,
 }
 
+/// Recorded Hyperliquid `activeAssetCtx` tick with optional `midPx` and `oraclePx`
+/// alongside `markPx` (`price`), used by offline backtesting and analysis tools.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HlTick {
+    pub ts_ms: u64,
+    pub price: f64,
+    pub mid_px: Option<f64>,
+    pub oracle_px: Option<f64>,
+}
+
+impl HlTick {
+    pub fn to_price_tick(self) -> PriceTick {
+        PriceTick {
+            ts_ms: self.ts_ms,
+            price: self.price,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PriceSnapshot {
     pub latest_tick: Option<PriceTick>,

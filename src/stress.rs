@@ -1,9 +1,9 @@
 use rand::Rng;
 
 use crate::calibrate::eval::{collect_gaps_over_3s, window_is_void};
-use crate::price::PriceTick;
+use crate::price::{HlTick, PriceTick};
 
-pub const POLICIES: [&str; 8] = [
+pub const POLICIES: [&str; 9] = [
     "closest",
     "three_rows",
     "row_sweep",
@@ -12,10 +12,12 @@ pub const POLICIES: [&str; 8] = [
     "random_near",
     "momentum",
     "chase_far",
+    "mid_follow",
 ];
 
 pub const QUOTE_LEAD_MS: u64 = 5_000;
 pub const WINDOW_MS: u64 = 5_000;
+pub const MID_GAP_THRESHOLD_CENTS: f64 = 0.5;
 pub const SHOCK_HORIZONS_MS: [u64; 3] = [10_000, 60_000, 300_000];
 pub const SIGMA_LAG_OFFSETS_MS: [u64; 6] = [0, 10_000, 30_000, 60_000, 120_000, 300_000];
 
@@ -33,6 +35,7 @@ pub struct CellTap {
     pub hit: bool,
     pub us: bool,
     pub move_sign: i8,
+    pub mid_gap_cents: Option<f64>,
     pub sigma: f64,
     pub sigma_raw: f64,
 }
@@ -156,6 +159,37 @@ pub fn move_sign(ticks: &[PriceTick], quote_ms: u64, lookback_ms: u64) -> i8 {
     }
 }
 
+/// Returns `midPx - markPx` in cents at or before `quote_ms`, or `None` if no tick or no `midPx`.
+pub fn mid_gap_cents_at(ticks: &[HlTick], quote_ms: u64) -> Option<f64> {
+    let idx = ticks.partition_point(|tick| tick.ts_ms <= quote_ms);
+    if idx == 0 {
+        return None;
+    }
+    let tick = ticks[idx - 1];
+    tick.mid_px.map(|mid| (mid - tick.price) * 100.0)
+}
+
+/// Classifies a cell's signed `row_offset` relative to the `midPx - markPx` gap:
+/// - `Some("center")` when `row_offset == 0` and a nonzero mid gap exists,
+/// - `Some("mid_side")` when `row_offset` is on the same side as the mid gap,
+/// - `Some("other_side")` when `row_offset` is on the opposite side of the mid gap,
+/// - `None` when `mid_gap_cents` is absent or zero (`|gap| <= 1e-9`).
+pub fn mid_side_label(row_offset: i64, mid_gap_cents: Option<f64>) -> Option<&'static str> {
+    let gap = mid_gap_cents?;
+    if !gap.is_finite() || gap.abs() <= 1e-9 {
+        return None;
+    }
+    if row_offset == 0 {
+        return Some("center");
+    }
+    let gap_sign: i64 = if gap > 0.0 { 1 } else { -1 };
+    if row_offset * gap_sign > 0 {
+        Some("mid_side")
+    } else {
+        Some("other_side")
+    }
+}
+
 pub fn choose_taps(policy: &str, taps: &[CellTap], count: usize, rng: &mut impl Rng) -> Vec<CellTap> {
     let mut pool = taps.to_vec();
     match policy {
@@ -213,6 +247,17 @@ pub fn choose_taps(policy: &str, taps: &[CellTap], count: usize, rng: &mut impl 
                     .then(right.multiplier.total_cmp(&left.multiplier))
                     .then(left.start_ms.cmp(&right.start_ms))
             });
+        }
+        "mid_follow" => {
+            pool.retain(|tap| {
+                tap.mid_gap_cents.is_some_and(|gap| {
+                    gap.is_finite()
+                        && gap.abs() >= MID_GAP_THRESHOLD_CENTS
+                        && tap.signed_dist != 0
+                        && tap.signed_dist.signum() as i8 == if gap > 0.0 { 1 } else { -1 }
+                })
+            });
+            pool.sort_by_key(|tap| (tap.dist, tap.start_ms));
         }
         _ => {}
     }
@@ -524,9 +569,16 @@ mod tests {
             hit: false,
             us: true,
             move_sign,
+            mid_gap_cents: None,
             sigma: 0.001,
             sigma_raw: 0.001,
         }
+    }
+
+    fn tap_with_mid(start_ms: u64, signed_dist: i64, mid_gap_cents: Option<f64>) -> CellTap {
+        let mut t = tap(start_ms, signed_dist, 3.0, 0);
+        t.mid_gap_cents = mid_gap_cents;
+        t
     }
 
     #[test]
@@ -699,13 +751,23 @@ mod tests {
                     hit: false,
                     us: true,
                     move_sign: 1,
+                    mid_gap_cents: Some(2.0),
                     sigma: 0.001,
                     sigma_raw: 0.001,
                 });
             }
         }
         let mut rng = StdRng::seed_from_u64(42);
-        for policy in ["closest", "row_sweep", "long_bias", "short_bias", "random_near", "momentum", "chase_far"] {
+        for policy in [
+            "closest",
+            "row_sweep",
+            "long_bias",
+            "short_bias",
+            "random_near",
+            "momentum",
+            "chase_far",
+            "mid_follow",
+        ] {
             let picked = choose_taps(policy, &board, 18, &mut rng);
             assert_eq!(picked.len(), 18, "policy={policy}");
             assert!(
@@ -713,5 +775,96 @@ mod tests {
                 "expected policy {policy} to tap far windows (>=6)"
             );
         }
+    }
+
+    #[test]
+    fn mid_follow_selects_nearest_on_gap_side_and_skips_small_or_missing_gap() {
+        let mut rng = StdRng::seed_from_u64(1);
+
+        // Positive gap >= 0.5c picks positive signed_dist sorted by (dist, start_ms).
+        let up_board = vec![
+            tap_with_mid(15, 2, Some(1.5)),
+            tap_with_mid(10, -1, Some(1.5)),
+            tap_with_mid(15, 1, Some(1.5)),
+            tap_with_mid(10, 0, Some(1.5)),
+            tap_with_mid(10, 1, Some(1.5)),
+            tap_with_mid(10, 3, Some(1.5)),
+        ];
+        let picked_up = choose_taps("mid_follow", &up_board, 3, &mut rng);
+        assert_eq!(picked_up.len(), 3);
+        assert_eq!(
+            picked_up
+                .iter()
+                .map(|t| (t.signed_dist, t.start_ms))
+                .collect::<Vec<_>>(),
+            vec![(1, 10), (1, 15), (2, 15)]
+        );
+
+        // Negative gap at exact -0.5c boundary picks negative signed_dist sorted by (dist, start_ms).
+        let down_board = vec![
+            tap_with_mid(10, 1, Some(-0.5)),
+            tap_with_mid(15, -1, Some(-0.5)),
+            tap_with_mid(10, -2, Some(-0.5)),
+            tap_with_mid(10, -1, Some(-0.5)),
+        ];
+        let picked_down = choose_taps("mid_follow", &down_board, 2, &mut rng);
+        assert_eq!(
+            picked_down
+                .iter()
+                .map(|t| (t.signed_dist, t.start_ms))
+                .collect::<Vec<_>>(),
+            vec![(-1, 10), (-1, 15)]
+        );
+
+        // |gap| < 0.5c, zero gap, or missing mid taps nothing.
+        for gap in [Some(0.49), Some(-0.49), Some(0.0), None] {
+            let idle = vec![
+                tap_with_mid(10, 1, gap),
+                tap_with_mid(10, -1, gap),
+            ];
+            assert!(
+                choose_taps("mid_follow", &idle, 18, &mut rng).is_empty(),
+                "expected mid_follow idle for gap={gap:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_gap_lookup_and_side_split_classify_mid_vs_other_side() {
+        let ticks = vec![
+            HlTick {
+                ts_ms: 1_000,
+                price: 145.98,
+                mid_px: Some(146.005),
+                oracle_px: Some(145.88),
+            },
+            HlTick {
+                ts_ms: 2_000,
+                price: 146.00,
+                mid_px: Some(145.97),
+                oracle_px: Some(145.90),
+            },
+            HlTick {
+                ts_ms: 3_000,
+                price: 146.00,
+                mid_px: None,
+                oracle_px: None,
+            },
+        ];
+        assert_eq!(mid_gap_cents_at(&ticks, 500), None);
+        let g1 = mid_gap_cents_at(&ticks, 1_500).unwrap();
+        assert!((g1 - 2.5).abs() < 1e-9);
+        assert_eq!(mid_side_label(1, Some(g1)), Some("mid_side"));
+        assert_eq!(mid_side_label(-2, Some(g1)), Some("other_side"));
+        assert_eq!(mid_side_label(0, Some(g1)), Some("center"));
+
+        let g2 = mid_gap_cents_at(&ticks, 2_500).unwrap();
+        assert!((g2 + 3.0).abs() < 1e-9);
+        assert_eq!(mid_side_label(-1, Some(g2)), Some("mid_side"));
+        assert_eq!(mid_side_label(1, Some(g2)), Some("other_side"));
+
+        assert_eq!(mid_gap_cents_at(&ticks, 3_500), None);
+        assert_eq!(mid_side_label(1, None), None);
+        assert_eq!(mid_side_label(1, Some(0.0)), None);
     }
 }

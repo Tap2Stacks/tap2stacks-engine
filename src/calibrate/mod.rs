@@ -75,6 +75,7 @@ pub struct CalibrationSample {
     pub sigma: f64,
     pub sigma_raw: f64,
     pub regime: Option<Regime>,
+    pub row_offset: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -295,6 +296,10 @@ fn evaluate_window(
         .as_ref()
         .map(|(detector, _)| detector.current_regime());
     let spot_cents = (quote.spot * 100.0).round() as i64;
+    let band_c = opts.band_cents as i64;
+    let floor_spot_cents = (quote.spot * 100.0 + 1e-9).floor() as i64;
+    let anchor_cents = floor_spot_cents.div_euclid(band_c) * band_c;
+    let center_lower_cents = anchor_cents - (band_c / 2);
     let dist_max = opts.base_config.pricing.calibration_dist_max;
 
     if !opts.all_windows {
@@ -324,6 +329,7 @@ fn evaluate_window(
                 .abs_diff(spot_cents)
                 .div_ceil(opts.band_cents as u64) as usize;
             let dist_bucket = row_dist_bucket(quote.spot, opts.band_cents, cell.lower_cents, dist_max);
+            let row_offset = (cell.lower_cents - center_lower_cents).div_euclid(band_c);
             report.samples.push(CalibrationSample {
                 quote_ts_ms,
                 window_start_ms,
@@ -340,6 +346,7 @@ fn evaluate_window(
                 sigma,
                 sigma_raw,
                 regime,
+                row_offset,
             });
         }
         return true;
@@ -386,6 +393,7 @@ fn evaluate_window(
                 .abs_diff(spot_cents)
                 .div_ceil(opts.band_cents as u64) as usize;
             let dist_bucket = row_dist_bucket(quote.spot, opts.band_cents, cell.lower_cents, dist_max);
+            let row_offset = (cell.lower_cents - center_lower_cents).div_euclid(band_c);
             report.samples.push(CalibrationSample {
                 quote_ts_ms,
                 window_start_ms: w_start,
@@ -402,6 +410,7 @@ fn evaluate_window(
                 sigma,
                 sigma_raw,
                 regime,
+                row_offset,
             });
         }
     }

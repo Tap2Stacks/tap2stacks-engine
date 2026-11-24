@@ -127,6 +127,8 @@ pub struct AssetCtx {
     pub coin: String,
     pub mark_px: f64,
     pub prev_day_px: Option<f64>,
+    pub mid_px: Option<f64>,
+    pub oracle_px: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +143,10 @@ struct ActiveAssetCtx {
     mark_px: String,
     #[serde(rename = "prevDayPx")]
     prev_day_px: Option<String>,
+    #[serde(rename = "midPx")]
+    mid_px: Option<String>,
+    #[serde(rename = "oraclePx")]
+    oracle_px: Option<String>,
 }
 
 fn parse_positive_finite_price(raw: &str) -> Option<f64> {
@@ -160,15 +166,23 @@ pub(crate) fn parse_active_asset_ctx_full(data: serde_json::Value) -> Option<Ass
         .prev_day_px
         .as_deref()
         .and_then(parse_positive_finite_price);
+    let mid_px = payload
+        .ctx
+        .mid_px
+        .as_deref()
+        .and_then(parse_positive_finite_price);
+    let oracle_px = payload
+        .ctx
+        .oracle_px
+        .as_deref()
+        .and_then(parse_positive_finite_price);
     Some(AssetCtx {
         coin: payload.coin,
         mark_px,
         prev_day_px,
+        mid_px,
+        oracle_px,
     })
-}
-
-pub(crate) fn parse_active_asset_ctx_value(data: serde_json::Value) -> Option<(String, f64)> {
-    parse_active_asset_ctx_full(data).map(|ctx| (ctx.coin, ctx.mark_px))
 }
 
 /// Parses a live Hyperliquid WebSocket JSON frame and returns `AssetCtx`
@@ -489,6 +503,27 @@ mod tests {
         let parsed_no_prev = parse_asset_ctx(without_prev).expect("expected valid AssetCtx");
         assert_eq!(parsed_no_prev.mark_px, 154.68);
         assert_eq!(parsed_no_prev.prev_day_px, None);
+        assert_eq!(parsed_no_prev.oracle_px, Some(154.70));
+        assert_eq!(parsed_no_prev.mid_px, None);
+    }
+
+    #[test]
+    fn parse_asset_ctx_reads_optional_mid_and_oracle_px() {
+        let full = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"oraclePx":"145.88","markPx":"145.98","midPx":"146.005"}}}"#;
+        let parsed = parse_asset_ctx(full).expect("expected valid AssetCtx");
+        assert_eq!(parsed.mark_px, 145.98);
+        assert_eq!(parsed.mid_px, Some(146.005));
+        assert_eq!(parsed.oracle_px, Some(145.88));
+
+        let null_mid = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"145.98","midPx":null,"oraclePx":"145.88"}}}"#;
+        let parsed_null = parse_asset_ctx(null_mid).expect("expected valid AssetCtx with null mid");
+        assert_eq!(parsed_null.mid_px, None);
+        assert_eq!(parsed_null.oracle_px, Some(145.88));
+
+        let mark_only = r#"{"channel":"activeAssetCtx","data":{"coin":"xyz:NVDA","ctx":{"markPx":"145.98"}}}"#;
+        let parsed_min = parse_asset_ctx(mark_only).expect("expected valid mark-only AssetCtx");
+        assert_eq!(parsed_min.mid_px, None);
+        assert_eq!(parsed_min.oracle_px, None);
     }
 
     #[test]
