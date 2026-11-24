@@ -11,7 +11,9 @@ use st_engine::horizon::{
     CAP25_EPS, ExposureInterval, NEAR_WINDOWS, RepriceStats, apply_factor_table,
     compute_outstanding_exposure, parse_factor_table,
 };
-use st_engine::price::{HlTick, PriceTick, read_hl_jsonl_ctx};
+use st_engine::price::{
+    HlTick, PriceSource, PriceTick, deribit_ticker_symbol, read_ticks_for_source,
+};
 use st_engine::stress::{
     CellTap, POLICIES, QUOTE_LEAD_MS, SHOCK_HORIZONS_MS, SIGMA_LAG_OFFSETS_MS, WINDOW_MS,
     WindowQuote, audit_feed_gaps, bucket_quote, choose_taps, dense_session_starts, format_utc,
@@ -39,6 +41,7 @@ struct Args {
     files: Vec<PathBuf>,
     data_dirs: Vec<PathBuf>,
     coin: String,
+    source: PriceSource,
     band_cents: u32,
     m_base: Option<f64>,
     a_sigma: Option<f64>,
@@ -122,6 +125,7 @@ fn parse_args() -> Args {
         files: Vec::new(),
         data_dirs: Vec::new(),
         coin: String::new(),
+        source: PriceSource::Hyperliquid,
         band_cents: 0,
         m_base: None,
         a_sigma: None,
@@ -168,6 +172,10 @@ fn parse_args() -> Args {
             "--file" => args.files.push(PathBuf::from(val)),
             "--data-dir" => args.data_dirs.push(PathBuf::from(val)),
             "--coin" => args.coin = val.to_string(),
+            "--source" => {
+                args.source =
+                    PriceSource::parse(val).expect("bad --source (expected hyperliquid or deribit)")
+            }
             "--band-cents" => args.band_cents = val.parse().expect("bad --band-cents"),
             "--m-base" => args.m_base = Some(val.parse().expect("bad --m-base")),
             "--a-sigma" => args.a_sigma = Some(val.parse().expect("bad --a-sigma")),
@@ -273,7 +281,7 @@ fn parse_args() -> Args {
         || args.band_cents == 0
     {
         panic!(
-            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
+            "usage: policy_backtest (--file <jsonl> | --data-dir <dir>) --coin <coin> --band-cents <n> [--source hyperliquid|deribit] [--date-range YYYY-MM-DD..YYYY-MM-DD | --from-date YYYY-MM-DD --to-date YYYY-MM-DD] [--windows <n>] [--model v1|v2|m4] [--max-multiplier <cap>] [--accuracy-table true] [--sessions 200]"
         );
     }
     if let (Some(f), Some(t)) = (args.date_from_ms, args.date_to_excl_ms) {
@@ -370,7 +378,8 @@ fn load_hl_ticks(args: &Args) -> Vec<HlTick> {
     }
     let mut ticks = Vec::new();
     for path in &paths {
-        let mut part = read_hl_jsonl_ctx(path, &args.coin).unwrap_or_else(|err| panic!("{err}"));
+        let mut part = read_ticks_for_source(path, &args.coin, args.source)
+            .unwrap_or_else(|err| panic!("{err}"));
         ticks.append(&mut part);
     }
     if let Some(from_ms) = args.date_from_ms {
@@ -1606,12 +1615,15 @@ fn run_event(
 
 fn main() {
     let args = parse_args();
-    let ticker = args
-        .coin
-        .split(':')
-        .next_back()
-        .unwrap_or(&args.coin)
-        .to_string();
+    let ticker = match args.source {
+        PriceSource::Hyperliquid => args
+            .coin
+            .split(':')
+            .next_back()
+            .unwrap_or(&args.coin)
+            .to_string(),
+        PriceSource::Deribit => deribit_ticker_symbol(&args.coin),
+    };
     let mut cfg = stock_grid_config_for_ticker(&ticker, args.band_cents, Vec::new());
     apply(&mut cfg, &args);
     let cur_shift = cfg.pricing.current_row_logit_shift;

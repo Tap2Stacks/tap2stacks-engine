@@ -13,7 +13,8 @@ use st_engine::horizon::{
 };
 use st_engine::logging::init_tracing;
 use st_engine::price::{
-    FeedHealth, HealthTracker, HyperliquidConfig, PriceTick, fetch_candle_warmup, read_hl_jsonl,
+    DeribitConfig, FeedHealth, HealthTracker, HyperliquidConfig, PriceSource, PriceTick,
+    deribit_index_name, fetch_candle_warmup, read_ticks_for_source, spawn_deribit_stream,
     spawn_hyperliquid_stream, spawn_price_pipeline,
 };
 use st_engine::protocol::{EngineIn, EngineOut};
@@ -257,7 +258,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_TICKERS.to_string());
-    let tickers = parse_tickers(&tickers_raw)?;
+    let price_source = price_source_from_env()?;
+    let tickers = map_tickers_for_source(parse_tickers(&tickers_raw)?, price_source);
 
     let replay_file = env::var("ENGINE_REPLAY_FILE")
         .ok()
@@ -265,6 +267,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         .filter(|v| !v.is_empty());
 
     let hl_ws_url = env::var("HL_WS_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let drb_ws_url = env::var("DERIBIT_WS_URL")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
@@ -299,31 +305,62 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let mut seed_variance_priors: HashMap<String, f64> = HashMap::new();
     let (health_rx, prev_day_px) = if let Some(ref replay_path) = replay_file {
-        info!(replay_path = %replay_path, "starting engine_server in replay mode");
+        info!(
+            replay_path = %replay_path,
+            price_source = price_source.as_str(),
+            "starting engine_server in replay mode"
+        );
         let health_rx = spawn_replay_stream(
             Path::new(replay_path),
+            price_source,
             &tickers,
             tick_senders,
             Arc::clone(&clock),
         )?;
         (health_rx, Arc::new(RwLock::new(HashMap::new())))
     } else {
-        if warmup_minutes > 0 {
-            seed_variance_priors =
-                fetch_warmup_priors(&tickers, &hl_info_url, warmup_minutes).await;
+        match price_source {
+            PriceSource::Hyperliquid => {
+                if warmup_minutes > 0 {
+                    seed_variance_priors =
+                        fetch_warmup_priors(&tickers, &hl_info_url, warmup_minutes).await;
+                }
+                let mut hl_config = HyperliquidConfig {
+                    coins: tickers.iter().map(|t| t.coin.clone()).collect(),
+                    stale_after: STALE_AFTER,
+                    health_interval: HL_HEALTH_INTERVAL,
+                    ..HyperliquidConfig::default()
+                };
+                if let Some(url) = hl_ws_url {
+                    hl_config.ws_url = url;
+                }
+                info!(
+                    ws_url = %hl_config.ws_url,
+                    price_source = price_source.as_str(),
+                    "starting engine_server with Hyperliquid stream"
+                );
+                let handle = spawn_hyperliquid_stream(hl_config, tick_senders);
+                (handle.health_rx, handle.prev_day_px)
+            }
+            PriceSource::Deribit => {
+                let mut drb_config = DeribitConfig {
+                    coins: tickers.iter().map(|t| t.coin.clone()).collect(),
+                    stale_after: STALE_AFTER,
+                    health_interval: HL_HEALTH_INTERVAL,
+                    ..DeribitConfig::default()
+                };
+                if let Some(url) = drb_ws_url {
+                    drb_config.ws_url = url;
+                }
+                info!(
+                    ws_url = %drb_config.ws_url,
+                    price_source = price_source.as_str(),
+                    "starting engine_server with Deribit stream"
+                );
+                let handle = spawn_deribit_stream(drb_config, tick_senders);
+                (handle.health_rx, handle.prev_day_px)
+            }
         }
-        let mut hl_config = HyperliquidConfig {
-            coins: tickers.iter().map(|t| t.coin.clone()).collect(),
-            stale_after: STALE_AFTER,
-            health_interval: HL_HEALTH_INTERVAL,
-            ..HyperliquidConfig::default()
-        };
-        if let Some(url) = hl_ws_url {
-            hl_config.ws_url = url;
-        }
-        info!(ws_url = %hl_config.ws_url, "starting engine_server with Hyperliquid stream");
-        let handle = spawn_hyperliquid_stream(hl_config, tick_senders);
-        (handle.health_rx, handle.prev_day_px)
     };
 
     let ticker_count = tickers.len();
@@ -641,6 +678,7 @@ fn is_ticker_stale(
 
 fn spawn_replay_stream(
     path: &Path,
+    price_source: PriceSource,
     tickers: &[TickerSpec],
     senders: HashMap<String, mpsc::Sender<PriceTick>>,
     clock: Arc<MonotonicWallClock>,
@@ -655,7 +693,7 @@ fn spawn_replay_stream(
 
     let mut per_coin_ticks: Vec<(String, Vec<PriceTick>)> = Vec::with_capacity(tickers.len());
     for spec in tickers {
-        let ticks = read_hl_jsonl(path, &spec.coin)?;
+        let ticks = read_ticks_for_source(path, &spec.coin, price_source)?;
         if ticks.is_empty() {
             warn!(coin = %spec.coin, path = %path.display(), "no replay ticks found for coin");
         }
@@ -1005,6 +1043,27 @@ fn far_trigger_sigma_from_env() -> f64 {
     }
 }
 
+fn price_source_from_env() -> Result<PriceSource, Box<dyn Error + Send + Sync>> {
+    match env::var("ENGINE_PRICE_SOURCE") {
+        Ok(raw) if !raw.trim().is_empty() => Ok(PriceSource::parse(&raw).ok_or_else(|| {
+            format!("invalid ENGINE_PRICE_SOURCE '{raw}': expected hyperliquid or deribit")
+        })?),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(PriceSource::Hyperliquid),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("ENGINE_PRICE_SOURCE must be valid UTF-8".into())
+        }
+    }
+}
+
+fn map_tickers_for_source(mut tickers: Vec<TickerSpec>, source: PriceSource) -> Vec<TickerSpec> {
+    if source == PriceSource::Deribit {
+        for spec in &mut tickers {
+            spec.coin = deribit_index_name(&spec.ticker);
+        }
+    }
+    tickers
+}
+
 fn pricing_model_from_env() -> Result<PricingModel, Box<dyn Error + Send + Sync>> {
     match env::var("ENGINE_PRICING_MODEL") {
         Ok(raw) if !raw.trim().is_empty() => Ok(PricingModel::parse(&raw).ok_or_else(|| {
@@ -1223,5 +1282,29 @@ mod tests {
         assert_eq!(parse_max_multiplier("1.04"), None);
         assert_eq!(parse_max_multiplier("0"), None);
         assert_eq!(parse_max_multiplier("NaN"), None);
+    }
+
+    #[test]
+    fn price_source_defaults_to_hyperliquid_and_maps_deribit_coins() {
+        assert_eq!(PriceSource::default(), PriceSource::Hyperliquid);
+        assert_eq!(PriceSource::parse("hyperliquid"), Some(PriceSource::Hyperliquid));
+        assert_eq!(PriceSource::parse("DERIBIT"), Some(PriceSource::Deribit));
+        assert_eq!(PriceSource::parse(" deribit "), Some(PriceSource::Deribit));
+        assert_eq!(PriceSource::parse("coinbase"), None);
+        assert_eq!(PriceSource::parse(""), None);
+
+        let base = parse_tickers(DEFAULT_TICKERS).unwrap();
+        let hl = map_tickers_for_source(base.clone(), PriceSource::Hyperliquid);
+        assert_eq!(hl[0].ticker, "NVDA");
+        assert_eq!(hl[0].coin, "xyz:NVDA");
+        assert_eq!(hl[0].band_cents, 3);
+
+        let drb = map_tickers_for_source(base, PriceSource::Deribit);
+        assert_eq!(drb[0].ticker, "NVDA");
+        assert_eq!(drb[0].coin, "nvda_usdc");
+        assert_eq!(drb[0].band_cents, 3);
+        assert_eq!(drb[1].ticker, "TSLA");
+        assert_eq!(drb[1].coin, "tsla_usdc");
+        assert_eq!(drb[1].band_cents, 8);
     }
 }

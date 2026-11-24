@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use st_engine::grid::stock_grid_config_for_ticker;
 use st_engine::horizon::{DEFAULT_TRIGGER_SIGMA, FAR_REFRESH_MS, stagger_phase_ms};
-use st_engine::price::{PriceCache, PriceTick, read_hl_jsonl};
+use st_engine::price::{PriceCache, PriceSource, PriceTick, read_ticks_for_source};
 use st_engine::quote::QuoteEngine;
 use st_engine::stress::parse_utc;
 use st_engine::v2::PricingModel;
@@ -33,6 +33,7 @@ struct Args {
     seed: u64,
     model: PricingModel,
     max_multiplier: Option<f64>,
+    source: PriceSource,
 }
 
 fn parse_args() -> Args {
@@ -47,6 +48,7 @@ fn parse_args() -> Args {
     let mut seed = 42u64;
     let mut model = PricingModel::V1;
     let mut max_multiplier: Option<f64> = None;
+    let mut source = PriceSource::Hyperliquid;
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let mut i = 0usize;
@@ -71,13 +73,17 @@ fn parse_args() -> Args {
             "--max-multiplier" => {
                 max_multiplier = Some(val.parse().expect("bad --max-multiplier"))
             }
+            "--source" => {
+                source =
+                    PriceSource::parse(val).expect("bad --source (expected hyperliquid or deribit)")
+            }
             _ => panic!("unknown arg {key}"),
         }
         i += 2;
     }
     if file.as_os_str().is_empty() || from_ms == 0 || to_ms <= from_ms {
         panic!(
-            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2|m4] [--max-multiplier 50]"
+            "usage: bench_horizon --file <jsonl> --from-utc <ts> --to-utc <ts> [--source hyperliquid|deribit] [--windows 24] [--mc-n 5000] [--trigger-sigma 2.0] [--far-refresh-ms 5000] [--stagger true] [--seed 42] [--model v1|v2|m4] [--max-multiplier 50]"
         );
     }
     Args {
@@ -92,6 +98,7 @@ fn parse_args() -> Args {
         seed,
         model,
         max_multiplier,
+        source,
     }
 }
 
@@ -172,7 +179,11 @@ fn main() {
     let warmup_start = args.from_ms.saturating_sub(WARMUP_LOOKBACK_MS);
     let mut states: Vec<TickerState> = Vec::with_capacity(defs.len());
     for (idx, def) in defs.iter().enumerate() {
-        let mut ticks = read_hl_jsonl(&args.file, &def.coin)
+        let query_coin = match args.source {
+            PriceSource::Hyperliquid => def.coin.as_str(),
+            PriceSource::Deribit => def.ticker.as_str(),
+        };
+        let mut ticks = read_ticks_for_source(&args.file, query_coin, args.source)
             .unwrap_or_else(|err| panic!("failed reading {}: {err}", args.file.display()));
         ticks.sort_by_key(|t| t.ts_ms);
         ticks.retain(|t| t.ts_ms >= warmup_start && t.ts_ms <= args.to_ms);

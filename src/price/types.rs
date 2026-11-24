@@ -1,5 +1,30 @@
 use crate::grid::OhlcBar;
 
+/// Selects the upstream market-data price source (`hyperliquid` default, or `deribit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PriceSource {
+    #[default]
+    Hyperliquid,
+    Deribit,
+}
+
+impl PriceSource {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "hyperliquid" => Some(Self::Hyperliquid),
+            "deribit" => Some(Self::Deribit),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hyperliquid => "hyperliquid",
+            Self::Deribit => "deribit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PriceTick {
     pub ts_ms: u64,
