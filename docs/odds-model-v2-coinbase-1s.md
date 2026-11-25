@@ -175,6 +175,55 @@ The 1 s index moves more per window than the old 3 s mark: RMS per second is 3.5
 Wider rows (for example NVDA 5c, TSLA 10c) would spread the multipliers over fewer,
 clearer rows. The maths is the same either way.
 
+## 5b. The first 24 hours: nights and the US session (2026-11-24 14:35 to 11-25 14:50 UTC)
+
+**Feed at night.** The index prints all night: 0.3-0.5 prints/s off hours against
+0.7-0.85 in US hours. Its 1 s RMS move is about half the US-hours size: NVDA 1.1-2.3c,
+TSLA 1.6-3.3c. `mda_source` alternates `primary` / `secondary` around the clock, so these
+are two redundant feeds, not a day source and a night source. The recording has some
+spells with no message at all (21-24 UTC: 9 / 43 / 11 per hour over 3 s). The live engine
+proves liveness with a 1 s `public/test` ping, so those spells are not outages
+(`logs/calibration/drb-analysis/hourly-1124-25.txt`).
+
+**Shadow engine, 18 h live (not the live game).** 1.03-1.05 samples/s per ticker, no gap
+over 3 s, no stale flag in the sampled windows, 4.5 MiB RAM, 3% CPU. One socket reset
+(2026-11-25 12:23:36 UTC) reconnected in 1.6 s.
+
+**The book's lead is a US-hours effect** (`drb-analysis/split-day1-24h.txt`):
+
+| | NVDA US | NVDA off | TSLA US | TSLA off |
+|---|---:|---:|---:|---:|
+| slope h = 5 s | 1.00 | 0.68 | 0.92 | 0.32 |
+| R² h = 5 s | 0.42 | 0.37 | 0.44 | 0.17 |
+| book-price VR(10 s) | 0.94 | 0.82 | 0.89 | 0.69 |
+
+Off hours the perp book wobbles away from the index and comes back, so a factor of 1
+over-shifts at night.
+
+**One table for day and night fails.** The 24 h backtest with one table
+(`drb-runs/day1-24h`) gave M3 margins of 13-34% and averages of 10-31%, and `row_sweep`
+was still −6 to −10%.
+
+**Two tables, chosen by NYSE session** (st-engine ORDER S6: `off_hours`, chosen with
+`session::is_us_regular_session`, with early closes added). Touch-rate check, two-phase
+model C, mean |error| (`drb-runs/day1-24h/model-check-sessions.txt`):
+
+| Table used | NVDA | TSLA |
+|---|---:|---:|
+| US hours, US table | 0.93 pp | 0.74 pp |
+| Night, the one pooled table (β = 1) | 1.40 pp | 5.89 pp (max 31.8) |
+| Night, a night-only fit (own regimes, own β) | 3.05 pp | **2.56 pp** |
+| Night, pooled steps + night β | **0.78 pp** | 3.99 pp |
+
+The best night table differs by ticker. The night-only fit splits quiet nights into
+regimes that are too fine; it is too narrow for NVDA. TSLA needs night-fitted book steps.
+Rule for the decision run: choose each ticker's night table between these two on the FIT
+days (lowest touch-rate error), then test out of sample.
+
+**Calendar.** 2026-11-26 is an NYSE holiday and 2026-11-27 closes at 13:00 ET, so the
+planned test days are mostly off hours. The decision run uses two folds: fit 11-24/25 and
+test 11-26/27, and fit 11-24/26/27 and test 11-25 (a full US day).
+
 ## 6. Validation before any switch
 
 1. Fit presets and `L`, `β∞` on the first full 24 h with `logs/calibration/drb-tick-stats.py`
