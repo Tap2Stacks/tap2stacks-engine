@@ -197,6 +197,9 @@ pub struct TickerV2Params {
     pub window_presets: Option<[RegimePreset; 4]>,
     /// Empirical 4x4 1-minute regime transition matrix `T[from][to]`, row-stochastic.
     pub transition_1min: [[f64; 4]; 4],
+    /// Optional separate table used outside NYSE regular trading hours (`None` = use main table).
+    /// An off-hours table's own `off_hours` is always `None`.
+    pub off_hours: Option<&'static TickerV2Params>,
 }
 
 /// NVDA v2 parameters derived directly from `logs/calibration/m1-tick-stats.txt` and M2 accuracy
@@ -267,6 +270,7 @@ pub static NVDA_V2_PARAMS: TickerV2Params = TickerV2Params {
         [0.029, 0.273, 0.674, 0.024],
         [0.000, 0.012, 0.353, 0.635],
     ],
+    off_hours: None,
 };
 
 /// TSLA v2 parameters derived directly from `logs/calibration/m1-tick-stats.txt` and M2 accuracy
@@ -337,11 +341,113 @@ pub static TSLA_V2_PARAMS: TickerV2Params = TickerV2Params {
         [0.041, 0.366, 0.567, 0.026],
         [0.012, 0.094, 0.412, 0.482],
     ],
+    off_hours: None,
+};
+
+/// PROVISIONAL NVDA Deribit off-hours v2 parameters: exact copy of `NVDA_DERIBIT_V2_PARAMS`
+/// (with `off_hours: None`) until lead fits off-hours values on recorded Deribit data.
+pub static NVDA_DERIBIT_V2_PARAMS_OFF: TickerV2Params = TickerV2Params {
+    ticker: "NVDA",
+    band_cents: 3,
+    reference_price: 139.65,
+    clock_secs: PriceSource::Deribit.timing().clock_secs,
+    void_gap_ms: PriceSource::Deribit.timing().void_gap_ms,
+    book_lead_secs: DERIBIT_BOOK_LEAD_SECS,
+    book_gap_beta: DERIBIT_BOOK_GAP_BETA,
+    book_gap_clamp_cents: DERIBIT_NVDA_BOOK_GAP_CLAMP_CENTS,
+    book_max_age_ms: DERIBIT_BOOK_MAX_AGE_MS,
+    rms_ref_cents: 1.60,
+    thresholds_rms_cents: [1.162, 2.412, 8.390],
+    shock_single_step_cents: 34,
+    presets: [
+        RegimePreset {
+            q_1s: 0.1426,
+            p_move: 0.1426,
+            mix_weight: 1.0,
+            p1: 0.6517,
+            p2: 0.6517,
+            rms_median_cents: 0.58,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2602,
+            p_move: 0.2602,
+            mix_weight: 1.0,
+            p1: 0.3767,
+            p2: 0.3767,
+            rms_median_cents: 1.60,
+            m_base: 0.098,
+        },
+        RegimePreset {
+            q_1s: 0.3017,
+            p_move: 0.3017,
+            mix_weight: 1.0,
+            p1: 0.1850,
+            p2: 0.1850,
+            rms_median_cents: 3.36,
+            m_base: 0.134,
+        },
+        RegimePreset {
+            q_1s: 0.2949,
+            p_move: 0.2949,
+            mix_weight: 0.8150,
+            p1: 0.0643,
+            p2: 0.0242,
+            rms_median_cents: 11.79,
+            m_base: 0.263,
+        },
+    ],
+    window_presets: Some([
+        RegimePreset {
+            q_1s: 0.1426,
+            p_move: 0.1426,
+            mix_weight: 1.0,
+            p1: 0.6517,
+            p2: 0.6517,
+            rms_median_cents: 0.58,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2602,
+            p_move: 0.2602,
+            mix_weight: 1.0,
+            p1: 0.3767,
+            p2: 0.3767,
+            rms_median_cents: 1.60,
+            m_base: 0.098,
+        },
+        RegimePreset {
+            q_1s: 0.3017,
+            p_move: 0.3017,
+            mix_weight: 1.0,
+            p1: 0.1850,
+            p2: 0.1850,
+            rms_median_cents: 3.36,
+            m_base: 0.134,
+        },
+        RegimePreset {
+            q_1s: 0.2949,
+            p_move: 0.2949,
+            mix_weight: 0.8150,
+            p1: 0.0643,
+            p2: 0.0242,
+            rms_median_cents: 11.79,
+            m_base: 0.263,
+        },
+    ]),
+    transition_1min: [
+        [0.816, 0.171, 0.013, 0.000],
+        [0.252, 0.645, 0.102, 0.001],
+        [0.029, 0.273, 0.674, 0.024],
+        [0.000, 0.012, 0.353, 0.635],
+    ],
+    off_hours: None,
 };
 
 /// PROVISIONAL NVDA Deribit v2 parameters: copies Hyperliquid NVDA preset values
-/// (with `p_move = q_1s` for `clock_secs = 1` and PROVISIONAL `window_presets = Some(presets)`)
-/// until lead fits presets on recorded Deribit data.
+/// (with `p_move = q_1s` for `clock_secs = 1`, PROVISIONAL `window_presets = Some(presets)`,
+/// and PROVISIONAL `off_hours = Some(&NVDA_DERIBIT_V2_PARAMS_OFF)`) until lead fits presets
+/// on recorded Deribit data.
 pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "NVDA",
     band_cents: 3,
@@ -437,11 +543,113 @@ pub static NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
         [0.029, 0.273, 0.674, 0.024],
         [0.000, 0.012, 0.353, 0.635],
     ],
+    off_hours: Some(&NVDA_DERIBIT_V2_PARAMS_OFF),
+};
+
+/// PROVISIONAL TSLA Deribit off-hours v2 parameters: exact copy of `TSLA_DERIBIT_V2_PARAMS`
+/// (with `off_hours: None`) until lead fits off-hours values on recorded Deribit data.
+pub static TSLA_DERIBIT_V2_PARAMS_OFF: TickerV2Params = TickerV2Params {
+    ticker: "TSLA",
+    band_cents: 8,
+    reference_price: 363.97,
+    clock_secs: PriceSource::Deribit.timing().clock_secs,
+    void_gap_ms: PriceSource::Deribit.timing().void_gap_ms,
+    book_lead_secs: DERIBIT_BOOK_LEAD_SECS,
+    book_gap_beta: DERIBIT_BOOK_GAP_BETA,
+    book_gap_clamp_cents: DERIBIT_TSLA_BOOK_GAP_CLAMP_CENTS,
+    book_max_age_ms: DERIBIT_BOOK_MAX_AGE_MS,
+    rms_ref_cents: 2.77,
+    thresholds_rms_cents: [1.807, 4.359, 11.505],
+    shock_single_step_cents: 46,
+    presets: [
+        RegimePreset {
+            q_1s: 0.1108,
+            p_move: 0.1108,
+            mix_weight: 1.0,
+            p1: 0.4643,
+            p2: 0.4643,
+            rms_median_cents: 0.63,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2391,
+            p_move: 0.2391,
+            mix_weight: 1.0,
+            p1: 0.2202,
+            p2: 0.2202,
+            rms_median_cents: 2.77,
+            m_base: 0.073,
+        },
+        RegimePreset {
+            q_1s: 0.2900,
+            p_move: 0.2900,
+            mix_weight: 1.0,
+            p1: 0.1183,
+            p2: 0.1183,
+            rms_median_cents: 5.63,
+            m_base: 0.197,
+        },
+        RegimePreset {
+            q_1s: 0.3027,
+            p_move: 0.3027,
+            mix_weight: 0.7712,
+            p1: 0.0645,
+            p2: 0.0297,
+            rms_median_cents: 14.20,
+            m_base: 0.185,
+        },
+    ],
+    window_presets: Some([
+        RegimePreset {
+            q_1s: 0.1108,
+            p_move: 0.1108,
+            mix_weight: 1.0,
+            p1: 0.4643,
+            p2: 0.4643,
+            rms_median_cents: 0.63,
+            m_base: 0.025,
+        },
+        RegimePreset {
+            q_1s: 0.2391,
+            p_move: 0.2391,
+            mix_weight: 1.0,
+            p1: 0.2202,
+            p2: 0.2202,
+            rms_median_cents: 2.77,
+            m_base: 0.073,
+        },
+        RegimePreset {
+            q_1s: 0.2900,
+            p_move: 0.2900,
+            mix_weight: 1.0,
+            p1: 0.1183,
+            p2: 0.1183,
+            rms_median_cents: 5.63,
+            m_base: 0.197,
+        },
+        RegimePreset {
+            q_1s: 0.3027,
+            p_move: 0.3027,
+            mix_weight: 0.7712,
+            p1: 0.0645,
+            p2: 0.0297,
+            rms_median_cents: 14.20,
+            m_base: 0.185,
+        },
+    ]),
+    transition_1min: [
+        [0.825, 0.160, 0.015, 0.000],
+        [0.236, 0.620, 0.140, 0.004],
+        [0.041, 0.366, 0.567, 0.026],
+        [0.012, 0.094, 0.412, 0.482],
+    ],
+    off_hours: None,
 };
 
 /// PROVISIONAL TSLA Deribit v2 parameters: copies Hyperliquid TSLA preset values
-/// (with `p_move = q_1s` for `clock_secs = 1` and PROVISIONAL `window_presets = Some(presets)`)
-/// until lead fits presets on recorded Deribit data.
+/// (with `p_move = q_1s` for `clock_secs = 1`, PROVISIONAL `window_presets = Some(presets)`,
+/// and PROVISIONAL `off_hours = Some(&TSLA_DERIBIT_V2_PARAMS_OFF)`) until lead fits presets
+/// on recorded Deribit data.
 pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
     ticker: "TSLA",
     band_cents: 8,
@@ -537,6 +745,7 @@ pub static TSLA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {
         [0.041, 0.366, 0.567, 0.026],
         [0.012, 0.094, 0.412, 0.482],
     ],
+    off_hours: Some(&TSLA_DERIBIT_V2_PARAMS_OFF),
 };
 
 /// Normalizes a ticker, Hyperliquid coin (`xyz:NVDA`), Deribit index (`nvda_usdc`), or
@@ -573,6 +782,8 @@ pub struct TickerV2ParamsJson {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_presets: Option<[RegimePreset; 4]>,
     pub transition_1min: [[f64; 4]; 4],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_hours: Option<Box<TickerV2ParamsJson>>,
 }
 
 fn validate_preset_array(label: &str, presets: &[RegimePreset; 4]) -> Result<(), String> {
@@ -630,6 +841,7 @@ impl TickerV2ParamsJson {
             presets: params.presets,
             window_presets: params.window_presets,
             transition_1min: params.transition_1min,
+            off_hours: params.off_hours.map(|off| Box::new(Self::from_params(off))),
         }
     }
 
@@ -721,11 +933,29 @@ impl TickerV2ParamsJson {
             }
         }
 
+        if let Some(ref off) = self.off_hours {
+            if off.off_hours.is_some() {
+                return Err(
+                    "v2 params validation error: off_hours must not contain its own off_hours".into(),
+                );
+            }
+            if !off.matches_coin(&self.ticker) {
+                return Err(format!(
+                    "v2 params validation error: off_hours.ticker ('{}') must match ticker ('{}')",
+                    off.ticker, self.ticker
+                ));
+            }
+            off.validate()
+                .map_err(|err| format!("off_hours: {err}"))?;
+        }
+
         Ok(())
     }
 
     /// Converts validated owned JSON params into a leaked `'static` reference for offline tools.
     pub fn leak_static(self) -> &'static TickerV2Params {
+        let off_hours: Option<&'static TickerV2Params> =
+            self.off_hours.map(|off| (*off).leak_static());
         let ticker: &'static str = Box::leak(self.ticker.into_boxed_str());
         Box::leak(Box::new(TickerV2Params {
             ticker,
@@ -743,11 +973,23 @@ impl TickerV2ParamsJson {
             presets: self.presets,
             window_presets: self.window_presets,
             transition_1min: self.transition_1min,
+            off_hours,
         }))
     }
 }
 
 impl TickerV2Params {
+    /// Returns the active table for `quote_ts_ms`: `off_hours` when configured and
+    /// `quote_ts_ms` is outside NYSE regular trading hours, otherwise `self`.
+    pub fn for_session<'a>(&'a self, quote_ts_ms: u64) -> &'a TickerV2Params {
+        if let Some(off) = self.off_hours {
+            if !crate::session::is_us_regular_session(quote_ts_ms) {
+                return off;
+            }
+        }
+        self
+    }
+
     /// Serializes this parameter table as pretty JSON matching `TickerV2ParamsJson`.
     pub fn to_json_pretty(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&TickerV2ParamsJson::from_params(self))
@@ -756,6 +998,8 @@ impl TickerV2Params {
 
     /// Formats this parameter table as a paste-ready Rust
     /// `pub const <TICKER>_DERIBIT_V2_PARAMS: TickerV2Params = ...;` block matching `src/v2.rs`.
+    /// When `off_hours` is present, emits `<TICKER>_DERIBIT_V2_PARAMS_OFF` first and references it
+    /// from the main const.
     pub fn to_rust_deribit_const(&self) -> String {
         fn push_presets(out: &mut String, presets: &[RegimePreset; 4]) {
             for p in presets {
@@ -774,63 +1018,98 @@ impl TickerV2Params {
             }
         }
 
-        let sym = normalize_v2_ticker(self.ticker);
-        let mut out = String::new();
-        out.push_str(&format!(
-            "pub const {sym}_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {{\n"
-        ));
-        out.push_str(&format!("    ticker: {:?},\n", sym));
-        out.push_str(&format!("    band_cents: {},\n", self.band_cents));
-        out.push_str(&format!("    reference_price: {:?},\n", self.reference_price));
-        out.push_str(&format!("    clock_secs: {},\n", self.clock_secs));
-        out.push_str(&format!("    void_gap_ms: {},\n", self.void_gap_ms));
-        out.push_str(&format!("    book_lead_secs: {},\n", self.book_lead_secs));
-        out.push_str(&format!("    book_gap_beta: {:?},\n", self.book_gap_beta));
-        out.push_str(&format!(
-            "    book_gap_clamp_cents: {},\n",
-            self.book_gap_clamp_cents
-        ));
-        out.push_str(&format!("    book_max_age_ms: {},\n", self.book_max_age_ms));
-        out.push_str(&format!("    rms_ref_cents: {:?},\n", self.rms_ref_cents));
-        out.push_str(&format!(
-            "    thresholds_rms_cents: [{:?}, {:?}, {:?}],\n",
-            self.thresholds_rms_cents[0],
-            self.thresholds_rms_cents[1],
-            self.thresholds_rms_cents[2]
-        ));
-        out.push_str(&format!(
-            "    shock_single_step_cents: {},\n",
-            self.shock_single_step_cents
-        ));
-        out.push_str("    presets: [\n");
-        push_presets(&mut out, &self.presets);
-        out.push_str("    ],\n");
-        match &self.window_presets {
-            Some(wp) => {
-                out.push_str("    window_presets: Some([\n");
-                push_presets(&mut out, wp);
-                out.push_str("    ]),\n");
-            }
-            None => {
-                out.push_str("    window_presets: None,\n");
-            }
-        }
-        out.push_str("    transition_1min: [\n");
-        for row in &self.transition_1min {
+        fn format_const(
+            out: &mut String,
+            const_name: &str,
+            params: &TickerV2Params,
+            off_const_ref: Option<&str>,
+        ) {
+            let sym = normalize_v2_ticker(params.ticker);
             out.push_str(&format!(
-                "        [{:?}, {:?}, {:?}, {:?}],\n",
-                row[0], row[1], row[2], row[3]
+                "pub const {const_name}: TickerV2Params = TickerV2Params {{\n"
             ));
+            out.push_str(&format!("    ticker: {:?},\n", sym));
+            out.push_str(&format!("    band_cents: {},\n", params.band_cents));
+            out.push_str(&format!(
+                "    reference_price: {:?},\n",
+                params.reference_price
+            ));
+            out.push_str(&format!("    clock_secs: {},\n", params.clock_secs));
+            out.push_str(&format!("    void_gap_ms: {},\n", params.void_gap_ms));
+            out.push_str(&format!("    book_lead_secs: {},\n", params.book_lead_secs));
+            out.push_str(&format!(
+                "    book_gap_beta: {:?},\n",
+                params.book_gap_beta
+            ));
+            out.push_str(&format!(
+                "    book_gap_clamp_cents: {},\n",
+                params.book_gap_clamp_cents
+            ));
+            out.push_str(&format!(
+                "    book_max_age_ms: {},\n",
+                params.book_max_age_ms
+            ));
+            out.push_str(&format!("    rms_ref_cents: {:?},\n", params.rms_ref_cents));
+            out.push_str(&format!(
+                "    thresholds_rms_cents: [{:?}, {:?}, {:?}],\n",
+                params.thresholds_rms_cents[0],
+                params.thresholds_rms_cents[1],
+                params.thresholds_rms_cents[2]
+            ));
+            out.push_str(&format!(
+                "    shock_single_step_cents: {},\n",
+                params.shock_single_step_cents
+            ));
+            out.push_str("    presets: [\n");
+            push_presets(out, &params.presets);
+            out.push_str("    ],\n");
+            match &params.window_presets {
+                Some(wp) => {
+                    out.push_str("    window_presets: Some([\n");
+                    push_presets(out, wp);
+                    out.push_str("    ]),\n");
+                }
+                None => {
+                    out.push_str("    window_presets: None,\n");
+                }
+            }
+            out.push_str("    transition_1min: [\n");
+            for row in &params.transition_1min {
+                out.push_str(&format!(
+                    "        [{:?}, {:?}, {:?}, {:?}],\n",
+                    row[0], row[1], row[2], row[3]
+                ));
+            }
+            out.push_str("    ],\n");
+            match off_const_ref {
+                Some(off_name) => {
+                    out.push_str(&format!("    off_hours: Some(&{off_name}),\n"));
+                }
+                None => {
+                    out.push_str("    off_hours: None,\n");
+                }
+            }
+            out.push_str("};\n");
         }
-        out.push_str("    ],\n");
-        out.push_str("};\n");
+
+        let sym = normalize_v2_ticker(self.ticker);
+        let main_name = format!("{sym}_DERIBIT_V2_PARAMS");
+        let mut out = String::new();
+        if let Some(off) = self.off_hours {
+            let off_name = format!("{sym}_DERIBIT_V2_PARAMS_OFF");
+            format_const(&mut out, &off_name, off, None);
+            out.push('\n');
+            format_const(&mut out, &main_name, self, Some(&off_name));
+        } else {
+            format_const(&mut out, &main_name, self, None);
+        }
         out
     }
 
     /// Compact one-line summary for offline tool startup logs.
     pub fn one_line_summary(&self) -> String {
         format!(
-            "ticker={} band_cents={} clock={}s void_gap={}ms book_lead={}s beta={:.3} clamp={}c book_max_age={}ms rms_ref={:.3}c thresh=[{:.3},{:.3},{:.3}] shock={}c two_phase={} m_base=[{:.3},{:.3},{:.3},{:.3}]",
+            "ticker={} band_cents={} clock={}s void_gap={}ms book_lead={}s beta={:.3} clamp={}c book_max_age={}ms rms_ref={:.3}c thresh=[{:.3},{:.3},{:.3}] shock={}c two_phase={} off_hours={} m_base=[{:.3},{:.3},{:.3},{:.3}]",
             self.ticker,
             self.band_cents,
             self.clock_secs,
@@ -845,6 +1124,7 @@ impl TickerV2Params {
             self.thresholds_rms_cents[2],
             self.shock_single_step_cents,
             self.window_presets.is_some(),
+            self.off_hours.is_some(),
             self.presets[0].m_base,
             self.presets[1].m_base,
             self.presets[2].m_base,
@@ -2872,6 +3152,29 @@ mod tests {
         raw_val["window_presets"] = serde_json::Value::Array(short_wp);
         assert!(parse_v2_params_json(&raw_val.to_string()).is_err());
 
+        // off_hours validation: nested off_hours rejected, ticker mismatch rejected, inner field errors caught.
+        let mut plain_off = base.clone();
+        plain_off.off_hours = None;
+
+        let mut nested_off = base.clone();
+        let mut mid_off = plain_off.clone();
+        mid_off.off_hours = Some(Box::new(plain_off.clone()));
+        nested_off.off_hours = Some(Box::new(mid_off));
+        assert!(nested_off.validate().unwrap_err().contains("off_hours"));
+
+        let mut wrong_ticker_off = base.clone();
+        let mut tsla_off = plain_off.clone();
+        tsla_off.ticker = "TSLA".to_string();
+        wrong_ticker_off.off_hours = Some(Box::new(tsla_off));
+        assert!(wrong_ticker_off.validate().unwrap_err().contains("off_hours.ticker"));
+
+        let mut bad_inner_off = base.clone();
+        let mut broken_off = plain_off.clone();
+        broken_off.presets[0].p1 = 0.0;
+        bad_inner_off.off_hours = Some(Box::new(broken_off));
+        let err = bad_inner_off.validate().unwrap_err();
+        assert!(err.contains("off_hours") && err.contains("p1"));
+
         assert!(parse_v2_params_json("{not json").is_err());
     }
 
@@ -2881,93 +3184,119 @@ mod tests {
             ("NVDA_DERIBIT_V2_PARAMS", &NVDA_DERIBIT_V2_PARAMS),
             ("TSLA_DERIBIT_V2_PARAMS", &TSLA_DERIBIT_V2_PARAMS),
         ] {
+            let expected_off_const = format!("{expected_const}_OFF");
             let rendered = params.to_rust_deribit_const();
             assert!(
                 rendered.starts_with(&format!(
-                    "pub const {expected_const}: TickerV2Params = TickerV2Params {{"
+                    "pub const {expected_off_const}: TickerV2Params = TickerV2Params {{"
                 )),
-                "unexpected header:\n{rendered}"
+                "expected off-hours const first:\n{rendered}"
             );
+            let main_header = format!(
+                "\npub const {expected_const}: TickerV2Params = TickerV2Params {{"
+            );
+            let (off_section, main_section) = rendered
+                .split_once(&main_header)
+                .unwrap_or_else(|| panic!("missing main const header {main_header}:\n{rendered}"));
+            assert!(off_section.contains("    off_hours: None,\n"));
+            assert!(main_section.contains(&format!(
+                "    off_hours: Some(&{expected_off_const}),\n"
+            )));
             assert!(rendered.ends_with("};\n"));
-            assert!(rendered.contains(&format!("    ticker: {:?},", params.ticker)));
-            assert!(rendered.contains(&format!("    band_cents: {},", params.band_cents)));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!("    ticker: {:?},", params.ticker)));
+            assert!(main_section.contains(&format!("    band_cents: {},", params.band_cents)));
+            assert!(main_section.contains(&format!(
                 "    reference_price: {:?},",
                 params.reference_price
             )));
-            assert!(rendered.contains(&format!("    clock_secs: {},", params.clock_secs)));
-            assert!(rendered.contains(&format!("    void_gap_ms: {},", params.void_gap_ms)));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!("    clock_secs: {},", params.clock_secs)));
+            assert!(main_section.contains(&format!("    void_gap_ms: {},", params.void_gap_ms)));
+            assert!(main_section.contains(&format!(
                 "    book_lead_secs: {},",
                 params.book_lead_secs
             )));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!(
                 "    book_gap_beta: {:?},",
                 params.book_gap_beta
             )));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!(
                 "    book_gap_clamp_cents: {},",
                 params.book_gap_clamp_cents
             )));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!(
                 "    book_max_age_ms: {},",
                 params.book_max_age_ms
             )));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!(
                 "    rms_ref_cents: {:?},",
                 params.rms_ref_cents
             )));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!(
                 "    thresholds_rms_cents: [{:?}, {:?}, {:?}],",
                 params.thresholds_rms_cents[0],
                 params.thresholds_rms_cents[1],
                 params.thresholds_rms_cents[2]
             )));
-            assert!(rendered.contains(&format!(
+            assert!(main_section.contains(&format!(
                 "    shock_single_step_cents: {},",
                 params.shock_single_step_cents
             )));
-            assert!(rendered.contains("    window_presets: Some([\n"));
-            assert!(rendered.contains("    ]),\n"));
+            assert!(main_section.contains("    window_presets: Some([\n"));
+            assert!(main_section.contains("    ]),\n"));
             for preset in &params.presets {
-                assert!(rendered.contains(&format!("            q_1s: {:?},", preset.q_1s)));
-                assert!(rendered.contains(&format!("            p_move: {:?},", preset.p_move)));
-                assert!(rendered.contains(&format!(
+                assert!(main_section.contains(&format!("            q_1s: {:?},", preset.q_1s)));
+                assert!(main_section.contains(&format!("            p_move: {:?},", preset.p_move)));
+                assert!(main_section.contains(&format!(
                     "            mix_weight: {:?},",
                     preset.mix_weight
                 )));
-                assert!(rendered.contains(&format!("            p1: {:?},", preset.p1)));
-                assert!(rendered.contains(&format!("            p2: {:?},", preset.p2)));
-                assert!(rendered.contains(&format!(
+                assert!(main_section.contains(&format!("            p1: {:?},", preset.p1)));
+                assert!(main_section.contains(&format!("            p2: {:?},", preset.p2)));
+                assert!(main_section.contains(&format!(
                     "            rms_median_cents: {:?},",
                     preset.rms_median_cents
                 )));
-                assert!(rendered.contains(&format!("            m_base: {:?},", preset.m_base)));
+                assert!(main_section.contains(&format!("            m_base: {:?},", preset.m_base)));
             }
             for row in &params.transition_1min {
-                assert!(rendered.contains(&format!(
+                assert!(main_section.contains(&format!(
                     "        [{:?}, {:?}, {:?}, {:?}],",
                     row[0], row[1], row[2], row[3]
                 )));
             }
         }
 
-        // Distinct window_presets values are emitted separately from presets, and None emits `window_presets: None,`.
-        let mut custom = NVDA_DERIBIT_V2_PARAMS;
-        let mut wp = custom.presets;
-        wp[Regime::Normal.index()].p1 = 0.5123;
-        wp[Regime::Normal.index()].p2 = 0.5123;
-        custom.window_presets = Some(wp);
+        // Distinct window_presets and distinct off_hours values are emitted separately.
+        let mut custom_json = TickerV2ParamsJson::from_params(&NVDA_DERIBIT_V2_PARAMS);
+        custom_json.window_presets.as_mut().unwrap()[Regime::Normal.index()].p1 = 0.5123;
+        custom_json.window_presets.as_mut().unwrap()[Regime::Normal.index()].p2 = 0.5123;
+        custom_json.off_hours.as_mut().unwrap().book_gap_beta = 0.68;
+        custom_json.off_hours.as_mut().unwrap().book_lead_secs = 2;
+        let custom = custom_json.leak_static();
         let rendered_two_phase = custom.to_rust_deribit_const();
-        let (_, wp_section) = rendered_two_phase
+        let (off_part, main_part) = rendered_two_phase
+            .split_once("\npub const NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {")
+            .expect("expected _OFF followed by main const");
+        assert!(off_part.contains("    book_gap_beta: 0.68,\n"));
+        assert!(off_part.contains("    book_lead_secs: 2,\n"));
+        assert!(off_part.contains("    off_hours: None,\n"));
+        assert!(main_part.contains("    book_gap_beta: 1.0,\n"));
+        assert!(main_part.contains("    off_hours: Some(&NVDA_DERIBIT_V2_PARAMS_OFF),\n"));
+        let (_, wp_section) = main_part
             .split_once("    window_presets: Some([\n")
             .expect("expected window_presets: Some([ section");
         assert!(wp_section.contains("            p1: 0.5123,"));
         assert!(wp_section.contains("            p2: 0.5123,"));
 
+        // When off_hours is None (e.g. HL), no _OFF const is emitted and both window_presets & off_hours are None.
         let rendered_none = NVDA_V2_PARAMS.to_rust_deribit_const();
+        assert!(rendered_none.starts_with(
+            "pub const NVDA_DERIBIT_V2_PARAMS: TickerV2Params = TickerV2Params {"
+        ));
+        assert!(!rendered_none.contains("_DERIBIT_V2_PARAMS_OFF"));
         assert!(rendered_none.contains("    window_presets: None,\n"));
         assert!(!rendered_none.contains("window_presets: Some"));
+        assert!(rendered_none.contains("    off_hours: None,\n"));
     }
 
     #[test]
@@ -3063,6 +3392,7 @@ mod tests {
         let mut all_book = NVDA_DERIBIT_V2_PARAMS;
         all_book.presets = [book_pre; 4];
         all_book.window_presets = None;
+        all_book.off_hours = None;
 
         let mut two_phase = all_book;
         two_phase.window_presets = Some([index_win; 4]);
@@ -3070,6 +3400,7 @@ mod tests {
         let mut all_index = NVDA_DERIBIT_V2_PARAMS;
         all_index.presets = [index_win; 4];
         all_index.window_presets = None;
+        all_index.off_hours = None;
 
         let no_gap = BookLeadAdjustment {
             gap_cents: 0,
@@ -3311,5 +3642,69 @@ mod tests {
         val_null["window_presets"] = serde_json::Value::Null;
         let parsed_null = parse_v2_params_json(&val_null.to_string()).unwrap();
         assert!(parsed_null.window_presets.is_none());
+    }
+
+    #[test]
+    fn off_hours_session_selection_and_json_round_trip() {
+        // 1. Compiled table invariants: HL has None; Deribit has provisional Some(&*_OFF).
+        assert!(NVDA_V2_PARAMS.off_hours.is_none());
+        assert!(TSLA_V2_PARAMS.off_hours.is_none());
+        assert_eq!(NVDA_DERIBIT_V2_PARAMS.off_hours, Some(&NVDA_DERIBIT_V2_PARAMS_OFF));
+        assert_eq!(TSLA_DERIBIT_V2_PARAMS.off_hours, Some(&TSLA_DERIBIT_V2_PARAMS_OFF));
+        assert!(NVDA_DERIBIT_V2_PARAMS_OFF.off_hours.is_none());
+        assert!(TSLA_DERIBIT_V2_PARAMS_OFF.off_hours.is_none());
+
+        // 2. Build a distinct off-hours table and verify `for_session` across all session boundaries.
+        let mut base_json = TickerV2ParamsJson::from_params(&NVDA_DERIBIT_V2_PARAMS);
+        base_json.off_hours = None;
+        let mut off_json = base_json.clone();
+        off_json.book_gap_beta = 0.68;
+        off_json.book_lead_secs = 2;
+        off_json.book_gap_clamp_cents = 12;
+        off_json.rms_ref_cents = 0.90;
+        off_json.thresholds_rms_cents = [0.60, 1.30, 3.20];
+        off_json.shock_single_step_cents = 15;
+        off_json.presets[Regime::Normal.index()].m_base = 0.14;
+
+        let mut split_json = base_json.clone();
+        split_json.off_hours = Some(Box::new(off_json.clone()));
+        let split = split_json.clone().leak_static();
+
+        // US regular hours (2026-11-17 15:00 UTC = 10:00 ET) -> main table
+        assert_eq!(split.for_session(1_794_927_600_000).book_gap_beta, 1.0);
+        // Night (2026-11-18 03:00 UTC = 22:00 ET) -> off table
+        assert_eq!(split.for_session(1_794_970_800_000).book_gap_beta, 0.68);
+        // Weekend (2026-11-21 15:00 UTC = Sat 10:00 ET) -> off table
+        assert_eq!(split.for_session(1_795_273_200_000).book_gap_beta, 0.68);
+        // Holiday (2026-11-26 15:00 UTC = Thanksgiving) -> off table
+        assert_eq!(split.for_session(1_795_705_200_000).book_gap_beta, 0.68);
+        // Early-close boundary 2026-11-27 12:59:59 ET (17:59:59 UTC) vs 13:00:00 ET (18:00:00 UTC)
+        assert_eq!(split.for_session(1_795_802_399_000).book_gap_beta, 1.0);
+        assert_eq!(split.for_session(1_795_802_400_000).book_gap_beta, 0.68);
+        // Early-close boundary 2026-12-24 12:59:59 ET vs 13:00:00 ET
+        assert_eq!(split.for_session(1_798_135_199_000).book_gap_beta, 1.0);
+        assert_eq!(split.for_session(1_798_135_200_000).book_gap_beta, 0.68);
+
+        // 3. JSON round trip WITH distinct off_hours, WITHOUT off_hours (omitted), and `"off_hours": null`.
+        let json_with = split.to_json_pretty().unwrap();
+        assert!(json_with.contains("\"off_hours\""));
+        let parsed_with = parse_v2_params_json(&json_with).unwrap();
+        assert_eq!(parsed_with, split_json);
+        let loaded_with = parsed_with.leak_static();
+        assert_eq!(loaded_with, split);
+        assert_eq!(loaded_with.for_session(1_795_802_399_000).book_gap_beta, 1.0);
+        assert_eq!(loaded_with.for_session(1_795_802_400_000).book_gap_beta, 0.68);
+
+        let no_off = base_json.clone().leak_static();
+        let json_without = no_off.to_json_pretty().unwrap();
+        assert!(!json_without.contains("\"off_hours\""));
+        let parsed_without = parse_v2_params_json(&json_without).unwrap();
+        assert!(parsed_without.off_hours.is_none());
+        assert_eq!(parsed_without.leak_static(), no_off);
+
+        let mut val_null: serde_json::Value = serde_json::from_str(&json_without).unwrap();
+        val_null["off_hours"] = serde_json::Value::Null;
+        let parsed_null = parse_v2_params_json(&val_null.to_string()).unwrap();
+        assert!(parsed_null.off_hours.is_none());
     }
 }

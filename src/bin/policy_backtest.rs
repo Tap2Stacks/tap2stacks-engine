@@ -1706,6 +1706,9 @@ fn main() {
                 args.band_cents
             );
             loaded.band_cents = args.band_cents;
+            if let Some(ref mut off) = loaded.off_hours {
+                off.band_cents = args.band_cents;
+            }
         }
         let leaked = loaded.leak_static();
         print!("{}", leaked.to_rust_deribit_const());

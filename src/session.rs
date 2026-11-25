@@ -4,12 +4,16 @@ const EST_OFFSET_SECS: i64 = -5 * SECS_PER_HOUR;
 const EDT_OFFSET_SECS: i64 = -4 * SECS_PER_HOUR;
 const OPEN_SECS_LOCAL: i64 = 9 * SECS_PER_HOUR + 30 * 60;
 const CLOSE_SECS_LOCAL: i64 = 16 * SECS_PER_HOUR;
+const EARLY_CLOSE_SECS_LOCAL: i64 = 13 * SECS_PER_HOUR;
 
-/// NYSE holidays matching `tap2stacks-backend/src/modules/session/nyse-calendar.ts`.
+/// NYSE holidays matching `st-backend/src/modules/session/nyse-calendar.ts`.
 const NYSE_HOLIDAYS: &[(i64, u32, u32)] = &[(2026, 11, 26), (2026, 12, 25), (2027, 1, 1)];
+/// NYSE early-close days (13:00 America/New_York) matching `st-backend/src/modules/session/nyse-calendar.ts`.
+const NYSE_EARLY_CLOSES: &[(i64, u32, u32)] = &[(2026, 11, 27), (2026, 12, 24)];
 
-/// Returns true when `ts_ms` falls within NYSE regular trading hours (`09:30..16:00 America/New_York`),
-/// Monday through Friday, excluding NYSE holidays, accounting for US DST rules.
+/// Returns true when `ts_ms` falls within NYSE regular trading hours (`09:30..16:00 America/New_York`,
+/// or `09:30..13:00 America/New_York` on NYSE early-close days), Monday through Friday,
+/// excluding NYSE holidays, accounting for US DST rules.
 pub fn is_us_regular_session(ts_ms: u64) -> bool {
     let utc_secs = (ts_ms / 1_000) as i64;
     let offset = eastern_utc_offset_secs(utc_secs);
@@ -17,17 +21,22 @@ pub fn is_us_regular_session(ts_ms: u64) -> bool {
     let ny_days = ny_secs.div_euclid(SECS_PER_DAY);
     let sec_in_day = ny_secs.rem_euclid(SECS_PER_DAY);
 
-    if !(OPEN_SECS_LOCAL..CLOSE_SECS_LOCAL).contains(&sec_in_day) {
-        return false;
-    }
-
     let weekday = weekday_mon_1(ny_days);
     if weekday > 5 {
         return false;
     }
 
     let date = civil_from_days(ny_days);
-    !NYSE_HOLIDAYS.contains(&date)
+    if NYSE_HOLIDAYS.contains(&date) {
+        return false;
+    }
+
+    let close_secs = if NYSE_EARLY_CLOSES.contains(&date) {
+        EARLY_CLOSE_SECS_LOCAL
+    } else {
+        CLOSE_SECS_LOCAL
+    };
+    (OPEN_SECS_LOCAL..close_secs).contains(&sec_in_day)
 }
 
 fn eastern_utc_offset_secs(utc_secs: i64) -> i64 {
@@ -119,5 +128,23 @@ mod tests {
         assert_eq!(eastern_utc_offset_secs((utc_ms(2026, 3, 8, 7, 0, 0) / 1_000) as i64), EDT_OFFSET_SECS);
         assert_eq!(eastern_utc_offset_secs((utc_ms(2026, 11, 1, 5, 59, 59) / 1_000) as i64), EDT_OFFSET_SECS);
         assert_eq!(eastern_utc_offset_secs((utc_ms(2026, 11, 1, 6, 0, 0) / 1_000) as i64), EST_OFFSET_SECS);
+    }
+
+    #[test]
+    fn nyse_early_closes_at_1300_et() {
+        // 2026-11-27 (Day after Thanksgiving, EST = UTC-5): 09:30..13:00 ET == 14:30..18:00 UTC
+        assert!(is_us_regular_session(utc_ms(2026, 11, 27, 14, 30, 0)));
+        assert!(is_us_regular_session(utc_ms(2026, 11, 27, 17, 59, 59)));
+        assert!(!is_us_regular_session(utc_ms(2026, 11, 27, 18, 0, 0)));
+        assert!(!is_us_regular_session(utc_ms(2026, 11, 27, 20, 0, 0)));
+
+        // 2026-12-24 (Christmas Eve, EST = UTC-5): 09:30..13:00 ET == 14:30..18:00 UTC
+        assert!(is_us_regular_session(utc_ms(2026, 12, 24, 14, 30, 0)));
+        assert!(is_us_regular_session(utc_ms(2026, 12, 24, 17, 59, 59)));
+        assert!(!is_us_regular_session(utc_ms(2026, 12, 24, 18, 0, 0)));
+        assert!(!is_us_regular_session(utc_ms(2026, 12, 24, 20, 0, 0)));
+
+        // Normal trading day remains open at 13:00 ET (18:00 UTC)
+        assert!(is_us_regular_session(utc_ms(2026, 11, 17, 18, 0, 0)));
     }
 }

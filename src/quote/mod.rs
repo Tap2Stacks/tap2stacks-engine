@@ -121,7 +121,8 @@ impl SampleJob {
             .unwrap_or(u64::MAX);
         let far_end = full_windows.last().map(|window| window.0).unwrap_or(0);
 
-        if let Some(v2_params) = self.v2_params {
+        if let Some(base_v2_params) = self.v2_params {
+            let v2_params = base_v2_params.for_session(self.tick.ts_ms);
             self.v2_detector.on_tick(self.tick, v2_params);
             let regime = self
                 .base_config
@@ -590,7 +591,8 @@ impl QuoteEngine {
     /// Feeds a raw tick to the causal v2/m4 trackers (no-op on v1).
     pub fn observe_tick(&mut self, tick: PriceTick) {
         if let Some(params) = self.v2_params {
-            self.v2_detector.on_tick(tick, params);
+            self.v2_detector
+                .on_tick(tick, params.for_session(tick.ts_ms));
         }
         if self.m4_params.is_some() {
             self.m4_tracker.on_tick(tick);
@@ -1560,5 +1562,108 @@ mod tests {
                 source.as_str()
             );
         }
+    }
+
+    #[test]
+    fn v2_off_hours_table_switches_by_session_and_identical_copy_is_bit_identical() {
+        use crate::v2::{NVDA_DERIBIT_V2_PARAMS, TickerV2ParamsJson};
+
+        const TS_US_REGULAR: u64 = 1_794_927_600_000; // 2026-11-17 15:00:00 UTC (10:00:00 ET)
+        const TS_NIGHT: u64 = 1_794_970_800_000; // 2026-11-18 03:00:00 UTC (22:00:00 ET)
+        const TS_WEEKEND: u64 = 1_795_273_200_000; // 2026-11-21 15:00:00 UTC (Sat 10:00:00 ET)
+        const TS_HOLIDAY: u64 = 1_795_705_200_000; // 2026-11-26 15:00:00 UTC (Thanksgiving)
+        const TS_EARLY_BEFORE: u64 = 1_795_802_399_000; // 2026-11-27 17:59:59 UTC (12:59:59 ET)
+        const TS_EARLY_AFTER: u64 = 1_795_802_400_000; // 2026-11-27 18:00:00 UTC (13:00:00 ET)
+        const TS_XMAS_EVE_AFTER: u64 = 1_798_135_200_000; // 2026-12-24 18:00:00 UTC (13:00:00 ET)
+
+        let make_engine = |params: &'static TickerV2Params| {
+            let mut cfg = stock_grid_config_for_ticker("NVDA", 3, Vec::new());
+            cfg.simulation.pricing_model = PricingModel::V2;
+            cfg.simulation.price_source = PriceSource::Deribit;
+            cfg.simulation.v2_params_override = Some(params);
+            QuoteEngine::with_config("NVDA".to_string(), 3, cfg)
+        };
+
+        let quote_at = |params: &'static TickerV2Params, ts: u64| {
+            let mut eng = make_engine(params);
+            let tick = PriceTick {
+                ts_ms: ts,
+                price: 140.00,
+                mid_px: Some(140.10),
+                oracle_px: Some(140.00),
+            };
+            eng.on_sample(tick, &sample_history(140.00));
+            eng.price(ts)
+        };
+
+        // 1. off_hours = None vs Some(identical copy) give bit-identical quotes in both sessions.
+        let mut main_only_json = TickerV2ParamsJson::from_params(&NVDA_DERIBIT_V2_PARAMS);
+        main_only_json.off_hours = None;
+        let main_only = main_only_json.clone().leak_static();
+        let mut identical_off_json = main_only_json.clone();
+        identical_off_json.off_hours = Some(Box::new(main_only_json.clone()));
+        let identical_off = identical_off_json.leak_static();
+
+        for ts in [TS_US_REGULAR, TS_NIGHT, TS_EARLY_BEFORE, TS_EARLY_AFTER] {
+            assert_eq!(
+                quote_at(main_only, ts),
+                quote_at(identical_off, ts),
+                "identical off_hours copy must be bit-identical at ts={ts}"
+            );
+        }
+
+        // 2. Distinct off_hours table: US timestamps use main, off-hours timestamps use off.
+        let mut off_json = main_only_json.clone();
+        off_json.book_gap_beta = 0.30;
+        off_json.book_lead_secs = 1;
+        off_json.book_gap_clamp_cents = 10;
+        off_json.rms_ref_cents = 0.80;
+        off_json.thresholds_rms_cents = [0.50, 1.00, 2.00];
+        off_json.shock_single_step_cents = 12;
+        for p in &mut off_json.presets {
+            p.p_move = (p.p_move * 0.5).clamp(0.05, 1.0);
+            p.q_1s = p.p_move;
+            p.m_base = (p.m_base + 0.04).min(0.5);
+        }
+        off_json.window_presets = Some(off_json.presets);
+        let off_only = off_json.clone().leak_static();
+
+        let mut split_json = main_only_json.clone();
+        split_json.off_hours = Some(Box::new(off_json));
+        let split = split_json.leak_static();
+
+        // US regular session & 12:59:59 ET on early close day -> main table.
+        for ts in [TS_US_REGULAR, TS_EARLY_BEFORE] {
+            let q_split = quote_at(split, ts);
+            let q_main = quote_at(main_only, ts);
+            let q_off = quote_at(off_only, ts);
+            assert_eq!(q_split, q_main, "US timestamp {ts} must use main table");
+            assert_ne!(q_split, q_off, "US timestamp {ts} must differ from off table");
+        }
+
+        // Night, weekend, holiday, and 13:00:00 ET early closes -> off table.
+        for ts in [TS_NIGHT, TS_WEEKEND, TS_HOLIDAY, TS_EARLY_AFTER, TS_XMAS_EVE_AFTER] {
+            let q_split = quote_at(split, ts);
+            let q_main = quote_at(main_only, ts);
+            let q_off = quote_at(off_only, ts);
+            assert_eq!(q_split, q_off, "off-hours timestamp {ts} must use off table");
+            assert_ne!(q_split, q_main, "off-hours timestamp {ts} must differ from main table");
+        }
+
+        // 3. Crossing the 13:00 ET early-close boundary keeps the R_60 buffer and classifies
+        //    immediately with the off-hours thresholds (3c alternating steps -> R_60 ~ 3c:
+        //    Volatile under US thresholds [1.162, 2.412, 8.390], News under off [0.50, 1.00, 2.00]).
+        let mut eng = make_engine(split);
+        let hist = sample_history(140.00);
+        for sec in 0..16_u64 {
+            // 17:59:44..17:59:59 UTC (12:59:44..12:59:59 ET, still US session)
+            let ts = TS_EARLY_BEFORE - (15 - sec) * 1_000;
+            let price = if sec % 2 == 0 { 140.00 } else { 140.03 };
+            eng.observe_tick(PriceTick::new(ts, price));
+        }
+        assert_eq!(eng.current_v2_regime(), Some(Regime::Volatile));
+        // Next tick at 13:00:00 ET (18:00:00 UTC) enters off hours: same R_60 (~3c) > off p99 (2.0c) -> News.
+        eng.on_sample(PriceTick::new(TS_EARLY_AFTER, 140.00), &hist);
+        assert_eq!(eng.current_v2_regime(), Some(Regime::News));
     }
 }

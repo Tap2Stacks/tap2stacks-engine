@@ -266,7 +266,7 @@ impl EngineReplayState {
             let _ = self.cache.apply_tick(tick);
             self.engine.observe_tick(tick);
             if let Some((ref mut detector, params)) = self.causal_detector {
-                detector.on_tick(tick, params);
+                detector.on_tick(tick, params.for_session(tick.ts_ms));
             }
             self.last_tick = Some(tick);
             if opts.reprice_every_tick
